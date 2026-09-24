@@ -270,7 +270,7 @@ pub const Bot = struct {
 
         if (message.text) |raw| {
             const text = std.mem.trim(u8, raw, " \t\r\n");
-            if (text.len > 0) return self.handleText(arena, chat_id, text);
+            if (text.len > 0) return self.handleText(arena, chat_id, text, false);
         }
         if (message.voice orelse message.audio) |voice| {
             return self.handleVoice(arena, chat_id, voice);
@@ -337,7 +337,7 @@ pub const Bot = struct {
                     "Got {s} ({s}).",
                     .{ filename, attachments_mod.humanSize(bytes.len, &size_buf) },
                 ));
-                return self.handleText(arena, chat_id, trimmed);
+                return self.handleText(arena, chat_id, trimmed, false);
             }
         }
 
@@ -455,7 +455,7 @@ pub const Bot = struct {
         return true;
     }
 
-    fn handleText(self: *Bot, arena: std.mem.Allocator, chat_id: []const u8, text: []const u8) !void {
+    fn handleText(self: *Bot, arena: std.mem.Allocator, chat_id: []const u8, text: []const u8, spoken: bool) !void {
         if (!try self.ownerCheck(arena, chat_id, text)) return;
 
         log.info("owner message: {s}", .{text});
@@ -466,7 +466,7 @@ pub const Bot = struct {
         const reply = if (text[0] == '/')
             try self.handleCommand(arena, text)
         else
-            try self.handleNaturalLanguage(arena, text);
+            try self.handleNaturalLanguage(arena, text, spoken);
 
         try self.client.sendMessage(reply);
         try self.record(text, reply);
@@ -520,7 +520,7 @@ pub const Bot = struct {
         }
 
         try self.client.sendMessage(try std.fmt.allocPrint(arena, "I heard: \"{s}\"", .{text}));
-        try self.handleText(arena, chat_id, text);
+        try self.handleText(arena, chat_id, text, true);
     }
 
     fn sendTo(self: *Bot, chat_id: []const u8, text: []const u8) !void {
@@ -609,7 +609,7 @@ pub const Bot = struct {
 
     // ---- plain language ----
 
-    fn handleNaturalLanguage(self: *Bot, arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    fn handleNaturalLanguage(self: *Bot, arena: std.mem.Allocator, text: []const u8, spoken: bool) ![]const u8 {
         // With a draft pending, a plain yes/no decides it -- and the match is
         // deterministic, so no model ever decides whether to send.
         const answer = decision_mod.decide(text);
@@ -645,7 +645,7 @@ pub const Bot = struct {
             log.info("filling in the {s} for a pending compose", .{
                 if (needs_recipient) "recipient" else "message",
             });
-            return self.doComposeMail(arena, text, if (needs_recipient) null else text);
+            return self.doComposeMail(arena, text, if (needs_recipient) null else text, spoken);
         }
 
         const understood = interpret_mod.interpret(
@@ -706,7 +706,7 @@ pub const Bot = struct {
             else
                 "Summarize the latest mail from whom?",
             .draft_reply => try self.doDraftReply(arena, understood.message, false),
-            .compose_mail => try self.doComposeMail(arena, text, understood.message),
+            .compose_mail => try self.doComposeMail(arena, text, understood.message, spoken),
         };
 
         if (std.mem.eql(u8, result, understood.reply)) return result;
@@ -1381,7 +1381,7 @@ pub const Bot = struct {
         return false;
     }
 
-    fn doComposeMail(self: *Bot, arena: std.mem.Allocator, request: []const u8, instruction: ?[]const u8) ![]const u8 {
+    fn doComposeMail(self: *Bot, arena: std.mem.Allocator, request: []const u8, instruction: ?[]const u8, spoken: bool) ![]const u8 {
         // Carry whatever was already gathered, so a compose can be assembled
         // over several turns rather than demanding one perfect sentence.
         var recipient: []const u8 = "";
@@ -1398,8 +1398,22 @@ pub const Bot = struct {
         }
 
         if (recipient.len == 0) {
-            if (ownerTypedAddress(request)) |typed| {
-                recipient = try arena.dupe(u8, typed);
+            // A *typed* address is owner input and is taken exactly as given.
+            // A *spoken* one is not: transcription adds a failure mode typing
+            // does not have, and a corrupted address is still address-shaped,
+            // so the form check passes while the meaning is wrong. Observed
+            // three times in a row on one real address --
+            // "you name@", "you.name@", "name@" -- any of which would
+            // have addressed a stranger who really exists. Spoken requests
+            // must resolve against the contact book or ask.
+            //
+            // Same rule as the spoken yes/no on a pending send, for the same
+            // reason.
+            if (!spoken) {
+                if (ownerTypedAddress(request)) |typed| recipient = try arena.dupe(u8, typed);
+            }
+            if (recipient.len > 0) {
+                // taken as given
             } else if (refersToSelf(request)) {
                 recipient = self.cfg.imap_user;
                 label = "you";
@@ -1651,4 +1665,14 @@ test "self-reference resolves to the owner rather than the contact book" {
     // in "send me the invoice", which is an attachment download.
     try std.testing.expect(!Bot.refersToSelf("send me the invoice from that email"));
     try std.testing.expect(!Bot.refersToSelf("email dana about thursday"));
+}
+
+test "a mis-transcribed address is still address-shaped, which is why voice cannot supply one" {
+    // All three came out of whisper on one real address in one sitting.
+    // Every one passes the form check, and one of them is a real stranger's
+    // mailbox. Shape is not meaning, so spoken requests resolve against the
+    // contact book instead of being taken literally.
+    try std.testing.expectEqualStrings("name@example.com", Bot.ownerTypedAddress("email edu name@example.com").?);
+    try std.testing.expectEqualStrings("you.name@example.com", Bot.ownerTypedAddress("email you.name@example.com").?);
+    try std.testing.expectEqualStrings("youname@example.com", Bot.ownerTypedAddress("email youname@example.com").?);
 }
