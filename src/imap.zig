@@ -42,6 +42,8 @@ extern fn ronny_selection_uidnext(session: *c.mailimap) u32;
 extern fn ronny_selection_uidvalidity(session: *c.mailimap) u32;
 extern fn ronny_fetch_envelopes_since(session: *c.mailimap, first_uid: u32, out: [*]Envelope, max_out: c_int) c_int;
 extern fn ronny_fetch_message(session: *c.mailimap, uid: u32, out: *Message) c_int;
+extern fn ronny_search_from(session: *c.mailimap, sender: [*:0]const u8, days: c_int, out: [*]Envelope, max_out: c_int) c_int;
+extern fn ronny_search_gmail(session: *c.mailimap, query: [*:0]const u8, out: [*]Envelope, max_out: c_int) c_int;
 
 pub const Error = error{
     SessionAlloc,
@@ -133,6 +135,26 @@ pub const Session = struct {
     /// inspecting a message never marks it read.
     pub fn fetchMessage(self: *Session, uid: u32, out: *Message) Error!void {
         if (ronny_fetch_message(self.imap, uid, out) != 0) return Error.Fetch;
+    }
+
+    /// Mail from a sender within the last `days`, newest first. IMAP's FROM
+    /// is a substring match, so a bare domain or display name works too.
+    ///
+    /// The result is a slice *into* `buffer`: reusing one buffer across two
+    /// searches silently rewrites the earlier results.
+    pub fn searchFrom(self: *Session, sender: [:0]const u8, days: u16, buffer: []Envelope) Error![]Envelope {
+        const n = ronny_search_from(self.imap, sender.ptr, days, buffer.ptr, @intCast(buffer.len));
+        if (n < 0) return Error.Fetch;
+        return buffer[0..@intCast(n)];
+    }
+
+    /// Gmail's own full-text search. No local index to build or keep fresh --
+    /// Gmail already has one and answers in well under a second across 50k
+    /// messages.
+    pub fn searchGmail(self: *Session, query: [:0]const u8, buffer: []Envelope) Error![]Envelope {
+        const n = ronny_search_gmail(self.imap, query.ptr, buffer.ptr, @intCast(buffer.len));
+        if (n < 0) return Error.Fetch;
+        return buffer[0..@intCast(n)];
     }
 
     /// Blocks until the server reports activity or `timeout_seconds` passes.

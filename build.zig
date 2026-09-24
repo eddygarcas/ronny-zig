@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     // containing one (mailimap_selection_info) arrive opaque and their fields
     // are unreachable. This shim reads them from C, and also walks libetpan's
     // nested result structures, handing Zig flat data.
-    root.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{"-std=c11"} });
+    root.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{"-std=gnu11"} });
 
     // whisper.cpp for voice notes. Same reasoning as the libetpan shim:
     // whisper_full_params is a large struct with nested unions, so it is
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     root.linkSystemLibrary("whisper", .{});
     root.linkSystemLibrary("ggml", .{});
     root.linkSystemLibrary("ggml-base", .{});
-    root.addCSourceFile(.{ .file = b.path("src/whisper_shim.c"), .flags = &.{"-std=c11"} });
+    root.addCSourceFile(.{ .file = b.path("src/whisper_shim.c"), .flags = &.{"-std=gnu11"} });
 
     const exe = b.addExecutable(.{
         .name = "ronny",
@@ -79,6 +79,35 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Watch the mailbox");
     run_step.dependOn(&run_cmd.step);
+
+    // A scratch target for exercising one piece against the real mailbox.
+    // Ad-hoc `zig build-exe` cannot be used any more: the translated C module
+    // only exists inside the build graph, so probes have to share it.
+    const probe_source = b.path("src/probe.zig");
+    {
+        const probe = b.addExecutable(.{
+            .name = "probe",
+            .root_module = b.createModule(.{
+                .root_source_file = probe_source,
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "c", .module = translate_c.createModule() }},
+            }),
+        });
+        probe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        probe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        probe.root_module.linkSystemLibrary("etpan", .{});
+        probe.root_module.linkSystemLibrary("whisper", .{});
+        probe.root_module.linkSystemLibrary("ggml", .{});
+        probe.root_module.linkSystemLibrary("ggml-base", .{});
+        probe.root_module.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{"-std=gnu11"} });
+        probe.root_module.addCSourceFile(.{ .file = b.path("src/whisper_shim.c"), .flags = &.{"-std=gnu11"} });
+
+        const probe_run = b.addRunArtifact(probe);
+        if (b.args) |args| probe_run.addArgs(args);
+        b.step("probe", "Run src/probe.zig against the real mailbox").dependOn(&probe_run.step);
+    }
 
     const tests = b.addTest(.{ .root_module = root });
     const test_step = b.step("test", "Run tests");

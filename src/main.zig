@@ -18,6 +18,7 @@ const spam = @import("spam.zig");
 const intent = @import("intent.zig");
 const decision = @import("decision.zig");
 const transcribe = @import("transcribe.zig");
+const summarize = @import("summarize.zig");
 
 /// Namespaced so each module's output is identifiable in the journal,
 /// the way the Python version's per-module loggers were.
@@ -217,4 +218,5 @@ test {
     _ = intent;
     _ = decision;
     _ = transcribe;
+    _ = summarize;
 }
