@@ -15,9 +15,9 @@ const std = @import("std");
 /// the way the Python version's per-module loggers were.
 const log = std.log.scoped(.imap);
 
-pub const c = @cImport({
-    @cInclude("libetpan/libetpan.h");
-});
+/// Translated by the build system from src/c.h rather than @cImport, which
+/// 0.16 deprecates. See build.zig.
+pub const c = @import("c");
 
 pub const ADDR_MAX = 256;
 pub const SUBJ_MAX = 512;
