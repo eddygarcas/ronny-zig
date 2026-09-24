@@ -40,6 +40,8 @@ pub const Action = enum {
     read_mail,
     summarize_mail,
     draft_reply,
+    list_attachments,
+    get_attachment,
     help,
     unknown,
 
@@ -61,7 +63,19 @@ pub const Action = enum {
     /// Ollama argument-extraction call is skipped entirely.
     pub fn isArgless(self: Action) bool {
         return switch (self) {
-            .pause, .resume_, .status, .list_senders, .find_mail, .help, .unknown => true,
+            .pause,
+            .resume_,
+            .status,
+            .list_senders,
+            .find_mail,
+            .list_attachments,
+            // Which attachment is chosen by matching the owner's own words
+            // against the real filenames, so there is nothing for a
+            // general-purpose extractor to pull out first.
+            .get_attachment,
+            .help,
+            .unknown,
+            => true,
             else => false,
         };
     }
@@ -108,6 +122,8 @@ const ACTION_CRITERIA =
     \\  "read_mail": "Show the actual body text of the most recent email from someone. Examples: 'show me the content of the latest email from acme.com', 'what does his last email say?'",
     \\  "summarize_mail": "Summarize the most recent email from someone rather than showing it in full. Examples: 'summarise the last email from acme.com', 'give me the gist of it', 'tl;dr'",
     \\  "draft_reply": "Draft a reply to the email just shown, for the owner to approve. Drafting only; it never sends. Examples: 'reply saying Wednesday works'",
+    \\  "list_attachments": "Say what files are attached to the email just shown, without sending any of them. Examples: 'does that have attachments?', 'what is attached to it?', 'any files on that one?'",
+    \\  "get_attachment": "Send the owner a file attached to the email just shown. Examples: 'send me the invoice', 'download the pdf', 'give me that attachment', 'forward me the spreadsheet from it'",
     \\  "add_sender": "Add an email address or domain to the watched-sender allowlist.",
     \\  "remove_sender": "Remove an email address or domain from the watched-sender allowlist.",
     \\  "list_senders": "Show which senders are currently on the allowlist.",

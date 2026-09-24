@@ -34,6 +34,7 @@ const findmail = @import("findmail.zig");
 const transcribe = @import("transcribe.zig");
 const headers_mod = @import("headers.zig");
 const mailer = @import("mailer.zig");
+const attachments_mod = @import("attachments.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -63,6 +64,8 @@ pub const HELP_TEXT =
     \\/find <what it was about> - search mail by topic, not sender
     \\/read <address-or-domain> [days] - show the latest email's content
     \\/summarize <address-or-domain> [days] - summarize the latest email
+    \\/attachments - list the files attached to the last email I showed you
+    \\/get <name> - send me one of those files
     \\/reply <text> - draft a reply to the last email I showed you
     \\/confirm - send the drafted reply
     \\/cancel - discard the drafted reply
@@ -105,6 +108,9 @@ pub const Config = struct {
 /// target this, which is what keeps recipients coming from real headers.
 const LastMessage = struct {
     arena: std.heap.ArenaAllocator,
+    /// Needed to fetch an attachment later; the metadata comes back with the
+    /// message but the bytes are pulled on demand.
+    uid: u32,
     from: []const u8,
     reply_to: ?[]const u8,
     subject: []const u8,
@@ -112,6 +118,9 @@ const LastMessage = struct {
     body: []const u8,
     message_id: []const u8,
     references: []const u8,
+    /// Ranked: real files first, inline ones after. The numbering the owner
+    /// sees in a listing has to survive into the request that follows it.
+    attachments: []const imap.Attachment,
 };
 
 const Pending = struct {
@@ -378,6 +387,12 @@ pub const Bot = struct {
             if (arg.len == 0) return "Usage: /find <what the email was about>";
             return self.doFind(arena, arg);
         }
+        if (std.mem.eql(u8, command, "/attachments")) return self.doListAttachments(arena);
+        if (std.mem.eql(u8, command, "/get")) {
+            // No argument means "the only one", which doGetAttachment handles
+            // by skipping the model entirely.
+            return self.doGetAttachment(arena, arg);
+        }
         if (std.mem.eql(u8, command, "/reply")) {
             if (arg.len == 0) return "Usage: /reply <text>  (replies to the last email I showed you)";
             return self.doDraftReply(arena, arg, true);
@@ -466,6 +481,10 @@ pub const Bot = struct {
                 "Which address or domain should I remove?",
             // The whole message is the question, so it is passed through raw.
             .find_mail => try self.doFind(arena, text),
+            .list_attachments => try self.doListAttachments(arena),
+            // Likewise: which file is decided by matching the owner's own
+            // words against the real filenames.
+            .get_attachment => try self.doGetAttachment(arena, text),
             .search_mail => if (understood.target) |target|
                 try self.doSearch(arena, target, understood.days)
             else
@@ -592,11 +611,13 @@ pub const Bot = struct {
     }
 
     const Latest = struct {
+        uid: u32,
         from: []const u8,
         subject: []const u8,
         date: []const u8,
         body: []const u8,
         headers: []const u8,
+        attachments: []const imap.Attachment,
     };
 
     /// The newest message from `target` within `days`, or null.
@@ -625,11 +646,13 @@ pub const Bot = struct {
                 var message: imap.Message = undefined;
                 try session.fetchMessage(hits[0].uid, &message);
                 ctx.found = .{
+                    .uid = hits[0].uid,
                     .from = try ctx.arena.dupe(u8, hits[0].fromSlice()),
                     .subject = try ctx.arena.dupe(u8, hits[0].subjectSlice()),
                     .date = try ctx.arena.dupe(u8, hits[0].dateSlice()),
                     .body = try ctx.arena.dupe(u8, message.bodySlice()),
                     .headers = try ctx.arena.dupe(u8, message.headersSlice()),
+                    .attachments = try attachments_mod.ranked(ctx.arena, message.attachmentSlice()),
                 };
             }
         };
@@ -669,9 +692,12 @@ pub const Bot = struct {
         else
             "";
 
+        const attachments = try arena.dupe(imap.Attachment, latest.attachments);
+
         if (self.last_message) |*previous| previous.arena.deinit();
         self.last_message = .{
             .arena = arena_state,
+            .uid = latest.uid,
             .from = from,
             .reply_to = reply_to,
             .subject = subject,
@@ -679,7 +705,122 @@ pub const Bot = struct {
             .body = body,
             .message_id = message_id,
             .references = references,
+            .attachments = attachments,
         };
+    }
+
+    // ---- attachments ----
+
+    fn doListAttachments(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        if (self.last_message == null) {
+            return "I can only look at a message I've shown you. Read or find one first.";
+        }
+        const original = &self.last_message.?;
+        if (original.attachments.len == 0) {
+            return std.fmt.allocPrint(arena, "\"{s}\" has no attachments.", .{original.subject});
+        }
+
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("\"{s}\" has {d} attachment(s):", .{
+            original.subject, original.attachments.len,
+        });
+        for (original.attachments) |part| {
+            var size_buf: [32]u8 = undefined;
+            try out.writer.print("\n- {s} ({s}, {s}){s}", .{
+                part.filenameSlice(),
+                part.mimeTypeSlice(),
+                attachments_mod.humanSize(part.size, &size_buf),
+                if (part.is_inline == 1) " - inline, probably part of the layout" else "",
+            });
+        }
+        try out.writer.writeAll("\n\nAsk me for one by name and I'll send it.");
+        return telegram.truncate(out.writer.buffered());
+    }
+
+    fn doGetAttachment(self: *Bot, arena: std.mem.Allocator, request: []const u8) ![]const u8 {
+        if (self.last_message == null) {
+            return "I can only send a file from a message I've shown you. Read or find one first.";
+        }
+        const original = &self.last_message.?;
+        if (original.attachments.len == 0) {
+            return std.fmt.allocPrint(arena, "\"{s}\" has no attachments.", .{original.subject});
+        }
+
+        const choice = attachments_mod.choose(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            request,
+            original.attachments,
+        ) orelse {
+            // Never guess. Sending the wrong file to a chat is a privacy slip,
+            // and one extra turn is cheap next to that.
+            return try self.doListAttachments(arena);
+        };
+
+        const part = original.attachments[choice];
+        var size_buf: [32]u8 = undefined;
+        if (part.size > attachments_mod.MAX_BYTES) {
+            return std.fmt.allocPrint(
+                arena,
+                "{s} is {s}, which is more than I can pass through Telegram.",
+                .{ part.filenameSlice(), attachments_mod.humanSize(part.size, &size_buf) },
+            );
+        }
+
+        self.client.sendTyping();
+
+        const Context = struct {
+            uid: u32,
+            index: u32,
+            buffer: []u8,
+            bytes: []u8 = &.{},
+
+            fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                ctx.bytes = try session.fetchAttachment(ctx.uid, ctx.index, ctx.buffer);
+            }
+        };
+
+        // Sized from what the part declared, with room for the estimate being
+        // low; the shim refuses rather than overruns if it is too small.
+        const capacity = @min(
+            @as(usize, part.size) + (part.size / 4) + 64 * 1024,
+            attachments_mod.MAX_BYTES,
+        );
+        var context: Context = .{
+            .uid = original.uid,
+            .index = part.index,
+            .buffer = try arena.alloc(u8, capacity),
+        };
+        self.withMailbox(&context, Context.run) catch |err| {
+            log.err("could not fetch attachment {s}: {s}", .{ part.filenameSlice(), @errorName(err) });
+            return "Couldn't pull that file off the server -- try again in a bit.";
+        };
+
+        const caption = try std.fmt.allocPrint(arena, "From: {s}\n{s}", .{
+            original.from, original.subject,
+        });
+        self.client.sendDocument(
+            arena,
+            part.filenameSlice(),
+            part.mimeTypeSlice(),
+            context.bytes,
+            caption,
+        ) catch |err| {
+            log.err("could not send {s}: {s}", .{ part.filenameSlice(), @errorName(err) });
+            return std.fmt.allocPrint(
+                arena,
+                "Got {s} off the server but Telegram wouldn't take it ({s}).",
+                .{ part.filenameSlice(), @errorName(err) },
+            );
+        };
+
+        // The file itself is the answer; this is just the receipt.
+        return std.fmt.allocPrint(arena, "Sent {s} ({s}).", .{
+            part.filenameSlice(),
+            attachments_mod.humanSize(context.bytes.len, &size_buf),
+        });
     }
 
     fn doSearch(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
@@ -807,6 +948,13 @@ pub const Bot = struct {
             });
         }
 
+        // Remember the best match, so "does that have attachments?" or "reply
+        // to it" resolves against what was just found rather than whatever
+        // was last read.
+        self.rememberFound(arena, found.matches[0].candidate.uid) catch |err| {
+            log.warn("could not open the top match: {s}", .{@errorName(err)});
+        };
+
         var out: std.Io.Writer.Allocating = .init(arena);
         try out.writer.print("Found {d} match(es):", .{found.matches.len});
         for (found.matches) |match| {
@@ -815,7 +963,43 @@ pub const Bot = struct {
             });
             if (match.why.len > 0) try out.writer.print("\n  {s}", .{match.why});
         }
+        if (found.matches.len > 1) {
+            try out.writer.print("\n\nThe first one is open -- ask about \"it\" and I'll mean that.", .{});
+        }
         return telegram.truncate(out.writer.buffered());
+    }
+
+    /// Opens a message found by content search, so follow-ups have a target.
+    fn rememberFound(self: *Bot, arena: std.mem.Allocator, uid: u32) !void {
+        const Context = struct {
+            arena: std.mem.Allocator,
+            uid: u32,
+            found: ?Latest = null,
+
+            fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                ctx.found = null;
+                var message: imap.Message = undefined;
+                try session.fetchMessage(ctx.uid, &message);
+
+                const raw = message.headersSlice();
+                ctx.found = .{
+                    .uid = ctx.uid,
+                    .from = if (try headers_mod.value(ctx.arena, raw, "From")) |value|
+                        headers_mod.address(value) orelse value
+                    else
+                        "",
+                    .subject = (try headers_mod.value(ctx.arena, raw, "Subject")) orelse "",
+                    .date = (try headers_mod.value(ctx.arena, raw, "Date")) orelse "",
+                    .body = try ctx.arena.dupe(u8, message.bodySlice()),
+                    .headers = try ctx.arena.dupe(u8, raw),
+                    .attachments = try attachments_mod.ranked(ctx.arena, message.attachmentSlice()),
+                };
+            }
+        };
+
+        var context: Context = .{ .arena = arena, .uid = uid };
+        try self.withMailbox(&context, Context.run);
+        if (context.found) |latest| try self.remember(latest);
     }
 
     // ---- drafting, and the send gate ----

@@ -59,6 +59,38 @@ pub const FormPart = union(enum) {
     },
 };
 
+/// Assembles an RFC 7578 body. Split out from the request so the part with
+/// actual rules in it -- framing, CRLFs, the trailing `--` -- is reachable
+/// from a test rather than only from a live Telegram call.
+fn writeMultipartBody(
+    writer: *std.Io.Writer,
+    boundary: []const u8,
+    parts: []const FormPart,
+) !void {
+    for (parts) |part| {
+        try writer.print("--{s}\r\n", .{boundary});
+        switch (part) {
+            .text => |field| try writer.print(
+                "Content-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n",
+                .{ field.name, field.value },
+            ),
+            .file => |field| {
+                try writer.print(
+                    "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\n" ++
+                        "Content-Type: {s}\r\n\r\n",
+                    .{ field.name, field.filename, field.content_type },
+                );
+                // Written raw: form-data carries bytes, not text, so no
+                // encoding or escaping happens here.
+                try writer.writeAll(field.bytes);
+                try writer.writeAll("\r\n");
+            },
+        }
+    }
+    // The closing delimiter is the one with trailing dashes.
+    try writer.print("--{s}--\r\n", .{boundary});
+}
+
 /// POSTs multipart/form-data. Telegram's sendDocument needs this; its JSON
 /// endpoints cannot carry file contents.
 ///
@@ -72,35 +104,15 @@ pub fn postMultipart(
 ) !Response {
     // Random, because the boundary must not appear anywhere in the payload
     // and file bytes are arbitrary. 128 bits of hex makes that a non-issue.
+    // 0.16 has no std.crypto.random; entropy comes from Io.
     var raw: [16]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    io.random(&raw);
     var boundary: [32]u8 = undefined;
     _ = std.fmt.bufPrint(&boundary, "{x}", .{&raw}) catch unreachable;
 
     var body: std.Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
-
-    for (parts) |part| {
-        try body.writer.print("--{s}\r\n", .{&boundary});
-        switch (part) {
-            .text => |field| {
-                try body.writer.print(
-                    "Content-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n",
-                    .{ field.name, field.value },
-                );
-            },
-            .file => |field| {
-                try body.writer.print(
-                    "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\n" ++
-                        "Content-Type: {s}\r\n\r\n",
-                    .{ field.name, field.filename, field.content_type },
-                );
-                try body.writer.writeAll(field.bytes);
-                try body.writer.writeAll("\r\n");
-            },
-        }
-    }
-    try body.writer.print("--{s}--\r\n", .{&boundary});
+    try writeMultipartBody(&body.writer, &boundary, parts);
 
     const content_type = try std.fmt.allocPrint(
         gpa,
@@ -181,5 +193,35 @@ test "redact strips a telegram bot token from a url" {
     try std.testing.expectEqualStrings(
         "http://127.0.0.1:11434/api/generate",
         redact("http://127.0.0.1:11434/api/generate"),
+    );
+}
+
+test "multipart body framing" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Deliberately includes a NUL and a CR: form-data carries bytes, and
+    // nothing here may transform them.
+    const payload = "PDF\x00\r binary";
+    try writeMultipartBody(&out.writer, "BOUND", &.{
+        .{ .text = .{ .name = "chat_id", .value = "42" } },
+        .{ .file = .{
+            .name = "document",
+            .filename = "invoice.pdf",
+            .content_type = "application/pdf",
+            .bytes = payload,
+        } },
+    });
+
+    try std.testing.expectEqualStrings(
+        "--BOUND\r\n" ++
+            "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n42\r\n" ++
+            "--BOUND\r\n" ++
+            "Content-Disposition: form-data; name=\"document\"; filename=\"invoice.pdf\"\r\n" ++
+            "Content-Type: application/pdf\r\n\r\n" ++
+            payload ++ "\r\n" ++
+            "--BOUND--\r\n",
+        out.writer.buffered(),
     );
 }

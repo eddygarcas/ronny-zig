@@ -30,6 +30,7 @@ const transcribe = @import("transcribe.zig");
 const summarize = @import("summarize.zig");
 const ollama = @import("ollama.zig");
 const findmail = @import("findmail.zig");
+const attachments = @import("attachments.zig");
 const interpret = @import("interpret.zig");
 const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
@@ -304,6 +305,7 @@ test {
     _ = summarize;
     _ = ollama;
     _ = findmail;
+    _ = attachments;
     _ = bot_mod;
     _ = watchdog_mod;
     _ = interpret;
