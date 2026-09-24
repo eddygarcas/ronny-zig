@@ -44,6 +44,9 @@ pub const MAX_HISTORY = 6;
 /// later against a thread that has moved on.
 pub const PENDING_REPLY_TTL_SECONDS = 900;
 pub const DEFAULT_DAYS = 14;
+/// A compose gathers its pieces across turns; this bounds how long a
+/// half-finished one can capture the next thing the owner says.
+pub const COMPOSE_TTL_SECONDS = 300;
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
@@ -138,6 +141,21 @@ const Pending = struct {
     attachments: []const mailer.Attachment,
 };
 
+/// A new email being assembled over several turns.
+///
+/// Compose needs two things -- who, and what to say -- and real requests
+/// rarely carry both. "I'd like to email someone an attachment" has neither.
+/// Without this the next message gets re-classified from scratch, and
+/// "Thanks for the file" is not a recognisable command on its own.
+const Composing = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Empty until known. Once set it is a real address, never a guess.
+    recipient: []const u8,
+    label: []const u8,
+    instruction: []const u8,
+    created_ns: i96,
+};
+
 /// A file the owner uploaded, waiting to be attached to the next draft.
 ///
 /// Held separately from the draft because the two arrive in either order --
@@ -164,6 +182,7 @@ pub const Bot = struct {
     last_message: ?LastMessage = null,
     pending: ?Pending = null,
     staged: ?Staged = null,
+    composing: ?Composing = null,
 
     history: std.ArrayList(Turn) = .empty,
     vocabulary: []const []const u8 = &.{},
@@ -189,6 +208,7 @@ pub const Bot = struct {
         if (self.last_message) |*message| message.arena.deinit();
         if (self.pending) |*pending| pending.arena.deinit();
         if (self.staged) |*staged| staged.arena.deinit();
+        if (self.composing) |*composing| composing.arena.deinit();
         if (self.vocabulary_arena) |*arena| arena.deinit();
         for (self.history.items) |turn| {
             self.cfg.gpa.free(turn.owner);
@@ -346,6 +366,47 @@ pub const Bot = struct {
             .bytes = owned_bytes,
             .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
         };
+    }
+
+    /// Allocations finish before the arena is moved; see `remember`.
+    fn rememberComposing(self: *Bot, recipient: []const u8, label: []const u8, instruction: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const owned_recipient = try arena.dupe(u8, recipient);
+        const owned_label = try arena.dupe(u8, label);
+        const owned_instruction = try arena.dupe(u8, instruction);
+
+        if (self.composing) |*previous| previous.arena.deinit();
+        self.composing = .{
+            .arena = arena_state,
+            .recipient = owned_recipient,
+            .label = owned_label,
+            .instruction = owned_instruction,
+            .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+        };
+    }
+
+    fn discardComposing(self: *Bot) void {
+        if (self.composing) |*composing| composing.arena.deinit();
+        self.composing = null;
+    }
+
+    /// Short-lived on purpose: a half-finished compose that outlives the
+    /// conversation would swallow an unrelated message hours later.
+    fn freshComposing(self: *Bot) ?*Composing {
+        if (self.composing == null) return null;
+        const composing = &self.composing.?;
+        const age = @divTrunc(
+            std.Io.Clock.now(.boot, self.cfg.io).nanoseconds - composing.created_ns,
+            std.time.ns_per_s,
+        );
+        if (age > COMPOSE_TTL_SECONDS) {
+            self.discardComposing();
+            return null;
+        }
+        return composing;
     }
 
     fn discardStaged(self: *Bot) void {
@@ -564,11 +625,27 @@ pub const Bot = struct {
                 },
                 .unclear => {},
             }
+        } else if (self.freshComposing() != null and answer == .cancel) {
+            self.discardComposing();
+            return "Dropped it. Nothing was drafted.";
         } else if (answer != .unclear) {
             // A bare yes/no with nothing pending is inert. It must never reach
             // the classifier, which once turned a stray "yes" into a brand-new
             // invented draft -- one more "yes" from sending it.
             return "There's no draft waiting, so there's nothing to say yes or no to.";
+        }
+
+        // A compose still missing a piece takes the next message as that
+        // piece. Re-classifying it cannot work: "youname@example.com" and
+        // "Thanks for the file" are not commands, and the classifier
+        // correctly called the second one unknown -- which left the compose
+        // stuck with nowhere to go.
+        if (self.freshComposing()) |composing| {
+            const needs_recipient = composing.recipient.len == 0;
+            log.info("filling in the {s} for a pending compose", .{
+                if (needs_recipient) "recipient" else "message",
+            });
+            return self.doComposeMail(arena, text, if (needs_recipient) null else text);
         }
 
         const understood = interpret_mod.interpret(
@@ -1280,30 +1357,82 @@ pub const Bot = struct {
     /// The recipient is *selected* from addresses that have really written to
     /// this mailbox -- never produced by a model. See contacts.zig for why
     /// that distinction is the whole design here.
+    /// A literal address in the owner's own message.
+    ///
+    /// This outranks everything else and consults no model. An address the
+    /// owner typed is owner input, not model output, so the invariant holds
+    /// even when that address has never written to this mailbox -- which is
+    /// the whole point of being able to write to someone new.
+    fn ownerTypedAddress(request: []const u8) ?[]const u8 {
+        var tokens = std.mem.tokenizeAny(u8, request, " \t\r\n,;<>()[]\"'");
+        while (tokens.next()) |token| {
+            if (headers_mod.address(token)) |found| return found;
+        }
+        return null;
+    }
+
+    /// "email myself the notes" -- the owner's own mailbox, which by
+    /// definition is rarely in a list built from people who wrote *to* it.
+    fn refersToSelf(request: []const u8) bool {
+        const markers = [_][]const u8{ "myself", "my own address", "my own email", "my own inbox" };
+        for (markers) |marker| {
+            if (std.ascii.indexOfIgnoreCase(request, marker) != null) return true;
+        }
+        return false;
+    }
+
     fn doComposeMail(self: *Bot, arena: std.mem.Allocator, request: []const u8, instruction: ?[]const u8) ![]const u8 {
-        const said = instruction orelse return "What should the email say?";
+        // Carry whatever was already gathered, so a compose can be assembled
+        // over several turns rather than demanding one perfect sentence.
+        var recipient: []const u8 = "";
+        var label: []const u8 = "";
+        var said: []const u8 = "";
+        if (self.freshComposing()) |carried| {
+            recipient = try arena.dupe(u8, carried.recipient);
+            label = try arena.dupe(u8, carried.label);
+            said = try arena.dupe(u8, carried.instruction);
+        }
+        if (instruction) |value| {
+            const given = std.mem.trim(u8, value, " \t\r\n");
+            if (given.len > 0) said = given;
+        }
 
-        const contacts = self.contactBook(arena) catch |err| {
-            log.err("could not read contacts: {s}", .{@errorName(err)});
-            return "Couldn't read your contacts right now -- try again in a bit.";
-        };
+        if (recipient.len == 0) {
+            if (ownerTypedAddress(request)) |typed| {
+                recipient = try arena.dupe(u8, typed);
+            } else if (refersToSelf(request)) {
+                recipient = self.cfg.imap_user;
+                label = "you";
+            } else {
+                const contacts = self.contactBook(arena) catch |err| {
+                    log.err("could not read contacts: {s}", .{@errorName(err)});
+                    return "Couldn't read your contacts right now -- try again in a bit.";
+                };
+                if (contacts_mod.resolve(
+                    self.cfg.io,
+                    arena,
+                    self.cfg.ollama_url,
+                    self.cfg.ollama_model,
+                    request,
+                    contacts,
+                )) |choice| {
+                    recipient = try arena.dupe(u8, contacts[choice].addressSlice());
+                    label = try arena.dupe(u8, contacts[choice].nameSlice());
+                }
+            }
+        }
 
-        const choice = contacts_mod.resolve(
-            self.cfg.io,
-            arena,
-            self.cfg.ollama_url,
-            self.cfg.ollama_model,
-            request,
-            contacts,
-        ) orelse {
-            // Never guessed at. Mail to the wrong person cannot be recalled,
-            // and there is no allowlist or preview that catches a plausible
-            // but wrong name.
-            return "I couldn't match that to anyone who's written to you. Include the full address in your request and I'll use it exactly.";
-        };
-
-        const contact = contacts[choice];
-        const recipient = try arena.dupe(u8, contact.addressSlice());
+        // Never guessed at. Mail to the wrong person cannot be recalled, and
+        // no preview catches a plausible-but-wrong name skimmed past.
+        if (recipient.len == 0) {
+            try self.rememberComposing("", "", said);
+            return "Who should this go to? Give me a name I'd recognise from your mail, or type the full address.";
+        }
+        if (said.len == 0) {
+            try self.rememberComposing(recipient, label, "");
+            return std.fmt.allocPrint(arena, "What should I say to {s}?", .{recipient});
+        }
+        self.discardComposing();
 
         self.client.sendTyping();
         const draft = summarize_mod.draftNew(
@@ -1323,7 +1452,7 @@ pub const Bot = struct {
             .body = draft.body,
             .in_reply_to = "",
             .references = "",
-        }, contact.nameSlice());
+        }, label);
     }
 
     /// Contacts, cached on the same clock as the voice vocabulary -- both cost
@@ -1488,4 +1617,38 @@ test "parseSearchArg splits off a trailing day count" {
     const name = parseSearchArg("Mail Delivery Subsystem");
     try std.testing.expectEqualStrings("Mail Delivery Subsystem", name.target);
     try std.testing.expectEqual(@as(?u16, null), name.days);
+}
+
+test "an address the owner typed is preferred over anything a model might pick" {
+    // Owner input, not model output -- so it is trusted even when the
+    // address has never written to this mailbox.
+    try std.testing.expectEqualStrings(
+        "youname@example.com",
+        Bot.ownerTypedAddress("youname@example.com").?,
+    );
+    try std.testing.expectEqualStrings(
+        "someone@acme.co.uk",
+        Bot.ownerTypedAddress("write to someone@acme.co.uk asking for a refund").?,
+    );
+    try std.testing.expectEqualStrings(
+        "bob@acme.com",
+        Bot.ownerTypedAddress("email <bob@acme.com>, thanks").?,
+    );
+
+    // Nothing address-shaped means fall through to the contact book.
+    try std.testing.expectEqual(@as(?[]const u8, null), Bot.ownerTypedAddress("email dana about thursday"));
+    try std.testing.expectEqual(@as(?[]const u8, null), Bot.ownerTypedAddress("send it to my accountant"));
+}
+
+test "self-reference resolves to the owner rather than the contact book" {
+    // The owner's own address is rarely in a list built from people who
+    // wrote *to* the mailbox, so this needs handling of its own.
+    try std.testing.expect(Bot.refersToSelf("I would like to send an email to myself with an attachment"));
+    try std.testing.expect(Bot.refersToSelf("mail it to my own address"));
+    try std.testing.expect(Bot.refersToSelf("MYSELF"));
+
+    // "me" alone is far too common to treat as self-addressing -- it appears
+    // in "send me the invoice", which is an attachment download.
+    try std.testing.expect(!Bot.refersToSelf("send me the invoice from that email"));
+    try std.testing.expect(!Bot.refersToSelf("email dana about thursday"));
 }
