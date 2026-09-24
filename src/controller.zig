@@ -14,6 +14,10 @@
 
 const std = @import("std");
 
+/// Namespaced so each module's output is identifiable in the journal,
+/// the way the Python version's per-module loggers were.
+const log = std.log.scoped(.controller);
+
 pub const Error = error{InvalidEntry};
 
 /// Accepts a full address or a bare domain: an optional `local@` part, then

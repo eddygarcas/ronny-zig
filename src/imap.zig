@@ -11,6 +11,10 @@
 
 const std = @import("std");
 
+/// Namespaced so each module's output is identifiable in the journal,
+/// the way the Python version's per-module loggers were.
+const log = std.log.scoped(.imap);
+
 pub const c = @cImport({
     @cInclude("libetpan/libetpan.h");
 });
@@ -65,7 +69,7 @@ pub fn isOk(code: c_int) bool {
 
 fn check(code: c_int, comptime err: Error) Error!void {
     if (!isOk(code)) {
-        std.log.err("libetpan returned {d}", .{code});
+        log.err("libetpan returned {d}", .{code});
         return err;
     }
 }
@@ -122,7 +126,7 @@ pub const Session = struct {
             .revents = 0,
         }};
         const ready = std.posix.poll(&fds, @as(i32, timeout_seconds) * 1000) catch |err| {
-            std.log.warn("poll on the IDLE socket failed: {s}", .{@errorName(err)});
+            log.warn("poll on the IDLE socket failed: {s}", .{@errorName(err)});
             return Error.Idle;
         };
         return ready > 0;

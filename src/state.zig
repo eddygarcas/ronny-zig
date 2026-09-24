@@ -13,6 +13,10 @@
 
 const std = @import("std");
 
+/// Namespaced so each module's output is identifiable in the journal,
+/// the way the Python version's per-module loggers were.
+const log = std.log.scoped(.state);
+
 pub const Snapshot = struct {
     uidvalidity: u32 = 0,
     last_uid: u32 = 0,
@@ -33,7 +37,7 @@ pub const State = struct {
 
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, max_file_bytes) catch |err| {
             if (err != error.FileNotFound) {
-                std.log.warn("could not read {s} ({s}); starting fresh", .{ path, @errorName(err) });
+                log.warn("could not read {s} ({s}); starting fresh", .{ path, @errorName(err) });
             }
             return state;
         };
@@ -42,7 +46,7 @@ pub const State = struct {
         const parsed = std.json.parseFromSlice(Snapshot, gpa, bytes, .{
             .ignore_unknown_fields = true,
         }) catch |err| {
-            std.log.warn("could not parse {s} ({s}); starting fresh", .{ path, @errorName(err) });
+            log.warn("could not parse {s} ({s}); starting fresh", .{ path, @errorName(err) });
             return state;
         };
         defer parsed.deinit();
@@ -68,7 +72,7 @@ pub const State = struct {
     pub fn syncUidValidity(self: *State, uidvalidity: u32, baseline_uid: u32) !void {
         if (self.snapshot.uidvalidity == uidvalidity) return;
 
-        std.log.info("uidvalidity {d} -> {d}; baselining watermark to {d}", .{
+        log.info("uidvalidity {d} -> {d}; baselining watermark to {d}", .{
             self.snapshot.uidvalidity, uidvalidity, baseline_uid,
         });
         self.snapshot = .{ .uidvalidity = uidvalidity, .last_uid = baseline_uid };

@@ -13,6 +13,10 @@ const imap = @import("imap.zig");
 const state_mod = @import("state.zig");
 const controller_mod = @import("controller.zig");
 
+/// Namespaced so each module's output is identifiable in the journal,
+/// the way the Python version's per-module loggers were.
+const log = std.log.scoped(.ronny);
+
 const MAX_NEW_PER_SCAN = 256;
 const IDLE_TIMEOUT_SECONDS = 300;
 
@@ -25,7 +29,7 @@ fn envOptional(init: std.process.Init, name: []const u8) !?[:0]u8 {
 
 fn envRequired(init: std.process.Init, name: []const u8) ![:0]u8 {
     return (try envOptional(init, name)) orelse {
-        std.log.err("missing environment variable {s}", .{name});
+        log.err("missing environment variable {s}", .{name});
         return ConfigError.MissingEnvironmentVariable;
     };
 }
@@ -56,19 +60,19 @@ pub fn main(init: std.process.Init) !void {
     var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
     var state = state_mod.State.load(init.io, arena, state_path);
 
-    std.log.info("connecting to {s} as {s}", .{ host, user });
+    log.info("connecting to {s} as {s}", .{ host, user });
     var session = try imap.Session.connect(host, 993, user, password);
     defer session.deinit();
 
     const selection = try session.examineInbox();
-    std.log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
+    log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
         selection.exists, selection.uid_next, selection.uid_validity,
     });
 
     // Baseline to the mailbox's current UIDNEXT, not zero, so a first run
     // watches from now instead of replaying 50k messages.
     try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
-    std.log.info("resuming from uid {d} (paused: {})", .{ state.lastUid(), controller.paused });
+    log.info("resuming from uid {d} (paused: {})", .{ state.lastUid(), controller.paused });
 
     var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
     while (true) {
@@ -76,11 +80,11 @@ pub fn main(init: std.process.Init) !void {
         // was down should be reported on connect rather than sitting unseen
         // until the first IDLE wakeup.
         scanOnce(&session, &controller, &state, &buffer) catch |err| {
-            std.log.err("scan failed: {s}", .{@errorName(err)});
+            log.err("scan failed: {s}", .{@errorName(err)});
         };
 
         const woke = session.idleWait(IDLE_TIMEOUT_SECONDS) catch |err| {
-            std.log.err("IDLE failed: {s}", .{@errorName(err)});
+            log.err("IDLE failed: {s}", .{@errorName(err)});
             return err;
         };
         _ = woke; // rescan either way; the timeout is the keepalive and safety net
@@ -107,9 +111,9 @@ fn scanOnce(
         if (sender.len > 0 and imap.senderMatches(sender, allowlist)) {
             matched += 1;
             if (controller.paused) {
-                std.log.info("paused -- not reporting uid={d} from={s}", .{ envelope.uid, sender });
+                log.info("paused -- not reporting uid={d} from={s}", .{ envelope.uid, sender });
             } else {
-                std.log.info("MATCH uid={d} from={s} subject={s}", .{
+                log.info("MATCH uid={d} from={s} subject={s}", .{
                     envelope.uid, sender, envelope.subjectSlice(),
                 });
             }
@@ -119,7 +123,7 @@ fn scanOnce(
         try state.advance(envelope.uid);
     }
 
-    std.log.info("scanned {d} new message(s), {d} matched the allowlist", .{ found.len, matched });
+    log.info("scanned {d} new message(s), {d} matched the allowlist", .{ found.len, matched });
 }
 
 test {
