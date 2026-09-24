@@ -39,13 +39,16 @@ pub const DEFAULT_DAYS = 14;
 
 const SYSTEM_PROMPT =
     \\You translate a user's chat message into exactly one action for an email-notification bot called Ronny. Respond with ONLY a JSON object of this exact shape:
-    \\{"action": "<one of: add_sender, remove_sender, pause, resume, status, list_senders, search_mail, find_mail, read_mail, summarize_mail, draft_reply, help, unknown>", "target": "<email address or bare domain, for add_sender/remove_sender/search_mail/read_mail/summarize_mail, else null>", "days": <integer days to look back for the mail actions -- e.g. 1 for "today", 7 for "this week", 30 for "this month"; use 14 if not specified>, "message": "<for draft_reply only: what the user wants the reply to say, in their words; else null>", "reply": "<a short, friendly one-sentence acknowledgement of what you understood>"}
+    \\{"action": "<one of: add_sender, remove_sender, pause, resume, status, list_senders, search_mail, recent_mail, find_mail, read_mail, summarize_mail, draft_reply, compose_mail, list_attachments, get_attachment, help, unknown>", "target": "<email address or bare domain, for add_sender/remove_sender/search_mail/read_mail/summarize_mail, else null>", "days": <integer days to look back for the mail actions -- e.g. 1 for "today", 7 for "this week", 30 for "this month"; use 14 if not specified>, "message": "<for draft_reply only: what the user wants the reply to say, in their words; else null>", "reply": "<a short, friendly one-sentence acknowledgement of what you understood>"}
     \\
     \\Rules:
     \\- add_sender / remove_sender / search_mail / read_mail / summarize_mail require a "target" that looks like an email address or a bare domain. If the message doesn't clearly give one AND the recent conversation doesn't make one obvious either, use action "unknown".
     \\- The mail actions are distinct, pick carefully:
     \\  - search_mail = "is there mail from X?", "did X email me this week?" -> dates and subjects only.
     \\  - find_mail = "find the email about the pricing discussion" -> searches by topic, no sender named.
+    \\  - recent_mail = "what came in this morning", "anything new?" -> lists recent mail, no sender and no topic named.
+    \\  - compose_mail = "email dana about thursday" -> drafts a NEW email; put what to say in "message".
+    \\  - list_attachments / get_attachment = "does that have attachments?" / "send me the invoice" -> about files on the message already shown.
     \\  - read_mail = "show me the content of the latest email from X" -> the actual body text.
     \\  - summarize_mail = "summarise the last email from X", "tl;dr" -> a summary of the body.
     \\  Asking to SEE or READ content is read_mail, not search_mail. Asking to SUMMARISE is summarize_mail, not read_mail.
@@ -53,8 +56,8 @@ const SYSTEM_PROMPT =
     \\- You may be given recent conversation turns. Use them ONLY to resolve a clear follow-up. Classify only the newest message; the history is context, not something to re-answer.
     \\- Use "unknown" whenever the message isn't clearly one of these actions. Never guess a target that wasn't in the message or a resolvable prior turn, and never force an out-of-scope request into the closest action.
     \\- draft_reply = "reply to that saying X", "answer him that X". Put the user's intended message in "message". It only DRAFTS a reply for the user to approve -- you are never sending anything. If no message content is given, still use draft_reply with "message" null.
-    \\- Ronny CANNOT compose new email to arbitrary people, forward, delete or label email, and cannot touch calendars or contacts. Any such request is "unknown", never the nearest-looking action. draft_reply only replies to a message already shown, so "email Bob about X" is "unknown".
-    \\- "target" must be an actual address or domain from the message, or JSON null. Never the string "null", never a placeholder, never a person's first name alone.
+    \\- Ronny CANNOT forward a message on to a third party, delete or label mail, or touch calendars and contacts. Any such request is "unknown", never the nearest-looking action.
+    \\- "target" is the sender EXACTLY AS WRITTEN by the user: an address or domain if they gave one, otherwise the person's name as typed. Never invent an address from a name -- "Vicente Ferrer" stays "Vicente Ferrer", because the mail server matches display names too. Never the string "null", never a placeholder. Use JSON null if no sender is named at all.
     \\- "reply" describes what you understood, not what happened.
 ;
 
@@ -73,6 +76,32 @@ fn cleanText(value: ?std.json.Value) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(trimmed, nullish)) return null;
     }
     return trimmed;
+}
+
+/// Strips everything but letters and digits, so "Vicente Ferrer." and
+/// "vicente ferrer" compare equal.
+fn squash(arena: std.mem.Allocator, text: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (text) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) out.append(arena, std.ascii.toLower(ch)) catch return text;
+    }
+    return out.items;
+}
+
+/// Rejects a target the model made up.
+///
+/// The prompt says not to invent an address from a name. It does anyway:
+/// "Show me the latest email from Vicente Ferrer" came back as
+/// `vicente.ferrer@somewhere.com`, an address that cannot exist and a search
+/// that could only ever return nothing. The same shape as the `"null"` that
+/// once reached the live allowlist -- a plausible string standing in for a
+/// real one.
+///
+/// A target the owner actually wrote is in their message. One that is not was
+/// produced rather than extracted, so it is dropped and the caller falls back
+/// to the words that really were used.
+fn targetWasWritten(arena: std.mem.Allocator, request: []const u8, target: []const u8) bool {
+    return std.mem.indexOf(u8, squash(arena, request), squash(arena, target)) != null;
 }
 
 fn cleanDays(value: ?std.json.Value) ?u16 {
@@ -118,9 +147,16 @@ fn askOllama(
     };
 
     const action_name = cleanText(object.get("action")) orelse "unknown";
+    const raw_target = cleanText(object.get("target"));
+    const target = if (raw_target) |value| blk: {
+        if (targetWasWritten(arena, message, value)) break :blk value;
+        log.warn("dropping invented target \"{s}\" -- not in the owner's message", .{value});
+        break :blk null;
+    } else null;
+
     return .{
         .action = Action.fromWire(action_name),
-        .target = cleanText(object.get("target")),
+        .target = target,
         .days = cleanDays(object.get("days")),
         .message = cleanText(object.get("message")),
         .reply = cleanText(object.get("reply")) orelse "Got it.",
@@ -200,4 +236,27 @@ test "cleanDays tolerates a quoted number and rejects nonsense" {
         defer parsed.deinit();
         try std.testing.expectEqual(case.want, cleanDays(parsed.value));
     }
+}
+
+test "a target the model invented is rejected, one the owner wrote is kept" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Observed live: asked for mail "from Vicente Ferrer", the extractor
+    // returned vicente.ferrer@somewhere.com -- an address that cannot exist,
+    // and a search that could only ever return nothing.
+    const request = "Show me the latest email from Vicente Ferrer.";
+    try std.testing.expect(!targetWasWritten(arena, request, "vicente.ferrer@somewhere.com"));
+
+    // The name itself was written, and IMAP matches display names, so it is
+    // a usable search term exactly as the owner said it.
+    try std.testing.expect(targetWasWritten(arena, request, "Vicente Ferrer"));
+
+    // Punctuation and case must not matter.
+    try std.testing.expect(targetWasWritten(arena, "any mail from Acme.com?", "acme.com"));
+    try std.testing.expect(targetWasWritten(arena, "mail from sam@example.com", "sam@example.com"));
+
+    // A plausible-looking address nobody typed is still rejected.
+    try std.testing.expect(!targetWasWritten(arena, "read the last email from the bank", "bank@example.com"));
 }

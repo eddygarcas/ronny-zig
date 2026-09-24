@@ -48,6 +48,10 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "what came in today?", .want = .recent_mail },
                 .{ .text = "anything new?", .want = .recent_mail },
                 .{ .text = "Just the latest one from this morning, regardless of who sent it.", .want = .read_mail },
+                // A person's NAME, not an address -- must stay read_mail and
+                // must not become a search for an invented address.
+                .{ .text = "Show me the latest email from Vicente Ferrer.", .want = .read_mail },
+                .{ .text = "any mail from Vicente Ferrer this week?", .want = .search_mail },
                 // Still out of scope.
                 .{ .text = "forward that to my accountant", .want = .unknown },
                 .{ .text = "delete all the newsletters", .want = .unknown },

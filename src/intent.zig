@@ -119,7 +119,7 @@ const SystemOneResponse = struct {
 /// detail because they were the ones actually confused in use.
 const ACTION_CRITERIA =
     \\{
-    \\  "search_mail": "List mail from a NAMED SENDER. The request identifies a person or domain, not a topic and not merely a time. If no sender is named, prefer recent_mail. Examples: 'any mail from acme.com?', 'did she email me this week?'",
+    \\  "search_mail": "List SEVERAL messages from a NAMED SENDER -- dates and subjects, not content. Not for a request wanting one message, which is read_mail. The request identifies a person or domain, not a topic and not merely a time. If no sender is named, prefer recent_mail. Examples: 'any mail from acme.com?', 'did she email me this week?'",
     \\  "recent_mail": "List SEVERAL messages that arrived recently, with no sender and no topic named -- the request is about *when*, not who or what. Not for a request wanting one message's content, which is read_mail even when no sender is named. Examples: 'what came in this morning', 'any mail today?', 'list the emails from this morning', 'anything new?', 'show me the latest email regardless of who sent it'",
     \\  "find_mail": "Find mail by its TOPIC or CONTENT -- what a message is about, or something someone said in it, when no sender is named. Examples: 'find the email about the pricing discussion', 'where did someone mention the Thursday deadline?'",
     \\  "read_mail": "Show the actual body text of ONE email -- the most recent, whether or not a sender is named. Use this whenever the request is for a single message's content, including 'just the latest one' or 'the last email, whoever sent it'. Examples: 'show me the content of the latest email from acme.com', 'what does his last email say?'",
