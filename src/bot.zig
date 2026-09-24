@@ -35,6 +35,7 @@ const transcribe = @import("transcribe.zig");
 const headers_mod = @import("headers.zig");
 const mailer = @import("mailer.zig");
 const attachments_mod = @import("attachments.zig");
+const contacts_mod = @import("contacts.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -66,6 +67,7 @@ pub const HELP_TEXT =
     \\/summarize <address-or-domain> [days] - summarize the latest email
     \\/attachments - list the files attached to the last email I showed you
     \\/get <name> - send me one of those files
+    \\/compose <who> <what to say> - draft a NEW email to someone
     \\/reply <text> - draft a reply to the last email I showed you
     \\/confirm - send the drafted reply
     \\/cancel - discard the drafted reply
@@ -627,6 +629,7 @@ pub const Bot = struct {
             else
                 "Summarize the latest mail from whom?",
             .draft_reply => try self.doDraftReply(arena, understood.message, false),
+            .compose_mail => try self.doComposeMail(arena, text, understood.message),
         };
 
         if (std.mem.eql(u8, result, understood.reply)) return result;
@@ -1168,6 +1171,36 @@ pub const Bot = struct {
 
         // A re-draft must be obvious: the owner must never confirm a body they
         // believe they reviewed while a different one is actually pending.
+        return self.stageDraft(arena, .{
+            .to = recipient,
+            .subject = subject,
+            .body = trimmed,
+            .in_reply_to = original.message_id,
+            .references = original.references,
+        }, "");
+    }
+
+    const DraftParts = struct {
+        to: []const u8,
+        subject: []const u8,
+        body: []const u8,
+        in_reply_to: []const u8,
+        references: []const u8,
+    };
+
+    /// Holds a draft pending approval and returns the preview.
+    ///
+    /// Shared by replies and new mail so both go through exactly one gate.
+    /// A second copy of this logic is how the two paths would drift until one
+    /// of them sends something unreviewed.
+    fn stageDraft(
+        self: *Bot,
+        arena: std.mem.Allocator,
+        parts: DraftParts,
+        recipient_label: []const u8,
+    ) ![]const u8 {
+        // A re-draft must be obvious: the owner must never confirm a body they
+        // believe they reviewed while a different one is actually pending.
         const replaced = self.pending != null;
 
         // Allocations finish before the arena is moved into place; see the
@@ -1176,11 +1209,11 @@ pub const Bot = struct {
         errdefer pending_arena.deinit();
         const pending_alloc = pending_arena.allocator();
 
-        const to = try pending_alloc.dupe(u8, recipient);
-        const pending_subject = try pending_alloc.dupe(u8, subject);
-        const pending_body = try pending_alloc.dupe(u8, trimmed);
-        const in_reply_to = try pending_alloc.dupe(u8, original.message_id);
-        const references = try pending_alloc.dupe(u8, original.references);
+        const to = try pending_alloc.dupe(u8, parts.to);
+        const pending_subject = try pending_alloc.dupe(u8, parts.subject);
+        const pending_body = try pending_alloc.dupe(u8, parts.body);
+        const in_reply_to = try pending_alloc.dupe(u8, parts.in_reply_to);
+        const references = try pending_alloc.dupe(u8, parts.references);
 
         // A staged upload rides along with the draft, so what gets approved
         // and what gets sent are the same thing.
@@ -1213,9 +1246,16 @@ pub const Bot = struct {
             .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
             .attachments = attached,
         };
-        log.info("drafted a reply to {s} with {d} attachment(s); awaiting confirmation", .{
-            recipient, attached.len,
+        log.info("drafted mail to {s} with {d} attachment(s); awaiting confirmation", .{
+            parts.to, attached.len,
         });
+
+        // The label names who the address belongs to, so a wrong pick is
+        // visible as a name rather than only as an address to squint at.
+        const addressed = if (recipient_label.len > 0)
+            try std.fmt.allocPrint(arena, "{s} <{s}>", .{ recipient_label, parts.to })
+        else
+            parts.to;
 
         return telegram.truncate(try std.fmt.allocPrint(arena,
             \\{s}DRAFT -- not sent.
@@ -1228,11 +1268,86 @@ pub const Bot = struct {
             \\Reply 'yes' to send it, or 'no' to discard it (/confirm and /cancel work too). Nothing is sent until you say so.
         , .{
             if (replaced) "*** THIS REPLACES YOUR PREVIOUS DRAFT -- read it again ***\n\n" else "",
-            recipient,
-            subject,
+            addressed,
+            parts.subject,
             attachment_line,
-            trimmed,
+            parts.body,
         }));
+    }
+
+    /// Drafts a brand-new email.
+    ///
+    /// The recipient is *selected* from addresses that have really written to
+    /// this mailbox -- never produced by a model. See contacts.zig for why
+    /// that distinction is the whole design here.
+    fn doComposeMail(self: *Bot, arena: std.mem.Allocator, request: []const u8, instruction: ?[]const u8) ![]const u8 {
+        const said = instruction orelse return "What should the email say?";
+
+        const contacts = self.contactBook(arena) catch |err| {
+            log.err("could not read contacts: {s}", .{@errorName(err)});
+            return "Couldn't read your contacts right now -- try again in a bit.";
+        };
+
+        const choice = contacts_mod.resolve(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            request,
+            contacts,
+        ) orelse {
+            // Never guessed at. Mail to the wrong person cannot be recalled,
+            // and there is no allowlist or preview that catches a plausible
+            // but wrong name.
+            return "I couldn't match that to anyone who's written to you. Include the full address in your request and I'll use it exactly.";
+        };
+
+        const contact = contacts[choice];
+        const recipient = try arena.dupe(u8, contact.addressSlice());
+
+        self.client.sendTyping();
+        const draft = summarize_mod.draftNew(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            recipient,
+            said,
+        ) catch {
+            return "Couldn't reach the local model to draft that. Try again in a bit.";
+        };
+
+        return self.stageDraft(arena, .{
+            .to = recipient,
+            .subject = draft.subject,
+            .body = draft.body,
+            .in_reply_to = "",
+            .references = "",
+        }, contact.nameSlice());
+    }
+
+    /// Contacts, cached on the same clock as the voice vocabulary -- both cost
+    /// a mailbox scan and neither changes minute to minute.
+    fn contactBook(self: *Bot, arena: std.mem.Allocator) ![]const contacts_mod.Contact {
+        const Context = struct {
+            arena: std.mem.Allocator,
+            list: []const contacts_mod.Contact = &.{},
+
+            fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                ctx.list = try contacts_mod.load(ctx.arena, session, contacts_mod.DEFAULT_DAYS);
+            }
+        };
+        var context: Context = .{ .arena = arena };
+        try self.withMailbox(&context, Context.run);
+
+        // Watched senders first: whoever the owner cared enough about to put
+        // on the allowlist beats whoever merely sends the most mail.
+        const allowlist = try self.controller.senders();
+        defer self.controller.freeSenders(allowlist);
+        const book = try contacts_mod.prioritise(arena, context.list, allowlist);
+
+        log.info("contact book: {d} writable address(es)", .{book.len});
+        return book;
     }
 
     fn doConfirm(self: *Bot, arena: std.mem.Allocator) ![]const u8 {

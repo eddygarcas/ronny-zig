@@ -40,6 +40,7 @@ pub const Action = enum {
     read_mail,
     summarize_mail,
     draft_reply,
+    compose_mail,
     list_attachments,
     get_attachment,
     help,
@@ -122,6 +123,7 @@ const ACTION_CRITERIA =
     \\  "read_mail": "Show the actual body text of the most recent email from someone. Examples: 'show me the content of the latest email from acme.com', 'what does his last email say?'",
     \\  "summarize_mail": "Summarize the most recent email from someone rather than showing it in full. Examples: 'summarise the last email from acme.com', 'give me the gist of it', 'tl;dr'",
     \\  "draft_reply": "Draft a reply to the email just shown, for the owner to approve. Drafting only; it never sends. Examples: 'reply saying Wednesday works'",
+    \\  "compose_mail": "Start a NEW email to someone, not a reply to anything. The recipient is named or described. Drafting only; it never sends. Examples: 'email dana about thursday', 'send sam the notes', 'write to support@acme.com asking for a refund'",
     \\  "list_attachments": "Say what files are attached to the email just shown, without sending any of them. Examples: 'does that have attachments?', 'what is attached to it?', 'any files on that one?'",
     \\  "get_attachment": "Send the owner a file attached to the email just shown. Examples: 'send me the invoice', 'download the pdf', 'give me that attachment', 'forward me the spreadsheet from it'",
     \\  "add_sender": "Add an email address or domain to the watched-sender allowlist.",
@@ -131,7 +133,7 @@ const ACTION_CRITERIA =
     \\  "resume": "Start sending notifications again after a pause.",
     \\  "status": "Report the assistant's own state: active or paused, and how many senders it watches. Not about mail content.",
     \\  "help": "Explain what the assistant can do.",
-    \\  "unknown": "None of the other options fit, or the request is something this assistant cannot do at all -- sending new mail to arbitrary people, forwarding, deleting, calendars, or anything unrelated."
+    \\  "unknown": "None of the other options fit, or the request is something this assistant cannot do at all -- forwarding a message on to a third party, deleting or filing mail, calendars, contacts, or anything unrelated to this mailbox."
     \\}
 ;
 

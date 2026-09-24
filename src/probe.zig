@@ -9,6 +9,8 @@ const imap = @import("imap.zig");
 const findmail = @import("findmail.zig");
 const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
+const intent = @import("intent.zig");
+const contacts = @import("contacts.zig");
 
 const VOCAB_ENTRY = 96;
 const VOCAB_MAX = 300;
@@ -17,6 +19,57 @@ extern fn ronny_sender_vocabulary(session: *imap.c.mailimap, days: c_int, out: [
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const env = init.environ_map;
+
+    // Routing first, because it needs no mailbox and the criteria changing is
+    // the thing most likely to have broken something already working.
+    if (env.get("TYPESAFE_API_KEY")) |key| {
+        if (key.len > 0) {
+            std.debug.print("=== Jev routing ===\n", .{});
+            const cases = [_]struct { text: []const u8, want: intent.Action }{
+                // The three that historically misrouted.
+                .{ .text = "show me the content of the latest email from example.org", .want = .read_mail },
+                .{ .text = "give me the last email from 1Password", .want = .read_mail },
+                .{ .text = "Send me an email saying: all ready", .want = .unknown },
+                // Existing behaviour that must survive the new options.
+                .{ .text = "summarise the last email from sam", .want = .summarize_mail },
+                .{ .text = "find the email about self-hosted deployment", .want = .find_mail },
+                .{ .text = "any mail from example.org this week?", .want = .search_mail },
+                .{ .text = "reply saying Wednesday works", .want = .draft_reply },
+                .{ .text = "add alex@example.com to the list", .want = .add_sender },
+                .{ .text = "stop bugging me for a bit", .want = .pause },
+                // The new ones.
+                .{ .text = "does that email have any attachments?", .want = .list_attachments },
+                .{ .text = "send me the invoice from it", .want = .get_attachment },
+                .{ .text = "download the pdf", .want = .get_attachment },
+                .{ .text = "email dana about thursday", .want = .compose_mail },
+                .{ .text = "write to support@acme.com asking for a refund", .want = .compose_mail },
+                // Still out of scope.
+                .{ .text = "forward that to my accountant", .want = .unknown },
+                .{ .text = "delete all the newsletters", .want = .unknown },
+                .{ .text = "what is the weather tomorrow", .want = .unknown },
+            };
+
+            var correct: usize = 0;
+            for (cases) |case| {
+                const decision = intent.classify(init.io, arena, key, "jev-latest", case.text, &.{}) catch |err| {
+                    std.debug.print("  ERR  {s}: {s}\n", .{ case.text, @errorName(err) });
+                    continue;
+                };
+                const got = intent.resolve(decision, intent.DEFAULT_MIN_CONFIDENCE);
+                const ok = got == case.want;
+                if (ok) correct += 1;
+                std.debug.print("  {s} {s}\n       want={s} got={s} conf={d:.2} unk={d:.2}\n", .{
+                    if (ok) "ok  " else "FAIL",
+                    case.text,
+                    case.want.wireName(),
+                    got.wireName(),
+                    decision.confidence,
+                    decision.unknown_probability,
+                });
+            }
+            std.debug.print("  {d}/{d} correct\n\n", .{ correct, cases.len });
+        }
+    }
 
     var session = try imap.Session.connect(
         try arena.dupeZ(u8, "imap.gmail.com"),
@@ -61,7 +114,7 @@ pub fn main(init: std.process.Init) !void {
             .body = "Thanks, noted.",
             .in_reply_to = (try headers.value(arena, raw, "Message-ID")) orelse "",
             .references = (try headers.value(arena, raw, "References")) orelse "",
-        });
+        }, "PROBE-BOUNDARY");
         std.debug.print("\n=== composed reply (not sent) ===\n{s}\n", .{draft[0..@min(draft.len, 500)]});
     }
 
@@ -72,6 +125,15 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("\n=== raw body, first 400 chars (what the ranker sees) ===\n{s}\n", .{
             body[0..@min(body.len, 400)],
         });
+    }
+
+    std.debug.print("\n=== contact book ===\n", .{});
+    {
+        const book = try contacts.load(arena, &session, contacts.DEFAULT_DAYS);
+        std.debug.print("  {d} contacts; top 10 by frequency:\n", .{book.len});
+        for (book[0..@min(book.len, 10)]) |contact| {
+            std.debug.print("    {d:>3}x  {s} <{s}>\n", .{ contact.count, contact.nameSlice(), contact.addressSlice() });
+        }
     }
 
     std.debug.print("\n=== attachments on real mail ===\n", .{});

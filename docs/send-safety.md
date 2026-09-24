@@ -13,11 +13,25 @@ safe.
 
 ## The invariants
 
-- **A reply may only target a message Ronny has already fetched and shown.**
-  The recipient comes from that message's `Reply-To`/`From` headers
-  (`src/headers.zig`), **never from model output**, so a hallucinated address
-  is structurally impossible rather than merely unlikely. Sender only, never
-  reply-all — the blast radius of a mistake stays one person.
+- **No address ever originates from model output.** This is the invariant;
+  the two rules below are how it is kept in the two cases that exist.
+
+  - **A reply** may only target a message Ronny has already fetched and
+    shown. The recipient comes from that message's `Reply-To`/`From` headers
+    (`src/headers.zig`). Sender only, never reply-all — the blast radius of a
+    mistake stays one person.
+
+  - **A new email** has no such message, so the recipient is *selected* from
+    a list of addresses that have really written to this mailbox
+    (`src/contacts.zig`). The model returns an index, never a string. If
+    nothing clearly matches, Ronny asks the owner to include the full address
+    rather than guessing between similar names.
+
+  Both then show the literal address in the draft, and both go through the
+  same approval gate. Note what is *not* allowed: a model producing an
+  address as free text. That is the shape that once wrote the literal string
+  `"null"` into the live allowlist — embarrassing in a config file, and a
+  stranger's inbox in a `To:` header.
 
 - **There is no send action in the intent vocabulary** (`src/intent.zig`).
   Drafting is model-reachable; sending is not. No misclassification can reach
@@ -49,9 +63,15 @@ safe.
 - **Drafts expire** (`PENDING_REPLY_TTL_SECONDS`), so a forgotten draft cannot
   be confirmed hours later against a thread that has moved on.
 
+- **An attachment is named in the draft preview.** A file the owner did not
+  notice is a file they did not approve, so the draft says what is attached
+  before the yes, and the staged upload is cleared on send *and* on cancel —
+  leaving it would quietly ride along on the next unrelated draft.
+
 - **`src/mailer.zig` is the only code that can send, and is decision-free.**
   It takes an explicit recipient and a body. All policy lives at the call
-  site.
+  site. Both drafting paths funnel through one `stageDraft`, so there is a
+  single gate rather than two that can drift.
 
 ## The three bugs that produced these rules
 

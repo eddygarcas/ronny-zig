@@ -60,6 +60,8 @@ re-read each scan so chat commands take effect without a restart.
 | `src/summarize.zig` | Summaries and reply drafts |
 | `src/headers.zig` | RFC 5322 header reading — where a reply's recipient comes from |
 | `src/mailer.zig` | The only code that can send mail. Decision-free by design |
+| `src/attachments.zig` | Which attached file the owner meant (local model) |
+| `src/contacts.zig` | Who a new email can go to. Selected, never generated |
 | `src/transcribe.zig` | Voice notes, plus the transcript repair pass |
 | `src/watchdog.zig` | Journal tailing, incident classification, diagnosis |
 | `src/ollama.zig` | The one door to the local model |
@@ -71,9 +73,10 @@ re-read each scan so chat commands take effect without a restart.
 1. **Nothing sends mail without an explicit yes.** There is no send action in
    the intent vocabulary, so no misclassification can reach the mailer.
    Approval is resolved by word matching, never by a model.
-2. **A reply can only target a message already shown**, with the recipient
-   taken from that message's real headers — a hallucinated address is
-   structurally impossible.
+2. **No address ever originates from model output.** A reply takes its
+   recipient from the headers of a message already shown; a new email
+   selects one from addresses that have really written to this mailbox. The
+   model returns an index, never a string.
 3. **Email content never leaves the machine.** Spam checks, summaries, drafts
    and search ranking all run on local Ollama. Only the chat command itself
    goes to a hosted model, and that is optional.

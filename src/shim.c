@@ -843,6 +843,131 @@ int ronny_sender_vocabulary(mailimap *session, int days, char *out, int max_out)
     return count;
 }
 
+/* ---- contacts ---- */
+
+#define RONNY_CONTACT_NAME 96
+#define RONNY_CONTACT_ADDR 128
+
+typedef struct {
+    char name[RONNY_CONTACT_NAME];     /* display name, RFC 2047 decoded */
+    char address[RONNY_CONTACT_ADDR];  /* mailbox@host */
+    uint32_t count;                    /* messages from them in the window */
+} ronny_contact;
+
+/* Everyone who has written to this mailbox recently, most frequent first.
+ *
+ * This exists so composing a new email can *select* a recipient rather than
+ * have a model invent one. Every address here came off a real message, so a
+ * hallucinated recipient is not merely unlikely, it is unavailable.
+ *
+ * The frequency count is what makes "email dana" resolve sensibly when two
+ * people share a first name: the one who actually corresponds wins.
+ */
+int ronny_contacts(mailimap *session, int days, ronny_contact *out, int max_out) {
+    if (session == NULL || out == NULL || max_out <= 0) return -1;
+    memset(out, 0, (size_t)max_out * sizeof(ronny_contact));
+
+    time_t since_t = time(NULL) - (time_t)days * 24 * 60 * 60;
+    struct tm tm_since;
+    gmtime_r(&since_t, &tm_since);
+
+    struct mailimap_date *since = mailimap_date_new(tm_since.tm_mday, tm_since.tm_mon + 1, tm_since.tm_year + 1900);
+    if (since == NULL) return -1;
+    struct mailimap_search_key *key = mailimap_search_key_new_since(since);
+    if (key == NULL) { mailimap_date_free(since); return -1; }
+
+    clist *uid_list = NULL;
+    int r = mailimap_uid_search(session, NULL, key, &uid_list);
+    mailimap_search_key_free(key);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+    if (uid_list == NULL) return 0;
+
+    uint32_t uids[1024];
+    int n = 0;
+    for (clistiter *it = clist_begin(uid_list); it != NULL && n < 1024; it = clist_next(it)) {
+        uint32_t *uid = clist_content(it);
+        if (uid != NULL) uids[n++] = *uid;
+    }
+    mailimap_search_result_free(uid_list);
+    if (n == 0) return 0;
+
+    for (int i = 0; i < n - 1; i++)
+        for (int j = i + 1; j < n; j++)
+            if (uids[j] > uids[i]) { uint32_t t = uids[i]; uids[i] = uids[j]; uids[j] = t; }
+    if (n > 600) n = 600;
+
+    struct mailimap_set *set = mailimap_set_new_empty();
+    if (set == NULL) return -1;
+    for (int i = 0; i < n; i++) mailimap_set_add_single(set, uids[i]);
+
+    struct mailimap_fetch_type *fetch_type = mailimap_fetch_type_new_fetch_att_list_empty();
+    if (fetch_type == NULL) { mailimap_set_free(set); return -1; }
+    if (mailimap_fetch_type_new_fetch_att_list_add(fetch_type, mailimap_fetch_att_new_envelope()) != MAILIMAP_NO_ERROR) {
+        mailimap_fetch_type_free(fetch_type);
+        mailimap_set_free(set);
+        return -1;
+    }
+
+    clist *result = NULL;
+    r = mailimap_uid_fetch(session, set, fetch_type, &result);
+    mailimap_fetch_type_free(fetch_type);
+    mailimap_set_free(set);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+
+    int count = 0;
+    for (clistiter *it = clist_begin(result); it != NULL; it = clist_next(it)) {
+        struct mailimap_msg_att *msg = clist_content(it);
+        if (msg == NULL) continue;
+
+        for (clistiter *ait = clist_begin(msg->att_list); ait != NULL; ait = clist_next(ait)) {
+            struct mailimap_msg_att_item *item = clist_content(ait);
+            if (item == NULL || item->att_type != MAILIMAP_MSG_ATT_ITEM_STATIC) continue;
+            struct mailimap_msg_att_static *stat = item->att_data.att_static;
+            if (stat == NULL || stat->att_type != MAILIMAP_MSG_ATT_ENVELOPE) continue;
+
+            struct mailimap_envelope *env = stat->att_data.att_env;
+            if (env == NULL || env->env_from == NULL || env->env_from->frm_list == NULL) continue;
+            clistiter *fit = clist_begin(env->env_from->frm_list);
+            if (fit == NULL) continue;
+            struct mailimap_address *addr = clist_content(fit);
+            if (addr == NULL || addr->ad_mailbox_name == NULL || addr->ad_host_name == NULL) continue;
+
+            char address[RONNY_CONTACT_ADDR];
+            snprintf(address, sizeof(address), "%s@%s", addr->ad_mailbox_name, addr->ad_host_name);
+
+            int existing = -1;
+            for (int i = 0; i < count; i++) {
+                if (strcasecmp(out[i].address, address) == 0) { existing = i; break; }
+            }
+            if (existing >= 0) {
+                out[existing].count++;
+                /* Keep the first display name seen; later ones are often
+                 * "Name via List" or other decorations. */
+                continue;
+            }
+            if (count >= max_out) continue;
+
+            copy_bounded(out[count].address, sizeof(out[count].address), address);
+            if (addr->ad_personal_name != NULL) {
+                decode_header(out[count].name, sizeof(out[count].name), addr->ad_personal_name);
+            }
+            out[count].count = 1;
+            count++;
+        }
+    }
+    mailimap_fetch_list_free(result);
+
+    /* Most frequent first, so a first name resolves to whoever actually
+     * corresponds rather than whoever happens to be alphabetically lucky. */
+    for (int i = 0; i < count - 1; i++)
+        for (int j = i + 1; j < count; j++)
+            if (out[j].count > out[i].count) {
+                ronny_contact tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+            }
+
+    return count;
+}
+
 /* Gmail's own search, exposed over IMAP as the X-GM-RAW search key.
  *
  * This is what makes content search work without a local index: Gmail already
