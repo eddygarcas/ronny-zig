@@ -968,6 +968,34 @@ int ronny_contacts(mailimap *session, int days, ronny_contact *out, int max_out)
     return count;
 }
 
+/* Everything received in the last `days`, newest first, whoever sent it.
+ *
+ * Separate from ronny_search_from because "what came in this morning" has no
+ * sender to search on. It could be faked by searching FROM "@", since every
+ * From header contains one, but that leans on a substring quirk to express
+ * something IMAP says directly.
+ */
+int ronny_search_recent(mailimap *session, int days,
+                        ronny_envelope *out, int max_out) {
+    if (session == NULL || out == NULL || max_out <= 0) return -1;
+
+    time_t since_t = time(NULL) - (time_t)days * 24 * 60 * 60;
+    struct tm tm_since;
+    gmtime_r(&since_t, &tm_since);
+
+    struct mailimap_date *since = mailimap_date_new(tm_since.tm_mday, tm_since.tm_mon + 1, tm_since.tm_year + 1900);
+    if (since == NULL) return -1;
+    struct mailimap_search_key *key = mailimap_search_key_new_since(since);
+    if (key == NULL) { mailimap_date_free(since); return -1; }
+
+    clist *uid_list = NULL;
+    int r = mailimap_uid_search(session, NULL, key, &uid_list);
+    mailimap_search_key_free(key);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+
+    return envelopes_for_uids(session, uid_list, out, max_out);
+}
+
 /* Gmail's own search, exposed over IMAP as the X-GM-RAW search key.
  *
  * This is what makes content search work without a local index: Gmail already

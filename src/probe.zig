@@ -43,6 +43,11 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "download the pdf", .want = .get_attachment },
                 .{ .text = "email dana about thursday", .want = .compose_mail },
                 .{ .text = "write to support@acme.com asking for a refund", .want = .compose_mail },
+                // The generic, sender-less requests that had nowhere to go.
+                .{ .text = "List all the emails from this morning.", .want = .recent_mail },
+                .{ .text = "what came in today?", .want = .recent_mail },
+                .{ .text = "anything new?", .want = .recent_mail },
+                .{ .text = "Just the latest one from this morning, regardless of who sent it.", .want = .read_mail },
                 // Still out of scope.
                 .{ .text = "forward that to my accountant", .want = .unknown },
                 .{ .text = "delete all the newsletters", .want = .unknown },

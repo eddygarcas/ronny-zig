@@ -65,7 +65,7 @@ pub const HELP_TEXT =
     \\/add <address-or-domain> - add to the allowlist
     \\/remove <address-or-domain> - remove from the allowlist
     \\/search <address-or-domain> [days] - list recent mail (dates + subjects)
-    \\/find <what it was about> - search mail by topic, not sender
+    \\/recent [days] - what has arrived lately, whoever sent it\n    \\/find <what it was about> - search mail by topic, not sender
     \\/read <address-or-domain> [days] - show the latest email's content
     \\/summarize <address-or-domain> [days] - summarize the latest email
     \\/attachments - list the files attached to the last email I showed you
@@ -597,6 +597,10 @@ pub const Bot = struct {
             if (arg.len == 0) return "Usage: /find <what the email was about>";
             return self.doFind(arena, arg);
         }
+        if (std.mem.eql(u8, command, "/recent")) {
+            const days = std.fmt.parseInt(u16, arg, 10) catch null;
+            return self.doRecentMail(arena, days);
+        }
         if (std.mem.eql(u8, command, "/attachments")) return self.doListAttachments(arena);
         if (std.mem.eql(u8, command, "/get")) {
             // No argument means "the only one", which doGetAttachment handles
@@ -728,14 +732,10 @@ pub const Bot = struct {
                 try self.doSearch(arena, target, understood.days)
             else
                 "Search mail from whom?",
-            .read_mail => if (understood.target) |target|
-                try self.doRead(arena, target, understood.days)
-            else
-                "Read the latest mail from whom?",
-            .summarize_mail => if (understood.target) |target|
-                try self.doSummarize(arena, target, understood.days)
-            else
-                "Summarize the latest mail from whom?",
+            // A missing sender means "from anyone", not a failure to parse.
+            .read_mail => try self.doRead(arena, understood.target orelse "", understood.days),
+            .summarize_mail => try self.doSummarize(arena, understood.target orelse "", understood.days),
+            .recent_mail => try self.doRecentMail(arena, understood.days),
             .draft_reply => try self.doDraftReply(arena, understood.message, false),
             .compose_mail => try self.doComposeMail(arena, text, understood.message, spoken),
         };
@@ -861,6 +861,12 @@ pub const Bot = struct {
     };
 
     /// The newest message from `target` within `days`, or null.
+    /// The newest message from `target`, or -- when `target` is empty -- the
+    /// newest message from anyone.
+    ///
+    /// "Show me the last email" names no sender, and refusing to answer it
+    /// was worse than useless: the follow-up question ("from whom?") cannot
+    /// be answered by someone who does not care who sent it.
     fn fetchLatest(
         self: *Bot,
         arena: std.mem.Allocator,
@@ -879,8 +885,11 @@ pub const Bot = struct {
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
                 ctx.found = null;
-                // searchFrom returns newest first, so one slot is enough.
-                const hits = try session.searchFrom(ctx.target, ctx.days, ctx.buffer);
+                // Both return newest first, so one slot is enough.
+                const hits = if (ctx.target.len == 0)
+                    try session.searchRecent(ctx.days, ctx.buffer)
+                else
+                    try session.searchFrom(ctx.target, ctx.days, ctx.buffer);
                 if (hits.len == 0) return;
 
                 var message: imap.Message = undefined;
@@ -1099,12 +1108,63 @@ pub const Bot = struct {
         return telegram.truncate(out.writer.buffered());
     }
 
+    /// Everything that arrived recently, whoever sent it.
+    ///
+    /// The gap this fills: every other mail action is keyed on a sender or a
+    /// topic, so "what came in this morning" had nowhere to go. It routed to
+    /// read_mail with no target and asked who -- a question the request has
+    /// already answered with "anyone".
+    fn doRecentMail(self: *Bot, arena: std.mem.Allocator, days_opt: ?u16) ![]const u8 {
+        // IMAP's SINCE has date granularity, so "this morning" is today.
+        const days = days_opt orelse 1;
+        const buffer = try arena.alloc(imap.Envelope, SEARCH_RESULT_LIMIT);
+
+        const Context = struct {
+            days: u16,
+            buffer: []imap.Envelope,
+            hits: []imap.Envelope = &.{},
+
+            fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                ctx.hits = try session.searchRecent(ctx.days, ctx.buffer);
+            }
+        };
+
+        var context: Context = .{ .days = days, .buffer = buffer };
+        self.withMailbox(&context, Context.run) catch |err| {
+            log.err("recent-mail search failed: {s}", .{@errorName(err)});
+            return "Couldn't search the mailbox right now -- try again in a bit.";
+        };
+
+        if (context.hits.len == 0) {
+            return std.fmt.allocPrint(arena, "Nothing in the last {d} day(s).", .{days});
+        }
+
+        // Open the newest, so "read it" or "does it have attachments" works
+        // straight after without naming anyone.
+        self.rememberFound(arena, context.hits[0].uid) catch |err| {
+            log.warn("could not open the newest message: {s}", .{@errorName(err)});
+        };
+
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("{d} message(s) in the last {d} day(s):", .{ context.hits.len, days });
+        for (context.hits) |*envelope| {
+            try out.writer.print("\n- {s}\n  {s} | {s}", .{
+                envelope.subjectSlice(), envelope.fromSlice(), envelope.dateSlice(),
+            });
+        }
+        try out.writer.writeAll("\n\nThe newest one is open -- ask about \"it\" and I'll mean that.");
+        return telegram.truncate(out.writer.buffered());
+    }
+
     fn doRead(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
         const days = days_opt orelse DEFAULT_DAYS;
         const latest = self.fetchLatest(arena, target, days) catch |err| {
             log.err("fetching the latest mail failed for {s}: {s}", .{ target, @errorName(err) });
             return "Couldn't read the mailbox right now -- try again in a bit.";
         } orelse {
+            if (target.len == 0) {
+                return std.fmt.allocPrint(arena, "Nothing in the last {d} day(s).", .{days});
+            }
             return std.fmt.allocPrint(arena, "No mail from {s} in the last {d} day(s).", .{ target, days });
         };
 
@@ -1128,6 +1188,9 @@ pub const Bot = struct {
             log.err("fetching the latest mail failed for {s}: {s}", .{ target, @errorName(err) });
             return "Couldn't read the mailbox right now -- try again in a bit.";
         } orelse {
+            if (target.len == 0) {
+                return std.fmt.allocPrint(arena, "Nothing in the last {d} day(s).", .{days});
+            }
             return std.fmt.allocPrint(arena, "No mail from {s} in the last {d} day(s).", .{ target, days });
         };
 

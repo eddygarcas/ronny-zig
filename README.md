@@ -233,8 +233,9 @@ Plain language works; the slash commands are the same actions, spelled out.
 | `/status`, `/senders` | what it is doing, who it watches |
 | `/add`, `/remove` | change the allowlist, live |
 | `/search <who> [days]` | recent mail from someone, dates and subjects |
+| `/recent [days]` | what has arrived lately, whoever sent it |
 | `/find <topic>` | search by what a message was *about* |
-| `/read`, `/summarize <who>` | the latest message, in full or summarised |
+| `/read`, `/summarize [who]` | the latest message, in full or summarised — the sender is optional |
 | `/attachments`, `/get <name>` | what is attached; send me one |
 | `/reply <text>` | draft a reply to the last message shown |
 | `/compose <who> <what>` | draft a new email |

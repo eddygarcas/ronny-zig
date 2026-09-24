@@ -52,6 +52,7 @@ extern fn ronny_fetch_envelopes_since(session: *c.mailimap, first_uid: u32, out:
 extern fn ronny_fetch_message(session: *c.mailimap, uid: u32, out: *Message) c_int;
 extern fn ronny_fetch_attachment(session: *c.mailimap, uid: u32, index: u32, out: [*]u8, cap: usize) c_long;
 extern fn ronny_search_from(session: *c.mailimap, sender: [*:0]const u8, days: c_int, out: [*]Envelope, max_out: c_int) c_int;
+extern fn ronny_search_recent(session: *c.mailimap, days: c_int, out: [*]Envelope, max_out: c_int) c_int;
 extern fn ronny_search_gmail(session: *c.mailimap, query: [*:0]const u8, out: [*]Envelope, max_out: c_int) c_int;
 
 pub const Error = error{
@@ -200,6 +201,16 @@ pub const Session = struct {
     /// searches silently rewrites the earlier results.
     pub fn searchFrom(self: *Session, sender: [:0]const u8, days: u16, buffer: []Envelope) Error![]Envelope {
         const n = ronny_search_from(self.imap, sender.ptr, days, buffer.ptr, @intCast(buffer.len));
+        if (n < 0) return Error.Fetch;
+        return buffer[0..@intCast(n)];
+    }
+
+    /// Everything from the last `days`, newest first, whoever sent it.
+    ///
+    /// "What came in this morning" names no sender, so none of the
+    /// sender-keyed searches can answer it.
+    pub fn searchRecent(self: *Session, days: u16, buffer: []Envelope) Error![]Envelope {
+        const n = ronny_search_recent(self.imap, days, buffer.ptr, @intCast(buffer.len));
         if (n < 0) return Error.Fetch;
         return buffer[0..@intCast(n)];
     }
