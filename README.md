@@ -34,10 +34,64 @@ model for classification, and even that is optional.
 ## Running it
 
 ```
-zig build            # -> zig-out/bin/ronny
 zig build test
 cp .env.example .env # then fill it in
+
+zig build -Doptimize=ReleaseSafe \
+          -Dwhisper-prefix=/path/to/.local/opt/whisper-cuda   # -> zig-out/bin/ronny
 ```
+
+`-Dwhisper-prefix` is optional but matters a great deal for voice. See below.
+
+### Voice on the GPU
+
+The distro `whisper-cpp` package ships **CPU backends only** — `/usr/lib/ggml`
+holds fourteen `libggml-cpu-*.so` and no `libggml-cuda.so` — so voice notes
+transcribe at roughly real time on a machine with an idle RTX 3060. Measured
+encode time per 30s window of audio, medium model:
+
+| | encode |
+|---|---|
+| CPU, 4 threads (whisper's default here) | 13.2 s |
+| CPU, 8 threads | 6.6 s |
+| **CUDA on the 3060** | **0.09 s** |
+
+Nothing in Ronny changes between those; it is purely which ggml backend is
+available. There is no CUDA whisper.cpp in the repos or the AUR, so build one:
+
+```
+git clone --depth 1 --branch v1.9.3 https://github.com/ggml-org/whisper.cpp
+cd whisper.cpp
+PATH=/opt/cuda/bin:$PATH cmake -B build \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-15 \
+  -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_TESTS=OFF \
+  -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/whisper-cuda"
+cmake --build build -j12 && cmake --install build
+```
+
+Four details in there are load-bearing, each found the hard way:
+
+- **`CMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-15`.** nvcc 13.3 refuses any host
+  compiler above GCC 15 and this host defaults to 16.2. `gcc15` is packaged,
+  so this costs nothing — but without it the configure step fails outright.
+- **`CMAKE_INSTALL_RPATH='$ORIGIN'`.** CMake strips rpaths on install by
+  default, which leaves `libggml.so` unable to find `libggml-cuda.so` sitting
+  right beside it. The symptom is nastier than a clean failure: the loader
+  falls back to the *distro's* `libggml-base` from `/usr/lib`, quietly mixing
+  two builds.
+- **`v1.9.3`**, matching the distro package, so `src/whisper_shim.c` keeps
+  compiling against the API it was written for.
+- **`CMAKE_CUDA_ARCHITECTURES=86`** is just the 3060. Omit it and you compile
+  kernels for every GPU generation, for no benefit here.
+
+It installs under `$HOME`, needs no sudo, and overwrites nothing — the system
+`whisper-cpp` stays as it is, so dropping `-Dwhisper-prefix` reverts to it.
+`build.zig` bakes the prefix in as an rpath, so the unit files need no
+`LD_LIBRARY_PATH`. Check it took with `ldd zig-out/bin/ronny | grep ggml`:
+every line should point at the prefix, none at `/usr/lib`.
 
 Three subcommands, three processes:
 
@@ -109,10 +163,9 @@ pleasant to walk in C. They hand Zig flat data.
 
 ## Known gaps
 
-- The bot has been built and compiled but not yet run end to end, because
-  doing so means stopping the Python poller. The watcher, search, MIME
-  extraction, header parsing and reply composition have all been exercised
-  against the real mailbox.
+- The whisper.cpp CUDA build lives outside pacman, so a `whisper-cpp` package
+  upgrade won't touch it and won't update it either. If the API ever drifts
+  far enough that `whisper_shim.c` stops compiling, rebuild from a newer tag.
 - `build.zig` pins an explicit glibc target to work around Zig 0.16's ELF
   linker not handling the `.sframe` relocations this host's GCC emits. When
   `zig build -Dtarget=native` links cleanly, that workaround and the explicit

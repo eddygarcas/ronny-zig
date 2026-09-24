@@ -37,6 +37,24 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
+    // Where to find whisper.cpp, if not the system package.
+    //
+    // The distro's whisper-cpp ships CPU backends only -- /usr/lib/ggml holds
+    // fourteen libggml-cpu-*.so and no libggml-cuda.so -- so voice notes
+    // transcribe at roughly real time on a machine with an idle RTX 3060.
+    // Pointing this at a CUDA-enabled build is the whole fix; nothing in the
+    // Zig or C code changes, because ggml loads its backends by dlopen at
+    // runtime and simply picks the best one it finds.
+    //
+    //   zig build -Dwhisper-prefix=/path/to/.local/opt/whisper-cuda
+    //
+    // Unset, the system package is used, which still works -- just slowly.
+    const whisper_prefix = b.option(
+        []const u8,
+        "whisper-prefix",
+        "Prefix of a whisper.cpp install to use instead of the system package",
+    );
+
     // libetpan gives us IMAP and MIME parsing in C, which is the bulk of what
     // Python's imaplib and email modules were doing.
     //
@@ -61,6 +79,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "c", .module = translate_c.createModule() },
         },
     });
+
+    // Ahead of /usr, so a prefix build wins over the system package.
+    addWhisperPaths(b, root, whisper_prefix);
 
     root.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
     root.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
@@ -113,6 +134,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "c", .module = translate_c.createModule() }},
             }),
         });
+        addWhisperPaths(b, probe.root_module, whisper_prefix);
         probe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
         probe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
         probe.root_module.linkSystemLibrary("etpan", .{});
@@ -131,4 +153,16 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = root });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// Points a module at a whisper.cpp install outside the system prefix.
+///
+/// Must be called before the /usr paths so this build takes precedence. The
+/// rpath matters as much as the library path: without it the binary links
+/// fine and then fails to start under systemd, which has no LD_LIBRARY_PATH.
+fn addWhisperPaths(b: *std.Build, module: *std.Build.Module, prefix: ?[]const u8) void {
+    const root_prefix = prefix orelse return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root_prefix, "include" }) });
+    module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root_prefix, "lib" }) });
+    module.addRPath(.{ .cwd_relative = b.pathJoin(&.{ root_prefix, "lib" }) });
 }
