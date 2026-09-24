@@ -1,6 +1,8 @@
-<img src="docs/ronny-logo.png" alt="Ronny" width="140" align="right">
+<p align="center">
+  <img src="docs/ronny-logo.png" alt="Ronny" width="200">
+</p>
 
-# Ronny (Zig)
+<h1 align="center">Ronny email manager</h1>
 
 An email assistant that watches a Gmail inbox, notifies over Telegram for an
 allowlist of senders, suppresses anything that looks like spam — *even from an
