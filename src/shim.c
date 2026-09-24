@@ -172,10 +172,80 @@ typedef struct {
     char body[RONNY_BODY_MAX];
 } ronny_message;
 
-/* Fetches headers and text body for one UID.
+/* Is this MIME part text, and of which subtype? */
+static int part_is_text(struct mailmime *mime, const char *subtype) {
+    struct mailmime_content *content = mime->mm_content_type;
+    if (content == NULL || content->ct_type == NULL) {
+        /* No Content-Type at all means text/plain by RFC 2045. */
+        return strcasecmp(subtype, "plain") == 0;
+    }
+    if (content->ct_type->tp_type != MAILMIME_TYPE_DISCRETE_TYPE) return 0;
+    if (content->ct_type->tp_data.tp_discrete_type->dt_type != MAILMIME_DISCRETE_TYPE_TEXT) return 0;
+    return content->ct_subtype != NULL && strcasecmp(content->ct_subtype, subtype) == 0;
+}
+
+/* Appends one text part's decoded content to `dst`.
  *
- * Header and text parts are requested separately: the deterministic spam
- * checks only read headers, and the model only needs the text. Requesting
+ * mailmime_part_parse is what undoes quoted-printable and base64. Without it
+ * the model reads "We=E2=80=99ll" instead of "We'll", which is exactly the
+ * kind of thing that makes a ranker decide nothing matched.
+ */
+static int append_decoded(struct mailmime *mime, char *dst, size_t cap) {
+    struct mailmime_data *data = mime->mm_data.mm_single;
+    if (data == NULL || data->dt_type != MAILMIME_DATA_TEXT) return 0;
+
+    size_t index = 0;
+    char *decoded = NULL;
+    size_t decoded_len = 0;
+    int r = mailmime_part_parse(data->dt_data.dt_text.dt_data,
+                                data->dt_data.dt_text.dt_length,
+                                &index, data->dt_encoding, &decoded, &decoded_len);
+    if (r != MAILIMF_NO_ERROR || decoded == NULL) return 0;
+
+    size_t used = strlen(dst);
+    size_t room = cap - used - 1;
+    size_t n = decoded_len < room ? decoded_len : room;
+    memcpy(dst + used, decoded, n);
+    dst[used + n] = '\0';
+    mmap_string_unref(decoded);
+    return n > 0;
+}
+
+/* Walks the MIME tree for readable text, preferring `subtype`.
+ *
+ * Depth-first and stops at the first match: alternative parts carry the same
+ * content twice, so taking both would just feed the model duplicates.
+ */
+static int extract_text(struct mailmime *mime, const char *subtype, char *dst, size_t cap) {
+    if (mime == NULL) return 0;
+
+    switch (mime->mm_type) {
+    case MAILMIME_SINGLE:
+        return part_is_text(mime, subtype) ? append_decoded(mime, dst, cap) : 0;
+    case MAILMIME_MESSAGE:
+        return extract_text(mime->mm_data.mm_message.mm_msg_mime, subtype, dst, cap);
+    case MAILMIME_MULTIPLE:
+        for (clistiter *it = clist_begin(mime->mm_data.mm_multipart.mm_mp_list);
+             it != NULL; it = clist_next(it)) {
+            if (extract_text(clist_content(it), subtype, dst, cap)) return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* Fetches headers and readable body text for one UID.
+ *
+ * The whole message comes down in one BODY.PEEK[] and is split here: the raw
+ * header block for the deterministic spam checks, and the text/plain part --
+ * MIME-walked and transfer-decoded -- for anything a model reads.
+ *
+ * Handing the model RFC822.TEXT instead, as this first did, is a trap: for
+ * multipart mail its first few hundred bytes are boundary markers and
+ * Content-Type lines, so a 400-character snippet is mostly MIME boilerplate
+ * and the actual sentences never arrive.
+ *
  * BODY.PEEK avoids setting \Seen, so inspecting mail never marks it read --
  * the same guarantee the Python watcher had from a read-only selection.
  */
@@ -186,15 +256,14 @@ int ronny_fetch_message(mailimap *session, uint32_t uid, ronny_message *out) {
     struct mailimap_set *set = mailimap_set_new_single(uid);
     if (set == NULL) return -1;
 
-    struct mailimap_fetch_type *fetch_type = mailimap_fetch_type_new_fetch_att_list_empty();
-    if (fetch_type == NULL) { mailimap_set_free(set); return -1; }
+    struct mailimap_section *section = mailimap_section_new(NULL); /* BODY[] -- everything */
+    if (section == NULL) { mailimap_set_free(set); return -1; }
 
-    if (mailimap_fetch_type_new_fetch_att_list_add(fetch_type, mailimap_fetch_att_new_rfc822_header()) != MAILIMAP_NO_ERROR ||
-        mailimap_fetch_type_new_fetch_att_list_add(fetch_type, mailimap_fetch_att_new_rfc822_text()) != MAILIMAP_NO_ERROR) {
-        mailimap_fetch_type_free(fetch_type);
-        mailimap_set_free(set);
-        return -1;
-    }
+    struct mailimap_fetch_att *att = mailimap_fetch_att_new_body_peek_section(section);
+    if (att == NULL) { mailimap_section_free(section); mailimap_set_free(set); return -1; }
+
+    struct mailimap_fetch_type *fetch_type = mailimap_fetch_type_new_fetch_att(att);
+    if (fetch_type == NULL) { mailimap_fetch_att_free(att); mailimap_set_free(set); return -1; }
 
     clist *result = NULL;
     int r = mailimap_uid_fetch(session, set, fetch_type, &result);
@@ -211,12 +280,32 @@ int ronny_fetch_message(mailimap *session, uint32_t uid, ronny_message *out) {
             if (item == NULL || item->att_type != MAILIMAP_MSG_ATT_ITEM_STATIC) continue;
 
             struct mailimap_msg_att_static *stat = item->att_data.att_static;
-            if (stat == NULL) continue;
+            if (stat == NULL || stat->att_type != MAILIMAP_MSG_ATT_BODY_SECTION) continue;
 
-            if (stat->att_type == MAILIMAP_MSG_ATT_RFC822_HEADER) {
-                copy_bounded(out->headers, sizeof(out->headers), stat->att_data.att_rfc822_header.att_content);
-            } else if (stat->att_type == MAILIMAP_MSG_ATT_RFC822_TEXT) {
-                copy_bounded(out->body, sizeof(out->body), stat->att_data.att_rfc822_text.att_content);
+            const char *raw = stat->att_data.att_body_section->sec_body_part;
+            size_t raw_len = stat->att_data.att_body_section->sec_length;
+            if (raw == NULL || raw_len == 0) continue;
+
+            /* Headers are everything up to the first blank line. */
+            size_t header_len = raw_len;
+            for (size_t i = 0; i + 1 < raw_len; i++) {
+                if (raw[i] == '\n' && (raw[i + 1] == '\n' || (raw[i + 1] == '\r' && i + 2 < raw_len && raw[i + 2] == '\n'))) {
+                    header_len = i + 1;
+                    break;
+                }
+            }
+            size_t n = header_len < sizeof(out->headers) - 1 ? header_len : sizeof(out->headers) - 1;
+            memcpy(out->headers, raw, n);
+            out->headers[n] = '\0';
+
+            size_t index = 0;
+            struct mailmime *mime = NULL;
+            if (mailmime_parse(raw, raw_len, &index, &mime) == MAILIMF_NO_ERROR && mime != NULL) {
+                /* Plain text first; HTML is a fallback, not a preference. */
+                if (!extract_text(mime, "plain", out->body, sizeof(out->body))) {
+                    extract_text(mime, "html", out->body, sizeof(out->body));
+                }
+                mailmime_free(mime);
             }
         }
     }

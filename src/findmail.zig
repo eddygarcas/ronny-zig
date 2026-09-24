@@ -29,8 +29,11 @@ pub const RESULT_LIMIT = 5;
 pub const SNIPPET_CHARS = 400;
 pub const DEFAULT_DAYS = 365;
 
-/// Room to drop bulk mail and still have a full candidate list.
-const SCAN_LIMIT = CANDIDATE_LIMIT * 4;
+/// Room to drop bulk mail and still have a full candidate list. Bounded
+/// tightly because each candidate costs its own IMAP round trip -- Python
+/// fetched them in one batch, which libetpan does not make easy -- so this is
+/// the difference between a two-second answer and a thirty-second one.
+const SCAN_LIMIT = CANDIDATE_LIMIT * 2;
 
 pub const Error = error{SearchFailed};
 
@@ -87,12 +90,67 @@ pub fn buildQuery(
     if (std.mem.indexOfScalar(u8, first_line, '\n')) |nl| first_line = first_line[0..nl];
     first_line = std.mem.trim(u8, first_line, " \t\r\"");
     if (first_line.len == 0) first_line = question;
+    first_line = try balanceQuotes(arena, first_line);
+    first_line = try trimToTerms(arena, first_line);
 
     // Filtering promotions Gmail-side is far cheaper than fetching newsletters
     // and discarding them; isBulk below stays as a backstop for the rest.
     const query = try std.fmt.allocPrint(arena, "newer_than:{d}d {s} -category:promotions", .{ days, first_line });
     log.info("gmail query: {s}", .{query});
     return query;
+}
+
+/// A Gmail query worth sending. Past this the model has stopped generating
+/// alternative phrasings and started generating variations on its own
+/// variations: one real run produced 47 OR terms, over half of them exact
+/// duplicates, and broadening a query that far is the same as not filtering.
+const MAX_QUERY_CHARS = 400;
+
+/// Cuts an over-long query back at an OR boundary, closing any parenthesis
+/// the cut left open so what goes to Gmail is still a valid query.
+fn trimToTerms(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
+    if (query.len <= MAX_QUERY_CHARS) return query;
+
+    const head = query[0..MAX_QUERY_CHARS];
+    const cut = std.mem.lastIndexOf(u8, head, " OR ") orelse return head;
+    const trimmed = std.mem.trim(u8, head[0..cut], " \t");
+    log.warn("query ran long ({d} chars); cut back to its first terms", .{query.len});
+
+    var open: usize = 0;
+    var close: usize = 0;
+    for (trimmed) |ch| {
+        if (ch == '(') open += 1;
+        if (ch == ')') close += 1;
+    }
+    if (open <= close) return trimmed;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(trimmed);
+    try out.writer.splatByteAll(')', open - close);
+    return out.writer.buffered();
+}
+
+/// Strips every quote when they don't pair up.
+///
+/// Observed in practice: the model produced
+///   (self-hosted OR "self hosted" OR ...) deployment OR "self-hosted deployment
+/// with the last quote never closed. Gmail accepted it and quietly returned
+/// almost nothing, which reads from the outside like an empty mailbox. Dropping
+/// the quotes turns the phrase back into a bag of words, which is what an
+/// unquoted query means anyway.
+fn balanceQuotes(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
+    var quotes: usize = 0;
+    for (query) |ch| {
+        if (ch == '"') quotes += 1;
+    }
+    if (quotes % 2 == 0) return query;
+
+    log.warn("model returned an unbalanced quote; dropping quotes from the query", .{});
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (query) |ch| {
+        if (ch != '"') try out.writer.writeByte(ch);
+    }
+    return out.writer.buffered();
 }
 
 /// Newsletters and marketing blasts announce themselves. Their boilerplate
@@ -249,14 +307,19 @@ pub fn rank(
         \\Reply with ONLY JSON: {{"matches": [{{"index": <number>, "why": "<short reason>"}}]}}
     , .{ question, listing.writer.buffered() }) catch return byRecency(arena, candidates);
 
-    const answer = ollama.generateJson(io, arena, ollama_url, model, prompt) catch |err| {
+    const raw = ollama.generate(io, arena, ollama_url, model, prompt, .json) catch |err| {
         log.warn("ranking failed ({s}); returning the most recent candidates", .{@errorName(err)});
         return byRecency(arena, candidates);
     };
 
-    const parsed = std.json.parseFromValue(Ranking, arena, answer, .{
+    const parsed = std.json.parseFromSlice(Ranking, arena, raw, .{
         .ignore_unknown_fields = true,
-    }) catch return byRecency(arena, candidates);
+    }) catch |err| {
+        log.warn("ranking reply didn't parse ({s}): {s}", .{
+            @errorName(err), raw[0..@min(raw.len, 300)],
+        });
+        return byRecency(arena, candidates);
+    };
 
     var out: std.ArrayList(Match) = .empty;
     for (parsed.value.matches) |match| {
@@ -267,8 +330,16 @@ pub fn rank(
             .why = match.why[0..@min(match.why.len, 160)],
         }) catch break;
     }
-    // An empty list is a real answer here: the model looked and found nothing
-    // that genuinely matched, which beats handing back five keyword hits.
+
+    // An empty list is a legitimate answer -- the model looked and found
+    // nothing that genuinely matched, which beats handing back five keyword
+    // hits -- but it is also what a subtly wrong reply shape looks like, so
+    // the raw text is logged to tell the two apart.
+    if (out.items.len == 0) {
+        log.info("ranker matched none of {d} candidate(s); it replied: {s}", .{
+            candidates.len, raw[0..@min(raw.len, 300)],
+        });
+    }
     return out.items;
 }
 
@@ -315,6 +386,23 @@ test "snippet leaves plain text alone apart from collapsing whitespace" {
 
     const text = try snippet(arena, "  Hi there,\r\n\r\nThursday works for me.\n");
     try std.testing.expectEqualStrings("Hi there, Thursday works for me.", text);
+}
+
+test "an unbalanced quote is stripped rather than sent to Gmail" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Shortened from a query a model actually produced.
+    const broken = "(self-hosted OR \"self hosted\") OR \"self-hosted deployment";
+    try std.testing.expectEqualStrings(
+        "(self-hosted OR self hosted) OR self-hosted deployment",
+        try balanceQuotes(arena, broken),
+    );
+
+    // A well-formed query is passed through untouched.
+    const fine = "(invoice OR \"payment due\")";
+    try std.testing.expectEqualStrings(fine, try balanceQuotes(arena, fine));
 }
 
 test "isBulk spots newsletters by their own headers" {
