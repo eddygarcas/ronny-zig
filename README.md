@@ -1,4 +1,4 @@
-<img src="docs/ronny.svg" alt="Ronny" width="128" align="right">
+<img src="docs/ronny-logo.png" alt="Ronny" width="140" align="right">
 
 # Ronny (Zig)
 
