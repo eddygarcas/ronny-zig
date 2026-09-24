@@ -41,6 +41,7 @@ extern fn ronny_selection_exists(session: *c.mailimap) u32;
 extern fn ronny_selection_uidnext(session: *c.mailimap) u32;
 extern fn ronny_selection_uidvalidity(session: *c.mailimap) u32;
 extern fn ronny_fetch_envelopes_since(session: *c.mailimap, first_uid: u32, out: [*]Envelope, max_out: c_int) c_int;
+extern fn ronny_fetch_message(session: *c.mailimap, uid: u32, out: *Message) c_int;
 
 pub const Error = error{
     SessionAlloc,
@@ -49,6 +50,25 @@ pub const Error = error{
     Select,
     Fetch,
     Idle,
+};
+
+pub const HDR_MAX = 8192;
+pub const BODY_MAX = 8192;
+
+/// Mirrors `ronny_message` in shim.c. Headers and body are fetched
+/// separately: the deterministic spam checks read only headers, the model
+/// reads only the text.
+pub const Message = extern struct {
+    headers: [HDR_MAX]u8,
+    body: [BODY_MAX]u8,
+
+    pub fn headersSlice(self: *const Message) []const u8 {
+        return std.mem.sliceTo(&self.headers, 0);
+    }
+
+    pub fn bodySlice(self: *const Message) []const u8 {
+        return std.mem.sliceTo(&self.body, 0);
+    }
 };
 
 pub const Selection = struct {
@@ -107,6 +127,12 @@ pub const Session = struct {
         const written = ronny_fetch_envelopes_since(self.imap, first_uid, buffer.ptr, @intCast(buffer.len));
         if (written < 0) return Error.Fetch;
         return buffer[0..@intCast(written)];
+    }
+
+    /// Headers and text body for one UID. Fetched with BODY.PEEK, so
+    /// inspecting a message never marks it read.
+    pub fn fetchMessage(self: *Session, uid: u32, out: *Message) Error!void {
+        if (ronny_fetch_message(self.imap, uid, out) != 0) return Error.Fetch;
     }
 
     /// Blocks until the server reports activity or `timeout_seconds` passes.

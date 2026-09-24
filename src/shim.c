@@ -154,3 +154,66 @@ int ronny_fetch_envelopes_since(mailimap *session, uint32_t first_uid,
     mailimap_fetch_list_free(result);
     return count;
 }
+
+/* ---- full message fetch (for the spam gate) ---- */
+
+#define RONNY_HDR_MAX  8192
+#define RONNY_BODY_MAX 8192
+
+typedef struct {
+    char headers[RONNY_HDR_MAX];
+    char body[RONNY_BODY_MAX];
+} ronny_message;
+
+/* Fetches headers and text body for one UID.
+ *
+ * Header and text parts are requested separately: the deterministic spam
+ * checks only read headers, and the model only needs the text. Requesting
+ * BODY.PEEK avoids setting \Seen, so inspecting mail never marks it read --
+ * the same guarantee the Python watcher had from a read-only selection.
+ */
+int ronny_fetch_message(mailimap *session, uint32_t uid, ronny_message *out) {
+    if (session == NULL || out == NULL) return -1;
+    memset(out, 0, sizeof(*out));
+
+    struct mailimap_set *set = mailimap_set_new_single(uid);
+    if (set == NULL) return -1;
+
+    struct mailimap_fetch_type *fetch_type = mailimap_fetch_type_new_fetch_att_list_empty();
+    if (fetch_type == NULL) { mailimap_set_free(set); return -1; }
+
+    if (mailimap_fetch_type_new_fetch_att_list_add(fetch_type, mailimap_fetch_att_new_rfc822_header()) != MAILIMAP_NO_ERROR ||
+        mailimap_fetch_type_new_fetch_att_list_add(fetch_type, mailimap_fetch_att_new_rfc822_text()) != MAILIMAP_NO_ERROR) {
+        mailimap_fetch_type_free(fetch_type);
+        mailimap_set_free(set);
+        return -1;
+    }
+
+    clist *result = NULL;
+    int r = mailimap_uid_fetch(session, set, fetch_type, &result);
+    mailimap_fetch_type_free(fetch_type);
+    mailimap_set_free(set);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+
+    for (clistiter *it = clist_begin(result); it != NULL; it = clist_next(it)) {
+        struct mailimap_msg_att *msg = clist_content(it);
+        if (msg == NULL) continue;
+
+        for (clistiter *ait = clist_begin(msg->att_list); ait != NULL; ait = clist_next(ait)) {
+            struct mailimap_msg_att_item *item = clist_content(ait);
+            if (item == NULL || item->att_type != MAILIMAP_MSG_ATT_ITEM_STATIC) continue;
+
+            struct mailimap_msg_att_static *stat = item->att_data.att_static;
+            if (stat == NULL) continue;
+
+            if (stat->att_type == MAILIMAP_MSG_ATT_RFC822_HEADER) {
+                copy_bounded(out->headers, sizeof(out->headers), stat->att_data.att_rfc822_header.att_content);
+            } else if (stat->att_type == MAILIMAP_MSG_ATT_RFC822_TEXT) {
+                copy_bounded(out->body, sizeof(out->body), stat->att_data.att_rfc822_text.att_content);
+            }
+        }
+    }
+
+    mailimap_fetch_list_free(result);
+    return 0;
+}
