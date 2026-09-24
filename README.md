@@ -1,3 +1,5 @@
+<img src="docs/ronny.svg" alt="Ronny" width="128" align="right">
+
 # Ronny (Zig)
 
 An email assistant that watches a Gmail inbox, notifies over Telegram for an
