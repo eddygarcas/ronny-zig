@@ -13,10 +13,27 @@ pub fn build(b: *std.Build) void {
     // The cost is that an explicit target stops Zig searching system paths,
     // so those are named below.
     //
+    // The glibc version has to be named too. Without it Zig assumes an old
+    // baseline, which Debug tolerates but ReleaseSafe does not: it links with
+    // lld and --no-allow-shlib-undefined, and the system libetpan, libgcrypt
+    // and libgpg-error all reference symbols that only exist in newer glibc
+    // (fstat@2.33, __isoc23_strtol@2.38, closefrom@2.34). The result is a
+    // build that works in Debug and fails only when you go to ship it.
+    //
+    // Set to the highest glibc Zig 0.16 ships stubs for (2.43); the host is
+    // on 2.44 and naming that fails outright. Anything at or above 2.38
+    // covers the symbols above, so the ceiling is what matters, not an exact
+    // match. Revisit if the system libs ever need something newer than 2.43.
+    //
     // Revisit when Zig gains .sframe support: if `zig build -Dtarget=native`
     // links cleanly, this default and the explicit paths can all go.
     const target = b.standardTargetOptions(.{
-        .default_target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+        .default_target = .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .gnu,
+            .glibc_version = .{ .major = 2, .minor = 43, .patch = 0 },
+        },
     });
     const optimize = b.standardOptimizeOption(.{});
 
