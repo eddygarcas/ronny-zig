@@ -39,14 +39,21 @@ int ronny_smtp_send(const char *host, uint16_t port,
 
     if (mailsmtp_auth(smtp, user, password) != MAILSMTP_NO_ERROR) goto done;
 
-    recipients = clist_new();
+    /* mailesmtp_send wants a clist of `struct esmtp_address *`, NOT of
+     * `char *`. Appending the bare string compiles cleanly -- clist_append
+     * takes void* -- and then libetpan reads the first eight bytes of the
+     * address text as a pointer and dereferences it. That is a general
+     * protection fault inside libc, a core dump, and a bot that vanishes
+     * mid-send. Use the list helpers, which build the struct and strdup the
+     * address; esmtp_address_list_free then owns the copies. */
+    recipients = esmtp_address_list_new();
     if (recipients == NULL) goto done;
-    if (clist_append(recipients, (void *)to) != 0) goto done;
+    if (esmtp_address_list_add(recipients, (char *)to, 0, NULL) != 0) goto done;
 
     result = mailesmtp_send(smtp, from, 0, NULL, recipients, message, message_len);
 
 done:
-    if (recipients != NULL) clist_free(recipients);
+    if (recipients != NULL) esmtp_address_list_free(recipients);
     mailsmtp_free(smtp);
     return result;
 }
