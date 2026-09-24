@@ -1,0 +1,19 @@
+[Unit]
+Description=Ronny mailbox watcher, Zig (IMAP -> Telegram notifications)
+After=network-online.target ollama.service
+Wants=network-online.target
+# The Python service watches the same mailbox and would notify about the same
+# mail twice. systemd refusing to run both is cheaper than noticing by hand.
+Conflicts=ronny-email-manager.service
+
+[Service]
+Type=simple
+User=CHANGEME
+WorkingDirectory=/path/to/Work/ronny-zig
+EnvironmentFile=/path/to/Work/ronny-zig/.env
+ExecStart=/path/to/Work/ronny-zig/zig-out/bin/ronny watch
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

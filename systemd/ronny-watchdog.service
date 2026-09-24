@@ -1,0 +1,25 @@
+[Unit]
+Description=Ronny watchdog, Zig (journal incident detection -> Telegram alerts)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+# NOTE: this file has the same name as the Python watchdog's unit, which is
+# currently installed at /etc/systemd/system/ronny-watchdog.service. Copying
+# this over it *is* the watchdog cutover -- it does not run alongside. That is
+# intentional: two watchdogs on one Telegram token would double every alert,
+# and the Python one follows a unit this build no longer uses.
+#
+# Deliberately no Requires= on the units it watches: a watchdog that stops
+# when the thing it watches stops cannot report that the thing stopped.
+
+[Service]
+Type=simple
+User=CHANGEME
+WorkingDirectory=/path/to/Work/ronny-zig
+EnvironmentFile=/path/to/Work/ronny-zig/.env
+ExecStart=/path/to/Work/ronny-zig/zig-out/bin/ronny watchdog
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

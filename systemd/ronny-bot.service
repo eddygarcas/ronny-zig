@@ -1,0 +1,22 @@
+[Unit]
+Description=Ronny Telegram control channel, Zig
+After=network-online.target ollama.service
+Wants=network-online.target
+# This is the load-bearing line. Only one process may call getUpdates for a
+# given bot token: a second poller gets 409 Conflict and, worse, silently
+# consumes updates the first one needed -- so the owner's messages would
+# vanish into whichever poller happened to win the race. The Python service
+# polls the same token, so the two must never run together.
+Conflicts=ronny-email-manager.service
+
+[Service]
+Type=simple
+User=CHANGEME
+WorkingDirectory=/path/to/Work/ronny-zig
+EnvironmentFile=/path/to/Work/ronny-zig/.env
+ExecStart=/path/to/Work/ronny-zig/zig-out/bin/ronny bot
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const bot_mod = @import("bot.zig");
+const watchdog_mod = @import("watchdog.zig");
 const imap = @import("imap.zig");
 const state_mod = @import("state.zig");
 const controller_mod = @import("controller.zig");
@@ -84,9 +85,24 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "bot")) return runBot(init);
     if (std.mem.eql(u8, command, "watch")) return runWatcher(init);
+    if (std.mem.eql(u8, command, "watchdog")) return runWatchdog(init);
 
-    log.err("unknown command '{s}' -- expected 'watch' or 'bot'", .{command});
+    log.err("unknown command '{s}' -- expected 'watch', 'bot' or 'watchdog'", .{command});
     return error.UnknownCommand;
+}
+
+/// Its own process on purpose: a watchdog that dies with the thing it watches
+/// cannot report that the thing died.
+fn runWatchdog(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    return watchdog_mod.run(.{
+        .io = init.io,
+        .gpa = arena,
+        .telegram_token = try envRequired(init, "TELEGRAM_BOT_TOKEN"),
+        .telegram_owner_chat_id = (try envOptional(init, "TELEGRAM_OWNER_CHAT_ID")) orelse "",
+        .ollama_url = (try envOptional(init, "OLLAMA_URL")) orelse "http://127.0.0.1:11434",
+        .ollama_model = (try envOptional(init, "OLLAMA_MODEL")) orelse "qwen2.5",
+    });
 }
 
 fn runBot(init: std.process.Init) !void {
@@ -174,7 +190,11 @@ fn runWatcher(init: std.process.Init) !void {
             log.err("IDLE failed: {s}", .{@errorName(err)});
             return err;
         };
-        _ = woke; // rescan either way; the timeout is the keepalive and safety net
+
+        // A hang produces no error line, so without this the watchdog has no
+        // way to tell a quiet mailbox from a wedged loop. The marker string is
+        // shared with watchdog.zig rather than written out twice.
+        if (!woke) log.info("{s}, last uid {d}", .{ watchdog_mod.HEARTBEAT_MARKER, state.lastUid() });
     }
 }
 
@@ -285,6 +305,7 @@ test {
     _ = ollama;
     _ = findmail;
     _ = bot_mod;
+    _ = watchdog_mod;
     _ = interpret;
     _ = headers;
     _ = mailer;
