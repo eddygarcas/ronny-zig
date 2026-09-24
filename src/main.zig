@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const imap = @import("imap.zig");
+const state_mod = @import("state.zig");
+const controller_mod = @import("controller.zig");
 
 const MAX_NEW_PER_SCAN = 256;
 const IDLE_TIMEOUT_SECONDS = 300;
@@ -44,8 +46,15 @@ pub fn main(init: std.process.Init) !void {
     const user = try envRequired(init, "IMAP_USER");
     const password = try envRequired(init, "IMAP_APP_PASSWORD");
     const host = (try envOptional(init, "IMAP_HOST")) orelse try arena.dupeZ(u8, "imap.gmail.com");
-    const senders_raw = init.environ_map.get("RONNY_SENDERS") orelse "";
-    const allowlist = try parseAllowlist(arena, senders_raw);
+    const senders_path = (try envOptional(init, "RONNY_SENDERS_FILE")) orelse
+        try arena.dupeZ(u8, "config/senders.yaml");
+    const state_path = (try envOptional(init, "RONNY_STATE_FILE")) orelse
+        try arena.dupeZ(u8, "data/state.json");
+    const controller_state_path = (try envOptional(init, "RONNY_CONTROLLER_STATE_FILE")) orelse
+        try arena.dupeZ(u8, "data/controller_state.json");
+
+    var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
+    var state = state_mod.State.load(init.io, arena, state_path);
 
     std.log.info("connecting to {s} as {s}", .{ host, user });
     var session = try imap.Session.connect(host, 993, user, password);
@@ -55,49 +64,66 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
         selection.exists, selection.uid_next, selection.uid_validity,
     });
-    std.log.info("watching {d} sender(s)", .{allowlist.len});
-    if (allowlist.len == 0) {
-        std.log.warn("allowlist is empty -- nothing will ever be reported", .{});
-    }
 
-    // Start from now. A fresh run must not treat the whole mailbox as new;
-    // the Python version shipped that bug once and tried to backfill 50k
-    // messages on first start.
-    var next_uid = selection.uid_next;
+    // Baseline to the mailbox's current UIDNEXT, not zero, so a first run
+    // watches from now instead of replaying 50k messages.
+    try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
+    std.log.info("resuming from uid {d} (paused: {})", .{ state.lastUid(), controller.paused });
 
     var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
     while (true) {
+        // Scan before waiting, not after. Anything that arrived while Ronny
+        // was down should be reported on connect rather than sitting unseen
+        // until the first IDLE wakeup.
+        scanOnce(&session, &controller, &state, &buffer) catch |err| {
+            std.log.err("scan failed: {s}", .{@errorName(err)});
+        };
+
         const woke = session.idleWait(IDLE_TIMEOUT_SECONDS) catch |err| {
             std.log.err("IDLE failed: {s}", .{@errorName(err)});
             return err;
         };
         _ = woke; // rescan either way; the timeout is the keepalive and safety net
-
-        const found = session.envelopesSince(next_uid, &buffer) catch |err| {
-            std.log.err("fetch failed: {s}", .{@errorName(err)});
-            continue;
-        };
-
-        var matched: usize = 0;
-        for (found) |*envelope| {
-            if (envelope.uid >= next_uid) next_uid = envelope.uid + 1;
-
-            const sender = envelope.fromSlice();
-            if (sender.len == 0) continue;
-            if (!imap.senderMatches(sender, allowlist)) continue;
-
-            matched += 1;
-            std.log.info("MATCH uid={d} from={s} subject={s}", .{
-                envelope.uid, sender, envelope.subjectSlice(),
-            });
-        }
-
-        if (found.len > 0) {
-            std.log.info("scanned {d} new message(s), {d} matched the allowlist", .{ found.len, matched });
-        }
     }
+}
+
+fn scanOnce(
+    session: *imap.Session,
+    controller: *controller_mod.Controller,
+    state: *state_mod.State,
+    buffer: []imap.Envelope,
+) !void {
+    // Re-read per scan so edits made while running take effect without a
+    // restart, the same as the Python version.
+    const allowlist = try controller.senders();
+    defer controller.freeSenders(allowlist);
+
+    const found = try session.envelopesSince(state.lastUid() + 1, buffer);
+    if (found.len == 0) return;
+
+    var matched: usize = 0;
+    for (found) |*envelope| {
+        const sender = envelope.fromSlice();
+        if (sender.len > 0 and imap.senderMatches(sender, allowlist)) {
+            matched += 1;
+            if (controller.paused) {
+                std.log.info("paused -- not reporting uid={d} from={s}", .{ envelope.uid, sender });
+            } else {
+                std.log.info("MATCH uid={d} from={s} subject={s}", .{
+                    envelope.uid, sender, envelope.subjectSlice(),
+                });
+            }
+        }
+        // Advance past every scanned message, matched or not, so the
+        // watermark can't rewind and report the same mail twice.
+        try state.advance(envelope.uid);
+    }
+
+    std.log.info("scanned {d} new message(s), {d} matched the allowlist", .{ found.len, matched });
 }
 
 test {
     _ = imap;
+    _ = state_mod;
+    _ = controller_mod;
 }

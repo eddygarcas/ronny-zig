@@ -16,6 +16,8 @@
  */
 
 #include <libetpan/libetpan.h>
+#include <libetpan/mailmime_decode.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- selection info (hidden behind bitfields) ---- */
@@ -43,7 +45,7 @@ uint32_t ronny_selection_uidvalidity(mailimap *session) {
 typedef struct {
     uint32_t uid;
     char from[RONNY_ADDR_MAX];    /* mailbox@host, lowercased by the caller */
-    char subject[RONNY_SUBJ_MAX]; /* still MIME-encoded; decoded in Zig */
+    char subject[RONNY_SUBJ_MAX]; /* decoded to UTF-8 */
 } ronny_envelope;
 
 static void copy_bounded(char *dst, size_t cap, const char *src) {
@@ -52,6 +54,27 @@ static void copy_bounded(char *dst, size_t cap, const char *src) {
     if (n >= cap) n = cap - 1;
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+/* Decodes an RFC 2047 header ("=?UTF-8?Q?...?=") into plain UTF-8.
+ *
+ * Subjects arrive encoded, and showing the owner the raw encoded form is
+ * useless. libetpan does the decoding; on failure the original is copied
+ * through unchanged so a header we cannot decode is still readable.
+ */
+static void decode_header(char *dst, size_t cap, const char *src) {
+    dst[0] = '\0';
+    if (src == NULL) return;
+
+    size_t index = 0;
+    char *decoded = NULL;
+    int r = mailmime_encoded_phrase_parse("utf-8", src, strlen(src), &index, "utf-8", &decoded);
+    if (r == MAILIMF_NO_ERROR && decoded != NULL) {
+        copy_bounded(dst, cap, decoded);
+        free(decoded);
+        return;
+    }
+    copy_bounded(dst, cap, src);
 }
 
 /* Flattens the first From address into "mailbox@host". */
@@ -121,7 +144,7 @@ int ronny_fetch_envelopes_since(mailimap *session, uint32_t first_uid,
             } else if (stat->att_type == MAILIMAP_MSG_ATT_ENVELOPE) {
                 struct mailimap_envelope *env = stat->att_data.att_env;
                 envelope_from(env, entry.from, sizeof(entry.from));
-                if (env != NULL) copy_bounded(entry.subject, sizeof(entry.subject), env->env_subject);
+                if (env != NULL) decode_header(entry.subject, sizeof(entry.subject), env->env_subject);
             }
         }
 
