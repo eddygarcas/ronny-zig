@@ -153,6 +153,13 @@ const Composing = struct {
     recipient: []const u8,
     label: []const u8,
     instruction: []const u8,
+    /// Whether a file was asked for, remembered from whichever turn said so.
+    /// "Compose an email attaching the invoice" asks on turn one; by the time
+    /// the recipient and the body have been gathered two turns later, that
+    /// wording is long gone. Treating it as a property of one message rather
+    /// than of the compose is how a mail went out promising an invoice it
+    /// did not carry.
+    wants_attachment: bool,
     created_ns: i96,
 };
 
@@ -375,7 +382,7 @@ pub const Bot = struct {
     }
 
     /// Allocations finish before the arena is moved; see `remember`.
-    fn rememberComposing(self: *Bot, recipient: []const u8, label: []const u8, instruction: []const u8) !void {
+    fn rememberComposing(self: *Bot, recipient: []const u8, label: []const u8, instruction: []const u8, wants_attachment: bool) !void {
         var arena_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
         errdefer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -390,6 +397,7 @@ pub const Bot = struct {
             .recipient = owned_recipient,
             .label = owned_label,
             .instruction = owned_instruction,
+            .wants_attachment = wants_attachment,
             .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
         };
     }
@@ -1256,7 +1264,7 @@ pub const Bot = struct {
         // believe they reviewed while a different one is actually pending.
         // Same rule as compose: if a file was asked for and none uploaded,
         // take it from the message being replied to, or say why not.
-        if (try self.stageFromOpenMessage(arena, instruction_text)) |problem| return problem;
+        if (try self.stageFromOpenMessage(arena, instruction_text, mentionsAttaching(instruction_text))) |problem| return problem;
 
         return self.stageDraft(arena, .{
             .to = recipient,
@@ -1398,8 +1406,8 @@ pub const Bot = struct {
     /// a body that promises an invoice and a draft that carries none is a
     /// contradiction the owner should never have to notice for themselves,
     /// and it went out that way once already.
-    fn stageFromOpenMessage(self: *Bot, arena: std.mem.Allocator, request: []const u8) !?[]const u8 {
-        if (!mentionsAttaching(request)) return null;
+    fn stageFromOpenMessage(self: *Bot, arena: std.mem.Allocator, request: []const u8, wanted: bool) !?[]const u8 {
+        if (!wanted) return null;
         if (self.freshStaged() != null) return null; // an upload already wins
 
         if (self.last_message == null) {
@@ -1496,14 +1504,20 @@ pub const Bot = struct {
         var recipient: []const u8 = "";
         var label: []const u8 = "";
         var said: []const u8 = "";
+        // Sticky across turns, like the recipient and the body.
+        var wants_attachment = mentionsAttaching(request);
         if (self.freshComposing()) |carried| {
             recipient = try arena.dupe(u8, carried.recipient);
             label = try arena.dupe(u8, carried.label);
             said = try arena.dupe(u8, carried.instruction);
+            wants_attachment = wants_attachment or carried.wants_attachment;
         }
         if (instruction) |value| {
             const given = std.mem.trim(u8, value, " \t\r\n");
-            if (given.len > 0) said = given;
+            if (given.len > 0) {
+                said = given;
+                wants_attachment = wants_attachment or mentionsAttaching(given);
+            }
         }
 
         if (recipient.len == 0) {
@@ -1548,19 +1562,19 @@ pub const Bot = struct {
         // Never guessed at. Mail to the wrong person cannot be recalled, and
         // no preview catches a plausible-but-wrong name skimmed past.
         if (recipient.len == 0) {
-            try self.rememberComposing("", "", said);
+            try self.rememberComposing("", "", said, wants_attachment);
             return "Who should this go to? Give me a name I'd recognise from your mail, or type the full address.";
         }
         if (said.len == 0) {
-            try self.rememberComposing(recipient, label, "");
+            try self.rememberComposing(recipient, label, "", wants_attachment);
             return std.fmt.allocPrint(arena, "What should I say to {s}?", .{recipient});
         }
 
         // Asked for an attachment and has not uploaded one: take it from the
         // message currently open, or say plainly why not. Drafting a body
         // that promises a file it does not carry is how one went out empty.
-        if (try self.stageFromOpenMessage(arena, said)) |problem| {
-            try self.rememberComposing(recipient, label, said);
+        if (try self.stageFromOpenMessage(arena, said, wants_attachment)) |problem| {
+            try self.rememberComposing(recipient, label, said, wants_attachment);
             return problem;
         }
         self.discardComposing();
