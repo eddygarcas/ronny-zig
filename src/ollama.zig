@@ -62,7 +62,13 @@ pub fn generate(
 
     const text = std.mem.trim(u8, parsed.value.response, " \t\r\n");
     if (text.len == 0) return Error.Unavailable;
-    return text;
+
+    // Copied, not returned by reference. std.json's default `.alloc_if_needed`
+    // leaves unescaped strings pointing into `response.body`, which the defer
+    // above frees -- so returning `text` directly hands the caller memory that
+    // is already gone. It survived by luck for a while, which is the worst way
+    // for this to behave. telegram.zig has the same trap and a test for it.
+    return arena.dupe(u8, text) catch Error.Unavailable;
 }
 
 /// Runs a prompt whose answer is JSON, and hands back the parsed value.

@@ -286,7 +286,10 @@ pub const Bot = struct {
         }
 
         self.client.sendTyping();
-        const audio = self.client.downloadFile(arena, voice.file_id) catch {
+        const audio = self.client.downloadFile(arena, voice.file_id) catch |err| {
+            // Logged, not just reported to the owner. Swallowing this is what
+            // made a dangling file_id take a production round trip to find.
+            log.err("could not download voice note {s}: {s}", .{ voice.file_id, @errorName(err) });
             return self.client.sendMessage("Couldn't download that voice note -- try again, or type it.");
         };
 

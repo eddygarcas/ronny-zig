@@ -116,8 +116,14 @@ pub const Client = struct {
             return Error.SendFailed;
         }
 
+        // alloc_always is load-bearing here, not a default worth inheriting.
+        // parseFromSlice otherwise uses `.alloc_if_needed`, which leaves
+        // unescaped strings pointing *into* `response.body` -- and that is
+        // freed on the way out of this function, while the Parsed is handed
+        // to the caller. See the test at the bottom of this file.
         const parsed = try std.json.parseFromSlice(UpdatesResponse, arena, response.body, .{
             .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
         });
 
         // Acknowledge everything returned, so updates are not replayed.
@@ -157,11 +163,19 @@ pub const Client = struct {
         defer meta.deinit(arena);
         if (!meta.ok()) return Error.SendFailed;
 
+        // Same reason as getUpdates. file_path is only read before meta.body
+        // is freed today, but that is an ordering accident, not a guarantee.
         const parsed = try std.json.parseFromSlice(FileResponse, arena, meta.body, .{
             .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
         });
         defer parsed.deinit();
-        if (parsed.value.result.file_path.len == 0) return Error.SendFailed;
+        if (parsed.value.result.file_path.len == 0) {
+            log.warn("getFile returned no file_path for {s}: {s}", .{
+                file_id, meta.body[0..@min(meta.body.len, 200)],
+            });
+            return Error.SendFailed;
+        }
 
         const download_url = try std.fmt.allocPrint(
             arena,
@@ -176,6 +190,39 @@ pub const Client = struct {
         return audio.body;
     }
 };
+
+test "a parsed update keeps its own strings once the response body is gone" {
+    // The bug this pins: std.json.parseFromSlice defaults to
+    // `.alloc_if_needed`, so strings with no escapes point *into* the source
+    // buffer. getUpdates frees that buffer and returns the Parsed, so every
+    // message text and voice file_id became a dangling pointer. It showed up
+    // in production as `owner message: <0xAA repeated>` -- Zig's poison byte
+    // -- and as every voice note failing to download, because the file_id
+    // handed to getFile was garbage.
+    const gpa = std.testing.allocator;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source = try arena.dupe(u8,
+        \\{"ok":true,"result":[{"update_id":7,"message":{"chat":{"id":42},"text":"hello there","voice":{"file_id":"AwACAgQAA","duration":3}}}]}
+    );
+
+    const parsed = try std.json.parseFromSlice(UpdatesResponse, arena, source, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    // Stand in for the response body being freed and its memory reused.
+    @memset(source, 0xAA);
+
+    const message = parsed.value.result[0].message.?;
+    try std.testing.expectEqualStrings("hello there", message.text.?);
+    try std.testing.expectEqualStrings("AwACAgQAA", message.voice.?.file_id);
+    try std.testing.expectEqual(@as(i64, 42), message.chat.id);
+}
 
 test "truncate leaves short text alone and caps long text" {
     try std.testing.expectEqualStrings("hello", truncate("hello"));
