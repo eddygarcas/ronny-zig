@@ -1,14 +1,22 @@
-//! Ronny, in Zig. Currently the IMAP watcher only.
+//! Ronny, in Zig. Two subcommands, deliberately two processes.
 //!
-//! Connects to the mailbox, baselines to the current UIDNEXT so a first run
-//! doesn't treat 50k existing messages as new, then sits in IDLE reporting
-//! mail from allowlisted senders.
+//!   ronny watch  -- the mailbox watcher (the default)
+//!   ronny bot    -- the Telegram control channel
 //!
-//! Configuration comes from the environment:
-//!   IMAP_USER, IMAP_APP_PASSWORD, optionally IMAP_HOST
-//!   RONNY_SENDERS  comma-separated allowlist
+//! They are split rather than threaded because only one process may call
+//! Telegram's getUpdates for a given token: a second poller gets 409 Conflict
+//! and, worse, silently consumes updates the first one needed. Keeping them
+//! separate means either half can be cut over from the Python service on its
+//! own, and a crash in one does not take down the other.
+//!
+//! What they share is on disk: the allowlist file and the paused flag. The
+//! watcher re-reads both each scan, so a change made from chat takes effect
+//! without a restart.
+//!
+//! Configuration comes from the environment; see .env.example.
 
 const std = @import("std");
+const bot_mod = @import("bot.zig");
 const imap = @import("imap.zig");
 const state_mod = @import("state.zig");
 const controller_mod = @import("controller.zig");
@@ -67,6 +75,54 @@ fn parseAllowlist(allocator: std.mem.Allocator, raw: []const u8) ![]const []cons
 }
 
 pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+
+    // 0.16 hands the command line to main rather than exposing a global:
+    // init.minimal.args, materialised into the process arena.
+    const args = try init.minimal.args.toSlice(arena);
+    const command: []const u8 = if (args.len > 1) args[1] else "watch";
+
+    if (std.mem.eql(u8, command, "bot")) return runBot(init);
+    if (std.mem.eql(u8, command, "watch")) return runWatcher(init);
+
+    log.err("unknown command '{s}' -- expected 'watch' or 'bot'", .{command});
+    return error.UnknownCommand;
+}
+
+fn runBot(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+
+    const senders_path = (try envOptional(init, "RONNY_SENDERS_FILE")) orelse
+        try arena.dupeZ(u8, "config/senders.yaml");
+    const controller_state_path = (try envOptional(init, "RONNY_CONTROLLER_STATE_FILE")) orelse
+        try arena.dupeZ(u8, "data/controller_state.json");
+
+    var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
+
+    const cfg: bot_mod.Config = .{
+        .io = init.io,
+        .gpa = arena,
+        .telegram_token = try envRequired(init, "TELEGRAM_BOT_TOKEN"),
+        // Empty is valid: the bot then answers only /start, with the caller's
+        // own chat id, so the owner can bootstrap it.
+        .telegram_owner_chat_id = (try envOptional(init, "TELEGRAM_OWNER_CHAT_ID")) orelse "",
+        .imap_host = (try envOptional(init, "IMAP_HOST")) orelse try arena.dupeZ(u8, "imap.gmail.com"),
+        .imap_user = try envRequired(init, "IMAP_USER"),
+        .imap_password = try envRequired(init, "IMAP_APP_PASSWORD"),
+        .smtp_host = (try envOptional(init, "SMTP_HOST")) orelse "smtp.gmail.com",
+        .ollama_url = (try envOptional(init, "OLLAMA_URL")) orelse "http://127.0.0.1:11434",
+        .ollama_model = (try envOptional(init, "OLLAMA_MODEL")) orelse "qwen2.5",
+        .typesafe_api_key = (try envOptional(init, "TYPESAFE_API_KEY")) orelse "",
+        .jev_model = (try envOptional(init, "JEV_MODEL")) orelse "jev-latest",
+        .whisper_model_path = try envOptional(init, "WHISPER_MODEL_PATH"),
+    };
+
+    var bot = bot_mod.Bot.init(cfg, &controller);
+    defer bot.deinit();
+    try bot.run();
+}
+
+fn runWatcher(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     const user = try envRequired(init, "IMAP_USER");
@@ -175,7 +231,9 @@ fn notifyIfWanted(
 ) !void {
     const subject = envelope.subjectSlice();
 
-    if (controller.paused) {
+    // Re-read rather than trust the value cached at startup: the bot is a
+    // separate process, and it is the one that writes this flag.
+    if (controller.isPaused()) {
         log.info("paused -- not reporting uid={d} from={s}", .{ envelope.uid, sender });
         return;
     }
@@ -226,6 +284,7 @@ test {
     _ = summarize;
     _ = ollama;
     _ = findmail;
+    _ = bot_mod;
     _ = interpret;
     _ = headers;
     _ = mailer;

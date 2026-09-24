@@ -103,6 +103,17 @@ pub const Controller = struct {
         return parsed.value.paused;
     }
 
+    /// Re-reads the flag from disk.
+    ///
+    /// The bot and the watcher are separate processes: the bot writes this
+    /// flag and the watcher reads it, so a value cached at startup would leave
+    /// the watcher still notifying after the owner had paused. The file is
+    /// tiny and this runs once per scan.
+    pub fn isPaused(self: *Controller) bool {
+        self.paused = self.loadPaused();
+        return self.paused;
+    }
+
     /// Persisted, so a restart doesn't silently resume notifications the
     /// owner had paused.
     pub fn setPaused(self: *Controller, value: bool) !void {

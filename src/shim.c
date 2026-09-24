@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <strings.h>
 
 /* ---- selection info (hidden behind bitfields) ---- */
 
@@ -335,6 +336,129 @@ int ronny_search_from(mailimap *session, const char *sender, int days,
     if (r != MAILIMAP_NO_ERROR) return -1;
 
     return envelopes_for_uids(session, uid_list, out, max_out);
+}
+
+/* ---- voice vocabulary ---- */
+
+#define RONNY_VOCAB_ENTRY 96
+
+/* Collects the names and addresses that actually write to this mailbox.
+ *
+ * This exists for one reason: whisper guesses phonetically at names it has not
+ * been told about, and "1Password" came back as "one password" while
+ * "AcmeSync" came back as "acme synch". Both write here regularly and neither is
+ * a watched sender, so the allowlist alone was not enough.
+ *
+ * Display names matter more than addresses here -- they are what gets spoken
+ * -- and ronny_envelope flattens them away, which is why this fetches
+ * envelopes itself rather than reusing envelopes_for_uids.
+ *
+ * `out` is a flat array of `max_out` fixed-width entries, each
+ * RONNY_VOCAB_ENTRY bytes. Returns how many were written, or -1.
+ */
+int ronny_sender_vocabulary(mailimap *session, int days, char *out, int max_out) {
+    if (session == NULL || out == NULL || max_out <= 0) return -1;
+    memset(out, 0, (size_t)max_out * RONNY_VOCAB_ENTRY);
+
+    time_t since_t = time(NULL) - (time_t)days * 24 * 60 * 60;
+    struct tm tm_since;
+    gmtime_r(&since_t, &tm_since);
+
+    struct mailimap_date *since = mailimap_date_new(tm_since.tm_mday, tm_since.tm_mon + 1, tm_since.tm_year + 1900);
+    if (since == NULL) return -1;
+    struct mailimap_search_key *key = mailimap_search_key_new_since(since);
+    if (key == NULL) { mailimap_date_free(since); return -1; }
+
+    clist *uid_list = NULL;
+    int r = mailimap_uid_search(session, NULL, key, &uid_list);
+    mailimap_search_key_free(key);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+    if (uid_list == NULL) return 0;
+
+    /* Newest first, and bounded: the window can hold thousands of messages and
+     * the vocabulary only needs the recent, recurring correspondents. */
+    uint32_t uids[1024];
+    int n = 0;
+    for (clistiter *it = clist_begin(uid_list); it != NULL && n < 1024; it = clist_next(it)) {
+        uint32_t *uid = clist_content(it);
+        if (uid != NULL) uids[n++] = *uid;
+    }
+    mailimap_search_result_free(uid_list);
+    if (n == 0) return 0;
+
+    for (int i = 0; i < n - 1; i++)
+        for (int j = i + 1; j < n; j++)
+            if (uids[j] > uids[i]) { uint32_t t = uids[i]; uids[i] = uids[j]; uids[j] = t; }
+    if (n > 600) n = 600;
+
+    struct mailimap_set *set = mailimap_set_new_empty();
+    if (set == NULL) return -1;
+    for (int i = 0; i < n; i++) mailimap_set_add_single(set, uids[i]);
+
+    struct mailimap_fetch_type *fetch_type = mailimap_fetch_type_new_fetch_att_list_empty();
+    if (fetch_type == NULL) { mailimap_set_free(set); return -1; }
+    if (mailimap_fetch_type_new_fetch_att_list_add(fetch_type, mailimap_fetch_att_new_envelope()) != MAILIMAP_NO_ERROR) {
+        mailimap_fetch_type_free(fetch_type);
+        mailimap_set_free(set);
+        return -1;
+    }
+
+    clist *result = NULL;
+    r = mailimap_uid_fetch(session, set, fetch_type, &result);
+    mailimap_fetch_type_free(fetch_type);
+    mailimap_set_free(set);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+
+    int count = 0;
+    for (clistiter *it = clist_begin(result); it != NULL && count < max_out; it = clist_next(it)) {
+        struct mailimap_msg_att *msg = clist_content(it);
+        if (msg == NULL) continue;
+
+        for (clistiter *ait = clist_begin(msg->att_list); ait != NULL; ait = clist_next(ait)) {
+            struct mailimap_msg_att_item *item = clist_content(ait);
+            if (item == NULL || item->att_type != MAILIMAP_MSG_ATT_ITEM_STATIC) continue;
+            struct mailimap_msg_att_static *stat = item->att_data.att_static;
+            if (stat == NULL || stat->att_type != MAILIMAP_MSG_ATT_ENVELOPE) continue;
+
+            struct mailimap_envelope *env = stat->att_data.att_env;
+            if (env == NULL || env->env_from == NULL || env->env_from->frm_list == NULL) continue;
+            clistiter *fit = clist_begin(env->env_from->frm_list);
+            if (fit == NULL) continue;
+            struct mailimap_address *addr = clist_content(fit);
+            if (addr == NULL) continue;
+
+            /* Two candidates per message: the display name, then the address.
+             * Display names are RFC 2047 encoded like any other header. */
+            char candidates[2][RONNY_VOCAB_ENTRY];
+            int wanted = 0;
+            if (addr->ad_personal_name != NULL) {
+                decode_header(candidates[wanted], RONNY_VOCAB_ENTRY, addr->ad_personal_name);
+                if (candidates[wanted][0] != '\0') wanted++;
+            }
+            if (addr->ad_mailbox_name != NULL && addr->ad_host_name != NULL) {
+                snprintf(candidates[wanted], RONNY_VOCAB_ENTRY, "%s@%s",
+                         addr->ad_mailbox_name, addr->ad_host_name);
+                wanted++;
+            }
+
+            for (int i = 0; i < wanted && count < max_out; i++) {
+                int duplicate = 0;
+                for (int j = 0; j < count; j++) {
+                    if (strcasecmp(out + (size_t)j * RONNY_VOCAB_ENTRY, candidates[i]) == 0) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    copy_bounded(out + (size_t)count * RONNY_VOCAB_ENTRY, RONNY_VOCAB_ENTRY, candidates[i]);
+                    count++;
+                }
+            }
+        }
+    }
+
+    mailimap_fetch_list_free(result);
+    return count;
 }
 
 /* Gmail's own search, exposed over IMAP as the X-GM-RAW search key.
