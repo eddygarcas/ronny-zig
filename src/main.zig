@@ -15,6 +15,7 @@ const controller_mod = @import("controller.zig");
 const http = @import("http.zig");
 const telegram = @import("telegram.zig");
 const spam = @import("spam.zig");
+const intent = @import("intent.zig");
 
 /// Namespaced so each module's output is identifiable in the journal,
 /// the way the Python version's per-module loggers were.
@@ -211,4 +212,5 @@ test {
     _ = http;
     _ = telegram;
     _ = spam;
+    _ = intent;
 }
