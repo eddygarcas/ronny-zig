@@ -1,7 +1,70 @@
+# Grouped by *why*, because a rule whose reason is obvious is one nobody
+# deletes by accident later.
+
+# --- credentials ---
+# .env holds the IMAP app password, the Telegram bot token and the TypeSafe
+# key. The example is the only one that ships, and it must never carry a real
+# value: real secrets have been typed into it by mistake before, in this
+# project, twice. Diff it before staging.
+.env
+.env.*
+!.env.example
+
+# --- other people's data ---
+# The live allowlist names real correspondents. It is the file the running
+# watcher reads, so it lives on disk but never in git; the example ships.
+config/senders.yaml
+!config/senders.example.yaml
+
+# Mail in any form it might get saved while debugging. A single .eml is
+# somebody's private message.
+*.eml
+*.mbox
+*.msg
+attachments/
+
+# --- state ---
+# The UID watermark and the paused flag. Machine-specific, and the watermark
+# quietly reveals mailbox volume.
+data/*.json
+
+# --- backups and dumps ---
+# A history rewrite, a migration, or a quick "just in case" leaves these
+# behind, and they hold exactly what was being cleaned up. A bundle of this
+# repo's pre-rewrite history carried every address removed from it, and a
+# copy of .env carried every credential.
+*.bundle
+*.bak
+*-backup
+.*-backup
+*.orig
+*.rej
+
+# Core dumps carry process memory: tokens, message bodies, whatever was in
+# flight. Two were produced here in a single afternoon.
+core
+core.*
+vgcore.*
+*.core
+
+# --- build output ---
 .zig-cache/
 zig-out/
-.env
-testrun/
+
+# --- large local assets ---
+# The whisper model is ~1.5GB and is downloaded, not authored.
 models/
-data/*.json
-config/senders.yaml
+
+# --- scratch ---
+testrun/
+tmp/
+scratch/
+*.log
+
+# --- editors and OS ---
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
