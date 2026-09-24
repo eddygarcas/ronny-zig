@@ -3,3 +3,4 @@ zig-out/
 .env
 testrun/
 models/
+data/*.json

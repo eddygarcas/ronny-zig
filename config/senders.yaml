@@ -1,0 +1,20 @@
+# Ronny only ever notifies for mail matching one of these senders.
+# Everything else is silently ignored, no matter the subject.
+#
+# Match rules (case-insensitive):
+#   - a full address ("someone@example.com") matches that address only
+#   - a bare domain ("example.com") matches any address at that domain
+#
+# A match here is still not enough on its own: every matching message also
+# has to pass Ronny's spam/phishing check (see src/spam.zig) before
+# a Telegram notification actually goes out.
+#
+# You can also edit this list live via the Telegram bot: /add, /remove,
+# /senders. Ronny rewrites just the list below when you do -- this header
+# stays intact.
+
+senders:
+  - sam@example.com
+  - alex@example.com
+  - team@example.com
+  - example.org
