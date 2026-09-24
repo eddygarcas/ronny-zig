@@ -53,6 +53,22 @@ pub const Reply = struct {
     attachments: []const Attachment = &.{},
 };
 
+const BOUNDARY_PREFIX = "----ronny";
+const BOUNDARY_RANDOM_BYTES = 16;
+/// Derived, not guessed. A hand-written size here was wrong by five bytes and
+/// made `bufPrint` return NoSpaceLeft, which failed *every* send -- and the
+/// compose() tests never caught it because they pass a literal boundary.
+const BOUNDARY_LEN = BOUNDARY_PREFIX.len + BOUNDARY_RANDOM_BYTES * 2;
+
+/// Random, because the boundary must not occur inside any attachment and
+/// those are arbitrary bytes.
+fn makeBoundary(io: std.Io, buffer: *[BOUNDARY_LEN]u8) []const u8 {
+    var raw: [BOUNDARY_RANDOM_BYTES]u8 = undefined;
+    io.random(&raw);
+    // Cannot fail: BOUNDARY_LEN is computed from exactly what is written.
+    return std.fmt.bufPrint(buffer, BOUNDARY_PREFIX ++ "{x}", .{&raw}) catch unreachable;
+}
+
 /// Base64 wrapped at 76 characters, as RFC 2045 requires.
 ///
 /// 57 input bytes encode to exactly 76 output characters, which is why the
@@ -158,14 +174,8 @@ pub fn send(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Random, because the boundary must not occur inside any attachment and
-    // those are arbitrary bytes.
-    var raw: [16]u8 = undefined;
-    io.random(&raw);
-    var boundary: [36]u8 = undefined;
-    const boundary_text = try std.fmt.bufPrint(&boundary, "----ronny{x}", .{&raw});
-
-    const message = try compose(arena, user, reply, boundary_text);
+    var boundary: [BOUNDARY_LEN]u8 = undefined;
+    const message = try compose(arena, user, reply, makeBoundary(io, &boundary));
 
     const host_z = try arena.dupeZ(u8, host);
     const user_z = try arena.dupeZ(u8, user);
@@ -272,4 +282,18 @@ test "a filename that would break the header is sanitised, not dropped" {
     // which is not worth implementing for the rare case.
     try writeSafeFilename(&out.writer, "in\"voice\u{00e9}.pdf");
     try std.testing.expectEqualStrings("in_voice__.pdf", out.writer.buffered());
+}
+
+test "the generated boundary fits the buffer it is sized for" {
+    // This is the bug this pins: the buffer was hand-sized at 36 for 41
+    // characters of output, so bufPrint returned NoSpaceLeft and every send
+    // failed -- including sends with no attachment at all, since the boundary
+    // is generated unconditionally. Change the prefix without changing the
+    // length and this fails instead of production.
+    const raw: [BOUNDARY_RANDOM_BYTES]u8 = @splat(0xAB);
+    var buffer: [BOUNDARY_LEN]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, BOUNDARY_PREFIX ++ "{x}", .{&raw});
+
+    try std.testing.expectEqual(BOUNDARY_LEN, text.len);
+    try std.testing.expect(std.mem.startsWith(u8, text, BOUNDARY_PREFIX));
 }
