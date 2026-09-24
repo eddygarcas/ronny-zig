@@ -161,6 +161,22 @@ The C shims exist because Zig's translate-c cannot represent C bitfields —
 and because libetpan returns nested clists of tagged unions that are far more
 pleasant to walk in C. They hand Zig flat data.
 
+## Why things are the way they are
+
+`AGENTS.md` is the map of the repo. `docs/` holds the reasoning that isn't
+visible in any single file — worth reading before changing behaviour:
+
+- [docs/send-safety.md](docs/send-safety.md) — the reply-send gate, and the
+  three real bugs that shaped it
+- [docs/tuned-values.md](docs/tuned-values.md) — constants that look arbitrary
+  and each fixed a failure
+- [docs/toolchain.md](docs/toolchain.md) — Zig 0.16 changes, the C boundary,
+  and the build workarounds
+- [docs/working-on-ronny.md](docs/working-on-ronny.md) — practices that
+  followed real mistakes
+- [docs/new-deployment.md](docs/new-deployment.md) — running an instance
+  against a different mailbox
+
 ## Known gaps
 
 - The whisper.cpp CUDA build lives outside pacman, so a `whisper-cpp` package
