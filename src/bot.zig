@@ -732,9 +732,18 @@ pub const Bot = struct {
                 try self.doSearch(arena, target, understood.days)
             else
                 "Search mail from whom?",
-            // A missing sender means "from anyone", not a failure to parse.
-            .read_mail => try self.doRead(arena, understood.target orelse "", understood.days),
-            .summarize_mail => try self.doSummarize(arena, understood.target orelse "", understood.days),
+            // A missing sender means "from anyone" -- unless the words point
+            // at the message already open, in which case use that.
+            .read_mail => if (understood.target == null and
+                refersToOpenMessage(text) and self.last_message != null)
+                try self.readOpenMessage(arena)
+            else
+                try self.doRead(arena, tidyTarget(understood.target orelse ""), understood.days),
+            .summarize_mail => if (understood.target == null and
+                refersToOpenMessage(text) and self.last_message != null)
+                try self.summarizeOpenMessage(arena)
+            else
+                try self.doSummarize(arena, tidyTarget(understood.target orelse ""), understood.days),
             .recent_mail => try self.doRecentMail(arena, understood.days),
             .draft_reply => try self.doDraftReply(arena, understood.message, false),
             .compose_mail => try self.doComposeMail(arena, text, understood.message, spoken),
@@ -1154,6 +1163,82 @@ pub const Bot = struct {
         }
         try out.writer.writeAll("\n\nThe newest one is open -- ask about \"it\" and I'll mean that.");
         return telegram.truncate(out.writer.buffered());
+    }
+
+    /// Does the request point at the message already open, rather than asking
+    /// for a new one?
+    ///
+    /// "Summarize it" after reading something means *that* message. Treating
+    /// it as a sender-less request instead fetches the newest mail from
+    /// anyone and summarises a message the owner never asked about -- which
+    /// is worse than refusing, because it looks like it worked.
+    fn refersToOpenMessage(text: []const u8) bool {
+        var words = std.mem.tokenizeAny(u8, text, " \t\r\n.,!?;:\"'");
+        while (words.next()) |word| {
+            for ([_][]const u8{ "it", "that", "this", "same", "one" }) |pronoun| {
+                if (std.ascii.eqlIgnoreCase(word, pronoun)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Trims a target down to something a mail server can match.
+    ///
+    /// The extractor returns the sender as written, which is right, but as
+    /// written can be "Chas from Fleet DM" -- a description, not a search
+    /// term. IMAP matches substrings of the From header, so the name alone
+    /// hits "Chas <chas@example.org>" while the whole phrase hits nothing.
+    fn tidyTarget(target: []const u8) []const u8 {
+        var best = std.mem.trim(u8, target, " \t\r\n.,");
+        for ([_][]const u8{ " from ", " with ", " at ", " of " }) |joiner| {
+            if (std.ascii.indexOfIgnoreCase(best, joiner)) |i| {
+                const head = std.mem.trim(u8, best[0..i], " \t");
+                if (head.len > 0) best = head;
+            }
+        }
+        return best;
+    }
+
+    /// Shows the message already open, without going back to the server.
+    fn readOpenMessage(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const original = &self.last_message.?;
+        if (original.body.len == 0) {
+            return std.fmt.allocPrint(
+                arena,
+                "{s} ({s})\n\n(No plain-text body -- it's probably HTML-only.)",
+                .{ original.subject, original.date },
+            );
+        }
+        return telegram.truncate(try std.fmt.allocPrint(
+            arena,
+            "{s}\nFrom: {s}\nDate: {s}\n\n{s}",
+            .{ original.subject, original.from, original.date, original.body },
+        ));
+    }
+
+    fn summarizeOpenMessage(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const original = &self.last_message.?;
+        self.client.sendTyping();
+        const summary = summarize_mod.summarize(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            original.from,
+            original.subject,
+            original.body,
+        ) catch {
+            return telegram.truncate(try std.fmt.allocPrint(
+                arena,
+                "Couldn't summarize that one. Here's the raw content instead:\n\n{s} ({s})\n\n{s}",
+                .{ original.subject, original.date, original.body },
+            ));
+        };
+        return telegram.truncate(try std.fmt.allocPrint(
+            arena,
+            "{s} ({s})\n\n{s}",
+            .{ original.subject, original.date, summary },
+        ));
     }
 
     fn doRead(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
@@ -1900,4 +1985,32 @@ test "an attachment request is recognised from the owner's own words" {
     // No file mentioned: nothing should be pulled off the open message.
     try std.testing.expect(!Bot.mentionsAttaching("say I'll meet you at 5 tomorrow"));
     try std.testing.expect(!Bot.mentionsAttaching("reply saying Wednesday works"));
+}
+
+test "a pronoun means the message already open, not a fresh fetch" {
+    // "Summarize it" after reading something must summarise *that* message.
+    // Treating it as sender-less fetches the newest mail from anyone and
+    // summarises something never asked about -- worse than refusing,
+    // because it looks like it worked.
+    try std.testing.expect(Bot.refersToOpenMessage("Summarize it"));
+    try std.testing.expect(Bot.refersToOpenMessage("show me the content of this email"));
+    try std.testing.expect(Bot.refersToOpenMessage("what does that one say?"));
+
+    // A fresh request names no pronoun and should go to the server.
+    try std.testing.expect(!Bot.refersToOpenMessage("show me the latest email"));
+    try std.testing.expect(!Bot.refersToOpenMessage("read the last email from sam"));
+}
+
+test "a target is trimmed to something a mail server can match" {
+    // Observed live: the extractor correctly returned the sender as written,
+    // and as written it was a description. IMAP matches substrings of the
+    // From header, so the name alone hits and the whole phrase does not.
+    try std.testing.expectEqualStrings("Chas", Bot.tidyTarget("Chas from Fleet DM"));
+    try std.testing.expectEqualStrings("Mike", Bot.tidyTarget("Mike from Fleet DM"));
+    try std.testing.expectEqualStrings("Sam", Bot.tidyTarget("Sam at example.com"));
+
+    // Plain names, addresses and domains pass through untouched.
+    try std.testing.expectEqualStrings("Vicente Ferrer", Bot.tidyTarget("Vicente Ferrer"));
+    try std.testing.expectEqualStrings("sam@example.com", Bot.tidyTarget("sam@example.com"));
+    try std.testing.expectEqualStrings("omarchy.org", Bot.tidyTarget("omarchy.org."));
 }
