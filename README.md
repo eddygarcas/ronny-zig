@@ -9,9 +9,31 @@ allowlist of senders, suppresses anything that looks like spam — *even from an
 allowlisted sender* — and can be talked to, in text or by voice, to search,
 read, summarise and reply.
 
-A rewrite of the Python original (`../ronny-email-manager`), in Zig 0.16, to
-get at C libraries for mail and its content: libetpan for IMAP, MIME and SMTP,
-whisper.cpp for voice.
+Written in Zig 0.16 over C libraries for mail and its content: **libetpan**
+for IMAP, MIME and SMTP, **whisper.cpp** for voice. It is a personal tool, run
+as three small systemd services against one mailbox.
+
+```
+you   › any mail from the bank this week?
+Ronny › Found 2 message(s) from bank.example in the last 7 day(s):
+        - Tue, 23 Sep: Statement ready
+        - Fri, 19 Sep: Payment received
+
+you   › [voice note] "show me the statement attachment"
+Ronny › Sent Statement-September.pdf (240 KB).
+
+you   › reply saying thanks, received
+Ronny › DRAFT — not sent.
+        To: support@bank.example
+        Subject: Re: Statement ready
+
+        Thanks, received.
+        ---
+        Reply 'yes' to send it, or 'no' to discard it.
+
+you   › yes
+Ronny › Sent to support@bank.example.
+```
 
 ## The rules that shape it
 
@@ -35,34 +57,160 @@ drafts and search ranking all read message bodies, so they all run on local
 Ollama. Only the chat command itself — your words, no mail — goes to a hosted
 model for classification, and even that is optional.
 
-## Running it
+## What you need
+
+| | Why | Notes |
+|---|---|---|
+| **Zig 0.16** | builds it | 0.15 will not work — the standard library moved a lot |
+| **libetpan** | IMAP, MIME, SMTP | `pacman -S libetpan`, `apt install libetpan-dev`, `brew install libetpan` |
+| **whisper.cpp** | voice notes | optional; skip it and Ronny is text-only |
+| **Ollama** | everything that reads mail | a local model — see below for which |
+| **A Gmail account with 2-Step Verification** | the mailbox | app passwords require it |
+| **A Telegram account** | the control channel | one bot per mailbox, never shared |
+| **systemd** | running it unattended | or run the three commands yourself |
+
+Not required: a GPU (voice is ~10× slower without one), and a TypeSafe
+account (Ronny falls back to the local model for command routing).
+
+## Setup
+
+### 1. Ollama and a model
+
+Everything that reads your mail runs here, on your machine. Install Ollama,
+then pull a model:
 
 ```
-zig build test
-cp .env.example .env                              # then fill it in
-cp config/senders.example.yaml config/senders.yaml # then list who to watch
-
-zig build -Doptimize=ReleaseSafe \
-          -Dwhisper-prefix=$HOME/.local/opt/whisper-cuda   # -> zig-out/bin/ronny
+ollama pull qwen2.5
 ```
 
-`-Dwhisper-prefix` is optional but matters a great deal for voice. See below.
+Anything that follows instructions and returns JSON will do; `qwen2.5` is what
+this has been tuned against. Ronny talks to it over HTTP at
+`http://127.0.0.1:11434`.
 
-### Voice on the GPU
+### 2. A Gmail app password
 
-The distro `whisper-cpp` package ships **CPU backends only** — `/usr/lib/ggml`
-holds fourteen `libggml-cpu-*.so` and no `libggml-cuda.so` — so voice notes
-transcribe at roughly real time on a machine with an idle RTX 3060. Measured
-encode time per 30s window of audio, medium model:
+IMAP and SMTP need an **app password**, not your account password. Google
+requires 2-Step Verification on the account before it will issue one — turn
+that on first if it is not already, then create one at
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+
+You get a 16-character string. Keep the spaces or strip them, either works.
+
+### 3. A Telegram bot
+
+Message [@BotFather](https://t.me/botfather) and send `/newbot`. It asks for a
+display name and a username ending in `bot`, then gives you a token like
+`110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`.
+
+**One bot per mailbox.** Only one process may poll a given token — a second
+one gets 409 Conflict and silently eats messages meant for the first.
+
+### 4. Build
+
+```
+git clone https://github.com/eddygarcas/ronny-zig
+cd ronny-zig
+zig build test                     # 62 tests, no network needed
+zig build -Doptimize=ReleaseSafe   # -> zig-out/bin/ronny
+```
+
+### 5. Configure
+
+```
+cp .env.example .env
+cp config/senders.example.yaml config/senders.yaml
+```
+
+Fill in `.env` with the app password and the bot token. **Leave
+`TELEGRAM_OWNER_CHAT_ID` empty for now.** Then list the senders you actually
+want to hear about in `config/senders.yaml` — full addresses or bare domains:
+
+```yaml
+senders:
+  - someone@example.com
+  - example.org
+```
+
+That list is a *strict* allowlist. Mail from anyone not on it is never
+evaluated at all, whatever the subject says. Both files are gitignored.
+
+### 6. Claim the bot
+
+```
+./zig-out/bin/ronny bot
+```
+
+Message your bot `/start` in Telegram. It replies with your chat id and
+refuses everything else. Put that id in `.env` as `TELEGRAM_OWNER_CHAT_ID`,
+stop the process and start it again — from then on every other chat gets a
+flat refusal.
+
+### 7. Run it
+
+Three processes, and they are separate on purpose:
+
+```
+ronny watch      # the mailbox watcher — notifies you
+ronny bot        # the Telegram control channel — answers you
+ronny watchdog   # tails the journal and reports incidents
+```
+
+Only one process may call Telegram's `getUpdates` for a token, so the bot has
+to stand alone; the split also lets the watchdog report that the watcher died,
+which it could not do if it died alongside it.
+
+To run them unattended, edit the three unit files in `systemd/` — each needs
+`User=` and three paths changed — then:
+
+```
+sudo cp systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ronny-watch ronny-bot ronny-watchdog
+journalctl -u ronny-watch -u ronny-bot -f
+```
+
+On first run the watcher baselines to the mailbox's current position rather
+than treating every existing message as new — otherwise a large mailbox would
+produce one notification per message.
+
+## Talking to it
+
+Plain language works; the slash commands are the same actions, spelled out.
+
+| | |
+|---|---|
+| `/status`, `/senders` | what it is doing, who it watches |
+| `/add`, `/remove` | change the allowlist, live |
+| `/search <who> [days]` | recent mail from someone, dates and subjects |
+| `/find <topic>` | search by what a message was *about* |
+| `/read`, `/summarize <who>` | the latest message, in full or summarised |
+| `/attachments`, `/get <name>` | what is attached; send me one |
+| `/reply <text>` | draft a reply to the last message shown |
+| `/compose <who> <what>` | draft a new email |
+| `/confirm`, `/cancel` | send the draft, or discard it |
+| `/pause`, `/resume` | stop and start notifications |
+
+Send a **voice note** instead of typing and it does the same things. Send a
+**file** and it is held for the next draft.
+
+Nothing is sent until you reply `yes` to a draft you can see — and a *spoken*
+yes will not do it, because a misheard word should not be able to send mail.
+
+## Voice on the GPU
+
+Voice works on CPU but transcribes at roughly real time. The distro
+`whisper-cpp` package ships **CPU backends only** — on Arch, `/usr/lib/ggml`
+holds fourteen `libggml-cpu-*.so` and no `libggml-cuda.so`. Measured encode
+time per 30s of audio, medium model:
 
 | | encode |
 |---|---|
-| CPU, 4 threads (whisper's default here) | 13.2 s |
+| CPU, 4 threads | 13.2 s |
 | CPU, 8 threads | 6.6 s |
-| **CUDA on the 3060** | **0.09 s** |
+| **CUDA, RTX 3060** | **0.09 s** |
 
 Nothing in Ronny changes between those; it is purely which ggml backend is
-available. There is no CUDA whisper.cpp in the repos or the AUR, so build one:
+present. There is no CUDA whisper.cpp packaged, so build one:
 
 ```
 git clone --depth 1 --branch v1.9.3 https://github.com/ggml-org/whisper.cpp
@@ -74,74 +222,44 @@ PATH=/opt/cuda/bin:$PATH cmake -B build \
   -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_TESTS=OFF \
   -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/whisper-cuda"
-cmake --build build -j12 && cmake --install build
+cmake --build build -j && cmake --install build
 ```
 
-Four details in there are load-bearing, each found the hard way:
-
-- **`CMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-15`.** nvcc 13.3 refuses any host
-  compiler above GCC 15 and this host defaults to 16.2. `gcc15` is packaged,
-  so this costs nothing — but without it the configure step fails outright.
-- **`CMAKE_INSTALL_RPATH='$ORIGIN'`.** CMake strips rpaths on install by
-  default, which leaves `libggml.so` unable to find `libggml-cuda.so` sitting
-  right beside it. The symptom is nastier than a clean failure: the loader
-  falls back to the *distro's* `libggml-base` from `/usr/lib`, quietly mixing
-  two builds.
-- **`v1.9.3`**, matching the distro package, so `src/whisper_shim.c` keeps
-  compiling against the API it was written for.
-- **`CMAKE_CUDA_ARCHITECTURES=86`** is just the 3060. Omit it and you compile
-  kernels for every GPU generation, for no benefit here.
-
-It installs under `$HOME`, needs no sudo, and overwrites nothing — the system
-`whisper-cpp` stays as it is, so dropping `-Dwhisper-prefix` reverts to it.
-`build.zig` bakes the prefix in as an rpath, so the unit files need no
-`LD_LIBRARY_PATH`. Check it took with `ldd zig-out/bin/ronny | grep ggml`:
-every line should point at the prefix, none at `/usr/lib`.
-
-Three subcommands, three processes:
+Then point the build at it, and download a model:
 
 ```
-ronny watch      # the mailbox watcher (the default)
-ronny bot        # the Telegram control channel
-ronny watchdog   # journal incident detection
+zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
+mkdir -p models && curl -L -o models/ggml-medium.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin
 ```
 
-They are separate processes rather than threads for a specific reason: only
-one process may call Telegram's `getUpdates` for a given token. A second
-poller gets 409 Conflict and, worse, silently consumes updates the first one
-needed — so your messages disappear into whichever poller won the race. The
-split also means either half can be cut over from the Python service on its
-own, and the watchdog can report that the watcher died, which it could not do
-if it died with it.
+Set `WHISPER_MODEL_PATH=models/ggml-medium.bin` in `.env`. Leave it unset and
+voice notes are simply disabled.
 
-What they share is on disk: `config/senders.yaml` and the paused flag. Both
-are re-read each scan, so changes made from chat take effect without a
-restart.
+Four flags above are load-bearing, each found the hard way:
 
-## Cutting over from the Python service
+- **`CMAKE_CUDA_HOST_COMPILER`** — nvcc rejects host compilers newer than it
+  supports (13.3 refuses anything above GCC 15). Point it at an older one you
+  have installed, or configure fails outright.
+- **`CMAKE_INSTALL_RPATH='$ORIGIN'`** — CMake strips rpaths on install, which
+  leaves `libggml.so` unable to find `libggml-cuda.so` beside it. It does not
+  fail cleanly: the loader falls back to the distro's `libggml-base`, quietly
+  mixing two builds.
+- **`v1.9.3`**, matching the packaged version `src/whisper_shim.c` compiles
+  against.
+- **`CMAKE_CUDA_ARCHITECTURES`** — just your card (86 is a 3060). Omit it and
+  you compile kernels for every GPU generation.
 
-The Python service is the one in production. Nothing here is enabled, and the
-cutover is a deliberate step.
+Check it took with `ldd zig-out/bin/ronny | grep ggml`: every line should
+point at your prefix, none at `/usr/lib`. A plain `zig build` reverts to the
+system package, which is a large and silent voice regression.
 
-The units declare `Conflicts=ronny-email-manager.service`, so systemd will
-refuse to run the Zig and Python halves at the same time rather than letting
-two pollers fight over your messages. `ronny-watchdog.service` shares a name
-with the Python watchdog's unit — installing it *is* the watchdog cutover.
+## Running a second instance
 
-```
-sudo cp systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl disable --now ronny-email-manager ronny-watchdog
-cp ../ronny-email-manager/data/state.json data/    # byte-compatible
-sudo systemctl enable --now ronny-watch ronny-bot ronny-watchdog
-```
-
-`state.json` carries the UID watermark. Copying it is what stops the first
-Zig run from either re-notifying recent mail or silently skipping it; without
-it the watcher baselines to the mailbox's current UIDNEXT, which is safe but
-loses anything that arrived during the switch.
-
-To go back, reverse the last two lines.
+Point it at a different mailbox with its own `.env` and `config/senders.yaml`.
+It needs **its own Telegram bot token**, its own state files, and its own unit
+names — see [docs/new-deployment.md](docs/new-deployment.md) for what shares
+and what must not.
 
 ## Layout
 
@@ -184,13 +302,34 @@ visible in any single file — worth reading before changing behaviour:
 
 ## Known gaps
 
-- The whisper.cpp CUDA build lives outside pacman, so a `whisper-cpp` package
-  upgrade won't touch it and won't update it either. If the API ever drifts
-  far enough that `whisper_shim.c` stops compiling, rebuild from a newer tag.
-- `build.zig` pins an explicit glibc target to work around Zig 0.16's ELF
-  linker not handling the `.sframe` relocations this host's GCC emits. When
-  `zig build -Dtarget=native` links cleanly, that workaround and the explicit
-  system paths can all go.
+**`build.zig` is pinned to one machine's toolchain, and that may well bite
+you first.** It names an explicit `x86_64-linux-gnu` target with glibc 2.43
+and hardcodes `/usr/include` and `/usr/lib`, because Zig 0.16's ELF linker
+could not handle the `.sframe` relocations this host's GCC 16 emits into
+`crt1.o` — a hello-world with `-lc` failed the same way, so it is a toolchain
+disagreement rather than anything about this code.
+
+If you are on a different distro, architecture or glibc, that is the first
+thing to change. Try `zig build -Dtarget=native` — if it links, delete the
+default target and the explicit paths entirely, they exist only for that one
+problem. If it does not link, adjust the glibc version to match yours
+(`ldd --version`); naming one newer than Zig ships stubs for is rejected
+outright. Patches welcome; it should not need pinning at all.
+
+Other things worth knowing:
+
+- **Gmail-specific in one place.** `find_mail` searches by topic using
+  Gmail's `X-GM-RAW` IMAP extension. Everything else is ordinary IMAP, so
+  another provider works if you drop or replace that one command.
+- **The spam check is a judgement call by a small local model**, not a
+  guarantee. Treat it as a second opinion, not a filter you rely on.
+- **Allowlist matching is exact address or exact domain.** No wildcards, no
+  regex.
+- **The bot token is a credential.** Anyone holding it can impersonate the
+  bot; ownership is enforced only by Telegram chat id.
+- **A CUDA whisper build lives outside your package manager**, so upgrades
+  will neither break it nor update it. If the API drifts far enough that
+  `src/whisper_shim.c` stops compiling, rebuild from a newer tag.
 
 ## Licence
 

@@ -603,6 +603,19 @@ pub const Bot = struct {
             // by skipping the model entirely.
             return self.doGetAttachment(arena, arg);
         }
+        if (std.mem.eql(u8, command, "/compose")) {
+            if (arg.len == 0) return "Usage: /compose someone@example.com <what to say>";
+            // A leading address is taken exactly as given -- typed input, not
+            // model output. Anything else goes to the contact book, and a
+            // missing body is asked for rather than invented.
+            const split = std.mem.indexOfScalar(u8, arg, ' ') orelse arg.len;
+            const first = arg[0..split];
+            const rest = std.mem.trim(u8, arg[@min(split + 1, arg.len)..], " \t");
+            if (headers_mod.address(first) != null and rest.len > 0) {
+                return self.doComposeMail(arena, first, rest, false);
+            }
+            return self.doComposeMail(arena, arg, null, false);
+        }
         if (std.mem.eql(u8, command, "/reply")) {
             if (arg.len == 0) return "Usage: /reply <text>  (replies to the last email I showed you)";
             return self.doDraftReply(arena, arg, true);
