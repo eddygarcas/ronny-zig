@@ -133,6 +133,7 @@ fn runBot(init: std.process.Init) !void {
         .typesafe_api_key = (try envOptional(init, "TYPESAFE_API_KEY")) orelse "",
         .jev_model = (try envOptional(init, "JEV_MODEL")) orelse "jev-latest",
         .whisper_model_path = try envOptional(init, "WHISPER_MODEL_PATH"),
+        .whisper_languages = (try envOptional(init, "WHISPER_LANGUAGES")) orelse "en,es",
     };
 
     var bot = bot_mod.Bot.init(cfg, &controller);

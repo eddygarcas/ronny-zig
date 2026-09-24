@@ -26,8 +26,11 @@ extern fn ronny_whisper_transcribe(
     samples: [*]const f32,
     n_samples: c_int,
     prompt: ?[*:0]const u8,
+    allowed_languages: ?[*:0]const u8,
     out: [*]u8,
     cap: c_int,
+    language_out: [*]u8,
+    language_cap: c_int,
 ) c_int;
 
 pub const SAMPLE_RATE = 16000;
@@ -103,6 +106,7 @@ pub fn transcribe(
     gpa: std.mem.Allocator,
     audio: []const u8,
     prompt: ?[:0]const u8,
+    allowed_languages: ?[:0]const u8,
 ) ![]u8 {
     const samples = try decodeToPcm(io, gpa, audio);
     defer gpa.free(samples);
@@ -113,12 +117,16 @@ pub fn transcribe(
     errdefer gpa.free(buffer);
 
     const started = std.Io.Clock.now(.boot, io);
+    var language: [16]u8 = undefined;
     const written = ronny_whisper_transcribe(
         samples.ptr,
         @intCast(samples.len),
         if (prompt) |p| p.ptr else null,
+        if (allowed_languages) |l| l.ptr else null,
         buffer.ptr,
         MAX_TEXT,
+        &language,
+        language.len,
     );
     if (written < 0) return Error.TranscribeFailed;
     const elapsed_ms = @divTrunc(
@@ -133,8 +141,9 @@ pub fn transcribe(
     // Both numbers, because the ratio is the thing worth watching: on the CPU
     // backend this runs near real time, on the GPU it should be a fraction.
     const seconds = @as(f32, @floatFromInt(samples.len)) / @as(f32, SAMPLE_RATE);
-    log.info("transcribed {d:.1}s of audio in {d}ms ({d:.2}x real time)", .{
+    log.info("transcribed {d:.1}s of audio in {d}ms ({d:.2}x real time, {s})", .{
         seconds, elapsed_ms, @as(f32, @floatFromInt(elapsed_ms)) / 1000.0 / seconds,
+        std.mem.sliceTo(&language, 0),
     });
     return owned;
 }

@@ -104,6 +104,10 @@ pub const Config = struct {
 
     /// Voice notes are off unless a whisper model is configured.
     whisper_model_path: ?[:0]const u8 = null,
+    /// Languages the owner actually speaks. Auto-detect stays on -- they
+    /// switch mid-conversation -- but a result outside this set is re-decoded
+    /// rather than trusted. Null accepts whatever whisper reports.
+    whisper_languages: ?[:0]const u8 = null,
     /// Spoken yes/no never confirms a send by default: a misheard word would
     /// send mail the owner did not approve.
     voice_can_confirm_send: bool = false,
@@ -511,7 +515,7 @@ pub const Bot = struct {
         const vocabulary = self.voiceVocabulary();
         const prompt = transcribe.buildPrompt(arena, vocabulary) catch null;
 
-        const raw = transcribe.transcribe(self.cfg.io, arena, audio, prompt) catch |err| {
+        const raw = transcribe.transcribe(self.cfg.io, arena, audio, prompt, self.cfg.whisper_languages) catch |err| {
             log.warn("transcription failed: {s}", .{@errorName(err)});
             return self.client.sendMessage("I couldn't make out any speech in that -- try again, or type it.");
         };
