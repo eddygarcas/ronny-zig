@@ -57,6 +57,45 @@ drafts and search ranking all read message bodies, so they all run on local
 Ollama. Only the chat command itself — your words, no mail — goes to a hosted
 model for classification, and even that is optional.
 
+## How it decides things
+
+Three layers, and keeping them apart is most of the design.
+
+**Jev decides *what* you asked for.** [Jev](https://typesafe.ai) is a System
+One model: it returns a typed answer from a closed set with a probability
+attached, rather than generating text. Ronny asks it one question — which of
+about fifteen actions is this message? — and gets back something like
+`read_mail` at 0.94 with `unknown` at 0.01. A model that can only pick from a
+list cannot invent an action, and one that reports its own uncertainty can say
+*I don't know* instead of confidently choosing the nearest-looking thing.
+
+**Local models do the reasoning.** Which attachment did you mean. Which
+contact. What should this reply say. Is this message spam. Does this search
+result actually answer the question. All of that needs to see your mail, so
+all of it runs on Ollama, on your machine.
+
+**Zig does everything else.** Fetching, parsing, sending, the allowlist, the
+approval gate. No model is anywhere near the decision to actually send an
+email.
+
+That split is also where the privacy boundary falls out for free. Jev only
+ever sees the sentence you typed — never a subject line, never a body, never a
+filename. Anything that would require showing a model your mail is, by
+construction, a job for the local one.
+
+**Confidence is a floor, not a gate**, and that distinction cost real
+debugging. Jev's confidence measures how *concentrated* its answer is, not
+whether it is right. "Give me the last email from X" legitimately splits
+between reading it and searching for it — both fair readings — and a flat 0.55
+threshold rejected that twice at 0.51 and 0.54 while the answer was correct.
+Ronny now falls back on Jev's own `unknown` probability instead. Conversation
+history makes this worse, not better: the same sentence scores 0.93 alone and
+0.73 with context, so any threshold-based gate degrades the longer you talk.
+
+**It is optional.** Leave `TYPESAFE_API_KEY` empty and the local model does
+the routing too, using a prompt that asks for the same closed set as JSON.
+Everything still works; Jev is just better at refusing to guess.
+
 ## What you need
 
 | | Why | Notes |
@@ -69,8 +108,10 @@ model for classification, and even that is optional.
 | **A Telegram account** | the control channel | one bot per mailbox, never shared |
 | **systemd** | running it unattended | or run the three commands yourself |
 
-Not required: a GPU (voice is ~10× slower without one), and a TypeSafe
-account (Ronny falls back to the local model for command routing).
+Not required: a GPU (voice is ~10× slower without one), and a
+[TypeSafe](https://typesafe.ai) key for Jev — leave `TYPESAFE_API_KEY` empty
+and the local model routes commands too. See
+[How it decides things](#how-it-decides-things) for what that changes.
 
 ## Setup
 
@@ -105,7 +146,17 @@ display name and a username ending in `bot`, then gives you a token like
 **One bot per mailbox.** Only one process may poll a given token — a second
 one gets 409 Conflict and silently eats messages meant for the first.
 
-### 4. Build
+### 4. A TypeSafe key, if you want one (optional)
+
+Sign up at [typesafe.ai](https://typesafe.ai) and put the key in `.env` as
+`TYPESAFE_API_KEY`. Jev then decides which action a message means, and is
+better than a small local model at answering *I don't know* rather than
+guessing — see [How it decides things](#how-it-decides-things).
+
+Skip it and everything still works; the local model routes commands too. Only
+your typed words are ever sent, never mail.
+
+### 5. Build
 
 ```
 git clone https://github.com/eddygarcas/ronny-zig
@@ -114,7 +165,7 @@ zig build test                     # 62 tests, no network needed
 zig build -Doptimize=ReleaseSafe   # -> zig-out/bin/ronny
 ```
 
-### 5. Configure
+### 6. Configure
 
 ```
 cp .env.example .env
@@ -134,7 +185,7 @@ senders:
 That list is a *strict* allowlist. Mail from anyone not on it is never
 evaluated at all, whatever the subject says. Both files are gitignored.
 
-### 6. Claim the bot
+### 7. Claim the bot
 
 ```
 ./zig-out/bin/ronny bot
@@ -145,7 +196,7 @@ refuses everything else. Put that id in `.env` as `TELEGRAM_OWNER_CHAT_ID`,
 stop the process and start it again — from then on every other chat gets a
 flat refusal.
 
-### 7. Run it
+### 8. Run it
 
 Three processes, and they are separate on purpose:
 
