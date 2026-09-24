@@ -21,6 +21,7 @@
 #include <time.h>
 #include <string.h>
 #include <strings.h>
+#include <stddef.h>
 
 /* ---- selection info (hidden behind bitfields) ---- */
 
@@ -164,12 +165,25 @@ int ronny_fetch_envelopes_since(mailimap *session, uint32_t first_uid,
 
 /* ---- full message fetch (for the spam gate) ---- */
 
-#define RONNY_HDR_MAX  8192
-#define RONNY_BODY_MAX 8192
+#define RONNY_HDR_MAX    8192
+#define RONNY_BODY_MAX   8192
+#define RONNY_ATTACH_MAX 16
+#define RONNY_FNAME_MAX  200
+#define RONNY_CTYPE_MAX  100
+
+typedef struct {
+    char filename[RONNY_FNAME_MAX];   /* RFC 2047 decoded, or "part-N" */
+    char mime_type[RONNY_CTYPE_MAX];  /* "application/pdf" */
+    uint32_t size;                    /* approximate DECODED bytes */
+    uint32_t index;                   /* ordinal among single parts, for fetching */
+    uint8_t is_inline;                /* Content-Disposition: inline */
+} ronny_attachment;
 
 typedef struct {
     char headers[RONNY_HDR_MAX];
     char body[RONNY_BODY_MAX];
+    int32_t attachment_count;
+    ronny_attachment attachments[RONNY_ATTACH_MAX];
 } ronny_message;
 
 /* Is this MIME part text, and of which subtype? */
@@ -209,6 +223,193 @@ static int append_decoded(struct mailmime *mime, char *dst, size_t cap) {
     dst[used + n] = '\0';
     mmap_string_unref(decoded);
     return n > 0;
+}
+
+/* ---- attachment parts ---- */
+
+/* The filename a part declares, from Content-Disposition first and the
+ * Content-Type `name` parameter as a fallback. Both arrive RFC 2047 encoded
+ * as often as not, so both go through decode_header. */
+static void part_filename(struct mailmime *mime, char *dst, size_t cap) {
+    dst[0] = '\0';
+
+    if (mime->mm_mime_fields != NULL) {
+        for (clistiter *it = clist_begin(mime->mm_mime_fields->fld_list); it != NULL; it = clist_next(it)) {
+            struct mailmime_field *field = clist_content(it);
+            if (field == NULL || field->fld_type != MAILMIME_FIELD_DISPOSITION) continue;
+            struct mailmime_disposition *disposition = field->fld_data.fld_disposition;
+            if (disposition == NULL || disposition->dsp_parms == NULL) continue;
+            for (clistiter *p = clist_begin(disposition->dsp_parms); p != NULL; p = clist_next(p)) {
+                struct mailmime_disposition_parm *parm = clist_content(p);
+                if (parm != NULL && parm->pa_type == MAILMIME_DISPOSITION_PARM_FILENAME) {
+                    decode_header(dst, cap, parm->pa_data.pa_filename);
+                    return;
+                }
+            }
+        }
+    }
+
+    struct mailmime_content *content = mime->mm_content_type;
+    if (content != NULL && content->ct_parameters != NULL) {
+        for (clistiter *p = clist_begin(content->ct_parameters); p != NULL; p = clist_next(p)) {
+            struct mailmime_parameter *parm = clist_content(p);
+            if (parm != NULL && parm->pa_name != NULL && strcasecmp(parm->pa_name, "name") == 0) {
+                decode_header(dst, cap, parm->pa_value);
+                return;
+            }
+        }
+    }
+}
+
+static int part_is_inline(struct mailmime *mime) {
+    if (mime->mm_mime_fields == NULL) return 0;
+    for (clistiter *it = clist_begin(mime->mm_mime_fields->fld_list); it != NULL; it = clist_next(it)) {
+        struct mailmime_field *field = clist_content(it);
+        if (field == NULL || field->fld_type != MAILMIME_FIELD_DISPOSITION) continue;
+        struct mailmime_disposition *disposition = field->fld_data.fld_disposition;
+        if (disposition != NULL && disposition->dsp_type != NULL &&
+            disposition->dsp_type->dsp_type == MAILMIME_DISPOSITION_TYPE_INLINE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Reassembles "type/subtype" for Telegram, which wants a real content type. */
+static void part_content_type(struct mailmime *mime, char *dst, size_t cap) {
+    struct mailmime_content *content = mime->mm_content_type;
+    if (content == NULL || content->ct_type == NULL) {
+        copy_bounded(dst, cap, "application/octet-stream");
+        return;
+    }
+
+    const char *type = "application";
+    if (content->ct_type->tp_type == MAILMIME_TYPE_DISCRETE_TYPE) {
+        struct mailmime_discrete_type *discrete = content->ct_type->tp_data.tp_discrete_type;
+        switch (discrete->dt_type) {
+        case MAILMIME_DISCRETE_TYPE_TEXT:        type = "text"; break;
+        case MAILMIME_DISCRETE_TYPE_IMAGE:       type = "image"; break;
+        case MAILMIME_DISCRETE_TYPE_AUDIO:       type = "audio"; break;
+        case MAILMIME_DISCRETE_TYPE_VIDEO:       type = "video"; break;
+        case MAILMIME_DISCRETE_TYPE_APPLICATION: type = "application"; break;
+        case MAILMIME_DISCRETE_TYPE_EXTENSION:
+            if (discrete->dt_extension != NULL) type = discrete->dt_extension;
+            break;
+        default: break;
+        }
+    } else if (content->ct_type->tp_type == MAILMIME_TYPE_COMPOSITE_TYPE) {
+        type = "multipart";
+    }
+    snprintf(dst, cap, "%s/%s", type,
+             content->ct_subtype != NULL ? content->ct_subtype : "octet-stream");
+}
+
+/* An attachment is a part that names a file, or any non-text part.
+ *
+ * The body itself is text/* with no filename, so it falls out naturally.
+ * Inline images -- signature logos and the like -- do match, which is honest:
+ * they really are attached. They are flagged so the caller can rank them
+ * below the file someone actually meant to send. */
+static int part_is_attachment(struct mailmime *mime) {
+    char filename[RONNY_FNAME_MAX];
+    part_filename(mime, filename, sizeof(filename));
+    if (filename[0] != '\0') return 1;
+
+    struct mailmime_content *content = mime->mm_content_type;
+    if (content == NULL || content->ct_type == NULL) return 0;
+    if (content->ct_type->tp_type != MAILMIME_TYPE_DISCRETE_TYPE) return 0;
+    return content->ct_type->tp_data.tp_discrete_type->dt_type != MAILMIME_DISCRETE_TYPE_TEXT;
+}
+
+/* Encoded length adjusted for the transfer encoding. Approximate on purpose:
+ * it is for showing the owner "invoice.pdf (~240 KB)" before they decide to
+ * download it, not for allocating anything. */
+static uint32_t part_decoded_size(struct mailmime *mime) {
+    struct mailmime_data *data = mime->mm_data.mm_single;
+    if (data == NULL || data->dt_type != MAILMIME_DATA_TEXT) return 0;
+    size_t n = data->dt_data.dt_text.dt_length;
+    if (data->dt_encoding == MAILMIME_MECHANISM_BASE64) n = n / 4 * 3;
+    return (uint32_t)n;
+}
+
+/* Collects attachment metadata, numbering every single part in depth-first
+ * order so `index` can address one later without keeping the message around.
+ * Both walks must agree on that order, which is why they share this shape. */
+static void collect_attachments(struct mailmime *mime, ronny_message *out, int *ordinal) {
+    if (mime == NULL) return;
+
+    switch (mime->mm_type) {
+    case MAILMIME_SINGLE: {
+        int index = (*ordinal)++;
+        if (!part_is_attachment(mime)) return;
+        if (out->attachment_count >= RONNY_ATTACH_MAX) return;
+
+        ronny_attachment *entry = &out->attachments[out->attachment_count];
+        memset(entry, 0, sizeof(*entry));
+        part_filename(mime, entry->filename, sizeof(entry->filename));
+        part_content_type(mime, entry->mime_type, sizeof(entry->mime_type));
+        entry->index = (uint32_t)index;
+        entry->is_inline = part_is_inline(mime) ? 1 : 0;
+        entry->size = part_decoded_size(mime);
+        if (entry->filename[0] == '\0') {
+            snprintf(entry->filename, sizeof(entry->filename), "part-%d", index);
+        }
+        out->attachment_count++;
+        break;
+    }
+    case MAILMIME_MESSAGE:
+        collect_attachments(mime->mm_data.mm_message.mm_msg_mime, out, ordinal);
+        break;
+    case MAILMIME_MULTIPLE:
+        for (clistiter *it = clist_begin(mime->mm_data.mm_multipart.mm_mp_list);
+             it != NULL; it = clist_next(it)) {
+            collect_attachments(clist_content(it), out, ordinal);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Finds the single part numbered `wanted` and decodes it into `out`.
+ * Returns the byte count, or -1. Must walk identically to collect_attachments. */
+static long decode_part(struct mailmime *mime, uint32_t wanted, int *ordinal,
+                        char *out, size_t cap) {
+    if (mime == NULL) return -1;
+
+    switch (mime->mm_type) {
+    case MAILMIME_SINGLE: {
+        int index = (*ordinal)++;
+        if ((uint32_t)index != wanted) return -1;
+
+        struct mailmime_data *data = mime->mm_data.mm_single;
+        if (data == NULL || data->dt_type != MAILMIME_DATA_TEXT) return -1;
+
+        size_t position = 0;
+        char *decoded = NULL;
+        size_t decoded_len = 0;
+        int r = mailmime_part_parse(data->dt_data.dt_text.dt_data,
+                                    data->dt_data.dt_text.dt_length,
+                                    &position, data->dt_encoding, &decoded, &decoded_len);
+        if (r != MAILIMF_NO_ERROR || decoded == NULL) return -1;
+        if (decoded_len > cap) { mmap_string_unref(decoded); return -2; } /* caller's buffer too small */
+
+        memcpy(out, decoded, decoded_len);
+        mmap_string_unref(decoded);
+        return (long)decoded_len;
+    }
+    case MAILMIME_MESSAGE:
+        return decode_part(mime->mm_data.mm_message.mm_msg_mime, wanted, ordinal, out, cap);
+    case MAILMIME_MULTIPLE:
+        for (clistiter *it = clist_begin(mime->mm_data.mm_multipart.mm_mp_list);
+             it != NULL; it = clist_next(it)) {
+            long n = decode_part(clist_content(it), wanted, ordinal, out, cap);
+            if (n != -1) return n;
+        }
+        return -1;
+    default:
+        return -1;
+    }
 }
 
 /* Walks the MIME tree for readable text, preferring `subtype`.
@@ -305,6 +506,10 @@ int ronny_fetch_message(mailimap *session, uint32_t uid, ronny_message *out) {
                 if (!extract_text(mime, "plain", out->body, sizeof(out->body))) {
                     extract_text(mime, "html", out->body, sizeof(out->body));
                 }
+                /* Metadata only -- the bytes stay on the server until asked
+                 * for, so listing what is attached costs nothing extra. */
+                int ordinal = 0;
+                collect_attachments(mime, out, &ordinal);
                 mailmime_free(mime);
             }
         }
@@ -312,6 +517,94 @@ int ronny_fetch_message(mailimap *session, uint32_t uid, ronny_message *out) {
 
     mailimap_fetch_list_free(result);
     return 0;
+}
+
+/* Fetches one attachment's decoded bytes into `out`.
+ *
+ * Returns the byte count, -2 if `cap` is too small, or -1 on any failure.
+ *
+ * This refetches the message rather than caching it from ronny_fetch_message.
+ * That is one extra round trip, taken deliberately: caching would mean holding
+ * a whole multi-megabyte message for every mail the owner merely looked at,
+ * and attachments are downloaded far less often than mail is read.
+ */
+long ronny_fetch_attachment(mailimap *session, uint32_t uid, uint32_t index,
+                            char *out, size_t cap) {
+    if (session == NULL || out == NULL || cap == 0) return -1;
+
+    struct mailimap_set *set = mailimap_set_new_single(uid);
+    if (set == NULL) return -1;
+
+    struct mailimap_section *section = mailimap_section_new(NULL);
+    if (section == NULL) { mailimap_set_free(set); return -1; }
+
+    struct mailimap_fetch_att *att = mailimap_fetch_att_new_body_peek_section(section);
+    if (att == NULL) { mailimap_section_free(section); mailimap_set_free(set); return -1; }
+
+    struct mailimap_fetch_type *fetch_type = mailimap_fetch_type_new_fetch_att(att);
+    if (fetch_type == NULL) { mailimap_fetch_att_free(att); mailimap_set_free(set); return -1; }
+
+    clist *result = NULL;
+    int r = mailimap_uid_fetch(session, set, fetch_type, &result);
+    mailimap_fetch_type_free(fetch_type);
+    mailimap_set_free(set);
+    if (r != MAILIMAP_NO_ERROR) return -1;
+
+    long written = -1;
+    for (clistiter *it = clist_begin(result); it != NULL && written < 0; it = clist_next(it)) {
+        struct mailimap_msg_att *msg = clist_content(it);
+        if (msg == NULL) continue;
+
+        for (clistiter *ait = clist_begin(msg->att_list); ait != NULL; ait = clist_next(ait)) {
+            struct mailimap_msg_att_item *item = clist_content(ait);
+            if (item == NULL || item->att_type != MAILIMAP_MSG_ATT_ITEM_STATIC) continue;
+
+            struct mailimap_msg_att_static *stat = item->att_data.att_static;
+            if (stat == NULL || stat->att_type != MAILIMAP_MSG_ATT_BODY_SECTION) continue;
+
+            const char *raw = stat->att_data.att_body_section->sec_body_part;
+            size_t raw_len = stat->att_data.att_body_section->sec_length;
+            if (raw == NULL || raw_len == 0) continue;
+
+            size_t position = 0;
+            struct mailmime *mime = NULL;
+            if (mailmime_parse(raw, raw_len, &position, &mime) == MAILIMF_NO_ERROR && mime != NULL) {
+                int ordinal = 0;
+                written = decode_part(mime, index, &ordinal, out, cap);
+                mailmime_free(mime);
+            }
+            break;
+        }
+    }
+
+    mailimap_fetch_list_free(result);
+    return written;
+}
+
+/* Reports C's view of the shared struct layouts.
+ *
+ * Every struct here is declared twice -- once in C, once as a Zig extern
+ * struct -- and a mismatch does not fail to compile. It silently reads the
+ * wrong bytes, which surfaces as garbled filenames or nonsense sizes a long
+ * way from the cause. imap.zig asserts these at test time.
+ *
+ * `which`: 0 sizeof(ronny_envelope), 1 sizeof(ronny_message),
+ *          2 sizeof(ronny_attachment), 3 offsetof(message, attachment_count),
+ *          4 offsetof(message, attachments), 5 offsetof(attachment, size),
+ *          6 offsetof(attachment, index), 7 offsetof(attachment, is_inline).
+ */
+size_t ronny_layout(int which) {
+    switch (which) {
+    case 0: return sizeof(ronny_envelope);
+    case 1: return sizeof(ronny_message);
+    case 2: return sizeof(ronny_attachment);
+    case 3: return offsetof(ronny_message, attachment_count);
+    case 4: return offsetof(ronny_message, attachments);
+    case 5: return offsetof(ronny_attachment, size);
+    case 6: return offsetof(ronny_attachment, index);
+    case 7: return offsetof(ronny_attachment, is_inline);
+    default: return (size_t)-1;
+    }
 }
 
 /* ---- searching ---- */

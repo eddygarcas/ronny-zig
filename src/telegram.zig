@@ -13,7 +13,7 @@ const http = @import("http.zig");
 
 const log = std.log.scoped(.telegram);
 
-pub const Error = error{SendFailed};
+pub const Error = error{ SendFailed, FileTooLarge };
 
 /// Telegram rejects messages over 4096 characters; leave room for framing.
 pub const MAX_MESSAGE_CHARS = 3500;
@@ -30,6 +30,21 @@ pub const Voice = struct {
     duration: u32 = 0,
 };
 
+/// A file the owner uploaded. Telegram sends metadata plus a file id; the
+/// bytes are fetched separately through getFile, the same as a voice note.
+pub const Document = struct {
+    file_id: []const u8 = "",
+    file_name: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    file_size: u64 = 0,
+};
+
+/// A photo arrives as several sizes of the same image, smallest first.
+pub const PhotoSize = struct {
+    file_id: []const u8 = "",
+    file_size: u64 = 0,
+};
+
 pub const Chat = struct { id: i64 = 0 };
 
 pub const Message = struct {
@@ -38,6 +53,13 @@ pub const Message = struct {
     voice: ?Voice = null,
     /// A forwarded audio file behaves the same as a voice note here.
     audio: ?Voice = null,
+    /// An uploaded file. `caption` carries any text sent alongside it, which
+    /// is how the owner says what the file is for in one message.
+    document: ?Document = null,
+    /// Telegram strips the filename from photos sent as photos rather than as
+    /// files, so these are named on the way out.
+    photo: ?[]PhotoSize = null,
+    caption: ?[]const u8 = null,
 };
 
 pub const Update = struct {
@@ -151,6 +173,49 @@ pub const Client = struct {
         const endpoint = self.url(arena, "sendChatAction") catch return;
         var response = http.postJson(self.io, arena, endpoint, payload.writer.buffered(), &.{}) catch return;
         response.deinit(arena);
+    }
+
+    /// Telegram's documented ceiling for sendDocument on the standard API.
+    /// Downloads have their own, lower limit which the docs do not state
+    /// plainly, so downloadFile reports Telegram's refusal rather than
+    /// second-guessing it with a constant.
+    pub const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+    /// Sends a file to the owner. Used for email attachments.
+    ///
+    /// JSON cannot carry file contents, so this is the one Telegram call that
+    /// goes out as multipart/form-data.
+    pub fn sendDocument(
+        self: *Client,
+        arena: std.mem.Allocator,
+        filename: []const u8,
+        content_type: []const u8,
+        bytes: []const u8,
+        caption: []const u8,
+    ) !void {
+        if (bytes.len > MAX_UPLOAD_BYTES) return Error.FileTooLarge;
+
+        const endpoint = try self.url(arena, "sendDocument");
+        var response = http.postMultipart(self.io, arena, endpoint, &.{
+            .{ .text = .{ .name = "chat_id", .value = self.owner_chat_id } },
+            .{ .text = .{ .name = "caption", .value = truncate(caption) } },
+            .{ .file = .{
+                .name = "document",
+                .filename = filename,
+                .content_type = content_type,
+                .bytes = bytes,
+            } },
+        }) catch return Error.SendFailed;
+        defer response.deinit(arena);
+
+        if (!response.ok()) {
+            log.warn("sendDocument returned {d}: {s}", .{
+                @intFromEnum(response.status),
+                response.body[0..@min(response.body.len, 200)],
+            });
+            return Error.SendFailed;
+        }
+        log.info("sent {s} ({d} bytes) to the owner", .{ filename, bytes.len });
     }
 
     /// Downloads a voice note. Returns the audio bytes, owned by `arena`.

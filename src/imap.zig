@@ -50,6 +50,7 @@ extern fn ronny_selection_uidnext(session: *c.mailimap) u32;
 extern fn ronny_selection_uidvalidity(session: *c.mailimap) u32;
 extern fn ronny_fetch_envelopes_since(session: *c.mailimap, first_uid: u32, out: [*]Envelope, max_out: c_int) c_int;
 extern fn ronny_fetch_message(session: *c.mailimap, uid: u32, out: *Message) c_int;
+extern fn ronny_fetch_attachment(session: *c.mailimap, uid: u32, index: u32, out: [*]u8, cap: usize) c_long;
 extern fn ronny_search_from(session: *c.mailimap, sender: [*:0]const u8, days: c_int, out: [*]Envelope, max_out: c_int) c_int;
 extern fn ronny_search_gmail(session: *c.mailimap, query: [*:0]const u8, out: [*]Envelope, max_out: c_int) c_int;
 
@@ -60,17 +61,46 @@ pub const Error = error{
     Select,
     Fetch,
     Idle,
+    AttachmentTooLarge,
 };
 
 pub const HDR_MAX = 8192;
 pub const BODY_MAX = 8192;
+pub const ATTACH_MAX = 16;
+pub const FNAME_MAX = 200;
+pub const CTYPE_MAX = 100;
 
-/// Mirrors `ronny_message` in shim.c. Headers and body are fetched
-/// separately: the deterministic spam checks read only headers, the model
-/// reads only the text.
+/// Mirrors `ronny_attachment` in shim.c. Metadata only -- the bytes stay on
+/// the server until `fetchAttachment` asks for them, so listing what a
+/// message carries costs nothing beyond the fetch already being done.
+pub const Attachment = extern struct {
+    filename: [FNAME_MAX]u8,
+    mime_type: [CTYPE_MAX]u8,
+    /// Approximate decoded size, for showing the owner before they commit to
+    /// a download. Not an allocation size.
+    size: u32,
+    /// Ordinal among the message's single parts; what `fetchAttachment` takes.
+    index: u32,
+    /// Content-Disposition: inline -- a signature logo rather than a file
+    /// someone meant to send. Still an attachment, just ranked below.
+    is_inline: u8,
+
+    pub fn filenameSlice(self: *const Attachment) []const u8 {
+        return std.mem.sliceTo(&self.filename, 0);
+    }
+
+    pub fn mimeTypeSlice(self: *const Attachment) []const u8 {
+        return std.mem.sliceTo(&self.mime_type, 0);
+    }
+};
+
+/// Mirrors `ronny_message` in shim.c. Headers and body are separated: the
+/// deterministic spam checks read only headers, the model reads only the text.
 pub const Message = extern struct {
     headers: [HDR_MAX]u8,
     body: [BODY_MAX]u8,
+    attachment_count: i32,
+    attachments: [ATTACH_MAX]Attachment,
 
     pub fn headersSlice(self: *const Message) []const u8 {
         return std.mem.sliceTo(&self.headers, 0);
@@ -78,6 +108,11 @@ pub const Message = extern struct {
 
     pub fn bodySlice(self: *const Message) []const u8 {
         return std.mem.sliceTo(&self.body, 0);
+    }
+
+    pub fn attachmentSlice(self: *const Message) []const Attachment {
+        const n: usize = if (self.attachment_count < 0) 0 else @intCast(self.attachment_count);
+        return self.attachments[0..@min(n, ATTACH_MAX)];
     }
 };
 
@@ -145,6 +180,19 @@ pub const Session = struct {
         if (ronny_fetch_message(self.imap, uid, out) != 0) return Error.Fetch;
     }
 
+    /// Decoded bytes of one attachment, written into `buffer`.
+    ///
+    /// Costs a second fetch of the message: the metadata comes back with
+    /// `fetchMessage`, but the bytes are only pulled when actually wanted.
+    /// Holding whole multi-megabyte messages for every mail merely *looked*
+    /// at would be the wrong trade.
+    pub fn fetchAttachment(self: *Session, uid: u32, index: u32, buffer: []u8) Error![]u8 {
+        const written = ronny_fetch_attachment(self.imap, uid, index, buffer.ptr, buffer.len);
+        if (written == -2) return Error.AttachmentTooLarge;
+        if (written < 0) return Error.Fetch;
+        return buffer[0..@intCast(written)];
+    }
+
     /// Mail from a sender within the last `days`, newest first. IMAP's FROM
     /// is a substring match, so a bare domain or display name works too.
     ///
@@ -204,6 +252,24 @@ pub fn senderMatches(address: []const u8, allowlist: []const []const u8) bool {
         if (std.ascii.eqlIgnoreCase(entry, domain)) return true;
     }
     return false;
+}
+
+extern fn ronny_layout(which: c_int) usize;
+
+test "the C and Zig views of the shared structs agree" {
+    // These structs are declared twice, once per language, and a mismatch
+    // does not fail to compile -- it silently reads the wrong bytes and
+    // surfaces as a garbled filename or a nonsense size far from the cause.
+    try std.testing.expectEqual(ronny_layout(0), @sizeOf(Envelope));
+    try std.testing.expectEqual(ronny_layout(1), @sizeOf(Message));
+    try std.testing.expectEqual(ronny_layout(2), @sizeOf(Attachment));
+
+    try std.testing.expectEqual(ronny_layout(3), @offsetOf(Message, "attachment_count"));
+    try std.testing.expectEqual(ronny_layout(4), @offsetOf(Message, "attachments"));
+
+    try std.testing.expectEqual(ronny_layout(5), @offsetOf(Attachment, "size"));
+    try std.testing.expectEqual(ronny_layout(6), @offsetOf(Attachment, "index"));
+    try std.testing.expectEqual(ronny_layout(7), @offsetOf(Attachment, "is_inline"));
 }
 
 test "senderMatches handles addresses, domains and case" {

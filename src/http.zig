@@ -48,6 +48,88 @@ pub fn get(io: std.Io, gpa: std.mem.Allocator, url: []const u8) !Response {
     return send(io, gpa, .GET, url, null, &.{});
 }
 
+/// One part of a multipart/form-data body.
+pub const FormPart = union(enum) {
+    text: struct { name: []const u8, value: []const u8 },
+    file: struct {
+        name: []const u8,
+        filename: []const u8,
+        content_type: []const u8,
+        bytes: []const u8,
+    },
+};
+
+/// POSTs multipart/form-data. Telegram's sendDocument needs this; its JSON
+/// endpoints cannot carry file contents.
+///
+/// The whole body is assembled in memory, so the caller is responsible for
+/// not handing this something enormous.
+pub fn postMultipart(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    parts: []const FormPart,
+) !Response {
+    // Random, because the boundary must not appear anywhere in the payload
+    // and file bytes are arbitrary. 128 bits of hex makes that a non-issue.
+    var raw: [16]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    var boundary: [32]u8 = undefined;
+    _ = std.fmt.bufPrint(&boundary, "{x}", .{&raw}) catch unreachable;
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+
+    for (parts) |part| {
+        try body.writer.print("--{s}\r\n", .{&boundary});
+        switch (part) {
+            .text => |field| {
+                try body.writer.print(
+                    "Content-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n",
+                    .{ field.name, field.value },
+                );
+            },
+            .file => |field| {
+                try body.writer.print(
+                    "Content-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\n" ++
+                        "Content-Type: {s}\r\n\r\n",
+                    .{ field.name, field.filename, field.content_type },
+                );
+                try body.writer.writeAll(field.bytes);
+                try body.writer.writeAll("\r\n");
+            },
+        }
+    }
+    try body.writer.print("--{s}--\r\n", .{&boundary});
+
+    const content_type = try std.fmt.allocPrint(
+        gpa,
+        "multipart/form-data; boundary={s}",
+        .{&boundary},
+    );
+    defer gpa.free(content_type);
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var response_body: std.Io.Writer.Allocating = .init(gpa);
+    errdefer response_body.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body.writer.buffered(),
+        .headers = .{ .content_type = .{ .override = content_type } },
+        .response_writer = &response_body.writer,
+    }) catch |err| {
+        log.warn("multipart POST {s} failed: {s}", .{ redact(url), @errorName(err) });
+        response_body.deinit();
+        return Error.RequestFailed;
+    };
+
+    return .{ .status = result.status, .body = try response_body.toOwnedSlice() };
+}
+
 fn send(
     io: std.Io,
     gpa: std.mem.Allocator,

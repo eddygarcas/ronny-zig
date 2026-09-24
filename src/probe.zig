@@ -74,6 +74,49 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    std.debug.print("\n=== attachments on real mail ===\n", .{});
+    {
+        var found: [8]imap.Envelope = undefined;
+        const hits_att = try session.searchGmail(
+            try arena.dupeZ(u8, "newer_than:120d has:attachment"),
+            &found,
+        );
+        std.debug.print("  {d} message(s) with attachments\n", .{hits_att.len});
+
+        for (hits_att[0..@min(hits_att.len, 3)]) |*envelope| {
+            var message: imap.Message = undefined;
+            session.fetchMessage(envelope.uid, &message) catch continue;
+            const parts = message.attachmentSlice();
+            std.debug.print("\n  uid={d} from={s}\n    {s}\n    {d} attachment(s):\n", .{
+                envelope.uid, envelope.fromSlice(),
+                envelope.subjectSlice()[0..@min(envelope.subjectSlice().len, 60)],
+                parts.len,
+            });
+            for (parts) |*part| {
+                std.debug.print("      [{d}] {s}  {s}  ~{d} bytes{s}\n", .{
+                    part.index, part.filenameSlice(), part.mimeTypeSlice(), part.size,
+                    if (part.is_inline == 1) "  (inline)" else "",
+                });
+            }
+
+            // Actually pull the first non-inline one down and check the bytes
+            // are real -- a wrong part index would still "succeed" otherwise.
+            for (parts) |*part| {
+                if (part.is_inline == 1) continue;
+                const buffer = try arena.alloc(u8, 25 * 1024 * 1024);
+                const bytes = session.fetchAttachment(envelope.uid, part.index, buffer) catch |err| {
+                    std.debug.print("      -> fetch of [{d}] failed: {s}\n", .{ part.index, @errorName(err) });
+                    break;
+                };
+                std.debug.print("      -> fetched [{d}] {s}: {d} bytes, first 8: {x}\n", .{
+                    part.index, part.filenameSlice(), bytes.len,
+                    bytes[0..@min(bytes.len, 8)],
+                });
+                break;
+            }
+        }
+    }
+
     std.debug.print("\n=== find: content search ===\n", .{});
     const question = "find the email about self-hosted deployment";
     const found = try findmail.find(
