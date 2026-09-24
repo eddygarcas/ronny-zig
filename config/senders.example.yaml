@@ -14,7 +14,7 @@
 # stays intact.
 
 senders:
-  - sam@example.com
-  - alex@example.com
+  - someone@example.com
+  - someone-else@example.com
   - team@example.com
   - example.org

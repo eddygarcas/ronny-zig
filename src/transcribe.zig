@@ -370,8 +370,8 @@ pub fn snapNames(gpa: std.mem.Allocator, text: []const u8, vocabulary: []const [
 // ---- spoken addresses ----
 
 /// Whisper writes "@" as a word and often drops the dot too, so
-/// "sam@example.com" arrives as "sam at example dot club" -- or, at
-/// its worst, "sam at example club".
+/// "sam@example.com" arrives as "sam at example dot com" -- or, at
+/// its worst, "sam at example com".
 fn isAtToken(word: []const u8) bool {
     return std.mem.eql(u8, word, "@") or std.ascii.eqlIgnoreCase(word, "at");
 }
@@ -566,14 +566,21 @@ test "repair fixes the names whisper actually got wrong" {
     const gpa = std.testing.allocator;
     const vocab = [_][]const u8{ "1Password", "AcmeSync", "example.org", "sam@example.com" };
 
-    // The two real cases: spoken digits, and a phonetic guess.
+    // Two shapes, both seen for real: a spoken digit, and a phonetic guess
+    // at a compound name. 1Password is the genuine case; the compound is a
+    // stand-in for one, since the original was a real correspondent.
     const one = try repair(gpa, "read the last email from one password", &vocab);
     defer gpa.free(one);
     try std.testing.expect(std.mem.indexOf(u8, one, "1Password") != null);
 
-    const meta = try repair(gpa, "anything from acme synch today", &vocab);
-    defer gpa.free(meta);
-    try std.testing.expect(std.mem.indexOf(u8, meta, "AcmeSync") != null);
+    const near = try repair(gpa, "anything from acme synch today", &vocab);
+    defer gpa.free(near);
+    try std.testing.expect(std.mem.indexOf(u8, near, "AcmeSync") != null);
+
+    // And the split-compound case, which the digit normalisation also covers.
+    const split = try repair(gpa, "anything from acme sync today", &vocab);
+    defer gpa.free(split);
+    try std.testing.expect(std.mem.indexOf(u8, split, "AcmeSync") != null);
 }
 
 test "repair leaves ordinary words alone" {
@@ -590,13 +597,13 @@ test "repair rebuilds a spoken address" {
     const gpa = std.testing.allocator;
     const vocab = [_][]const u8{"sam@example.com"};
 
-    const dotted = try repair(gpa, "read the mail from sam at example dot club", &vocab);
+    const dotted = try repair(gpa, "read the mail from sam at example dot com", &vocab);
     defer gpa.free(dotted);
     try std.testing.expect(std.mem.indexOf(u8, dotted, "sam@example.com") != null);
 
     // The dot dropped entirely -- only accepted because it lands on a known
     // sender.
-    const loose = try repair(gpa, "read the mail from sam at example club", &vocab);
+    const loose = try repair(gpa, "read the mail from sam at example com", &vocab);
     defer gpa.free(loose);
     try std.testing.expect(std.mem.indexOf(u8, loose, "sam@example.com") != null);
 }

@@ -39,10 +39,11 @@ model for classification, and even that is optional.
 
 ```
 zig build test
-cp .env.example .env # then fill it in
+cp .env.example .env                              # then fill it in
+cp config/senders.example.yaml config/senders.yaml # then list who to watch
 
 zig build -Doptimize=ReleaseSafe \
-          -Dwhisper-prefix=/path/to/.local/opt/whisper-cuda   # -> zig-out/bin/ronny
+          -Dwhisper-prefix=$HOME/.local/opt/whisper-cuda   # -> zig-out/bin/ronny
 ```
 
 `-Dwhisper-prefix` is optional but matters a great deal for voice. See below.

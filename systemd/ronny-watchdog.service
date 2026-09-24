@@ -12,12 +12,13 @@ Wants=network-online.target
 # Deliberately no Requires= on the units it watches: a watchdog that stops
 # when the thing it watches stops cannot report that the thing stopped.
 
+# Adjust User= and the three paths below before installing.
 [Service]
 Type=simple
 User=CHANGEME
-WorkingDirectory=/path/to/Work/ronny-zig
-EnvironmentFile=/path/to/Work/ronny-zig/.env
-ExecStart=/path/to/Work/ronny-zig/zig-out/bin/ronny watchdog
+WorkingDirectory=/path/to/ronny-zig
+EnvironmentFile=/path/to/ronny-zig/.env
+ExecStart=/path/to/ronny-zig/zig-out/bin/ronny watchdog
 Restart=on-failure
 RestartSec=15
 

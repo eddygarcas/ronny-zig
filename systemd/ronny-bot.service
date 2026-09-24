@@ -9,12 +9,13 @@ Wants=network-online.target
 # polls the same token, so the two must never run together.
 Conflicts=ronny-email-manager.service
 
+# Adjust User= and the three paths below before installing.
 [Service]
 Type=simple
 User=CHANGEME
-WorkingDirectory=/path/to/Work/ronny-zig
-EnvironmentFile=/path/to/Work/ronny-zig/.env
-ExecStart=/path/to/Work/ronny-zig/zig-out/bin/ronny bot
+WorkingDirectory=/path/to/ronny-zig
+EnvironmentFile=/path/to/ronny-zig/.env
+ExecStart=/path/to/ronny-zig/zig-out/bin/ronny bot
 Restart=on-failure
 RestartSec=15
 

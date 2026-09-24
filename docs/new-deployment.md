@@ -6,7 +6,7 @@ tokens or paths baked into it.
 | | |
 |---|---|
 | `.env` | credentials, model endpoints, file paths — gitignored, copy from `.env.example` |
-| `config/senders.yaml` | the allowlist: full addresses or bare domains |
+| `config/senders.yaml` | the allowlist: full addresses or bare domains — gitignored like `.env`, copy `config/senders.example.yaml` |
 
 Nothing else needs touching to run a second Ronny against a different account.
 

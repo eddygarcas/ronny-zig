@@ -4,3 +4,4 @@ zig-out/
 testrun/
 models/
 data/*.json
+config/senders.yaml

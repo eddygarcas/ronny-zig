@@ -654,7 +654,7 @@ pub const Bot = struct {
         }
 
         // A compose still missing a piece takes the next message as that
-        // piece. Re-classifying it cannot work: "youname@example.com" and
+        // piece. Re-classifying it cannot work: "you@example.com" and
         // "Thanks for the file" are not commands, and the classifier
         // correctly called the second one unknown -- which left the compose
         // stuck with nowhere to go.
@@ -1772,8 +1772,8 @@ test "an address the owner typed is preferred over anything a model might pick" 
     // Owner input, not model output -- so it is trusted even when the
     // address has never written to this mailbox.
     try std.testing.expectEqualStrings(
-        "youname@example.com",
-        Bot.ownerTypedAddress("youname@example.com").?,
+        "you@example.com",
+        Bot.ownerTypedAddress("you@example.com").?,
     );
     try std.testing.expectEqualStrings(
         "someone@acme.co.uk",
@@ -1807,7 +1807,7 @@ test "a mis-transcribed address is still address-shaped, which is why voice cann
     // Every one passes the form check, and one of them is a real stranger's
     // mailbox. Shape is not meaning, so spoken requests resolve against the
     // contact book instead of being taken literally.
-    try std.testing.expectEqualStrings("name@example.com", Bot.ownerTypedAddress("email edu name@example.com").?);
+    try std.testing.expectEqualStrings("name@example.com", Bot.ownerTypedAddress("email you name@example.com").?);
     try std.testing.expectEqualStrings("you.name@example.com", Bot.ownerTypedAddress("email you.name@example.com").?);
     try std.testing.expectEqualStrings("youname@example.com", Bot.ownerTypedAddress("email youname@example.com").?);
 }

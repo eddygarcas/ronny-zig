@@ -178,15 +178,22 @@ pub fn resolve(
     return @intCast(index);
 }
 
+/// Fills a fixture without hand-counting the length, which a rename breaks.
+fn testContact(address: []const u8) Contact {
+    var contact = std.mem.zeroes(Contact);
+    @memcpy(contact.address[0..address.len], address);
+    return contact;
+}
+
 test "an address the owner typed is matched without consulting a model" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var contacts: [2]Contact = undefined;
-    for (&contacts) |*contact| contact.* = std.mem.zeroes(Contact);
-    @memcpy(contacts[0].address[0..17], "dana@example.org");
-    @memcpy(contacts[1].address[0..20], "sam@example.com");
+    const contacts = [_]Contact{
+        testContact("dana@example.org"),
+        testContact("sam@example.com"),
+    };
 
     // A URL that cannot be reached, proving no model call happens: if one
     // were attempted this would fall through and return null.
@@ -245,11 +252,11 @@ test "allowlisted senders sort ahead of everyone else" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var book: [3]Contact = undefined;
-    for (&book) |*contact| contact.* = std.mem.zeroes(Contact);
-    @memcpy(book[0].address[0..21], "hello@vendor.example"[0..21]);
-    @memcpy(book[1].address[0..17], "dana@example.org");
-    @memcpy(book[2].address[0..20], "sam@example.com");
+    const book = [_]Contact{
+        testContact("hello@vendor.example"),
+        testContact("dana@example.org"),
+        testContact("sam@example.com"),
+    };
 
     // example.org is allowlisted as a bare domain, sam by full address.
     const allowlist = [_][]const u8{ "example.org", "sam@example.com" };
