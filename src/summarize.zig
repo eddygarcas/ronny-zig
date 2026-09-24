@@ -9,13 +9,11 @@
 //! sent; see decision.zig for the gate itself.
 
 const std = @import("std");
-const http = @import("http.zig");
+const ollama = @import("ollama.zig");
 
 const log = std.log.scoped(.summarize);
 
 pub const Error = error{Unavailable};
-
-const OllamaReply = struct { response: []const u8 = "" };
 
 /// Caller owns the returned text.
 fn generate(
@@ -29,25 +27,7 @@ fn generate(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var payload: std.Io.Writer.Allocating = .init(arena);
-    std.json.Stringify.value(.{
-        .model = model,
-        .prompt = prompt,
-        .stream = false,
-    }, .{}, &payload.writer) catch return Error.Unavailable;
-
-    const endpoint = std.fmt.allocPrint(arena, "{s}/api/generate", .{ollama_url}) catch return Error.Unavailable;
-    var response = http.postJson(io, arena, endpoint, payload.writer.buffered(), &.{}) catch return Error.Unavailable;
-    defer response.deinit(arena);
-    if (!response.ok()) return Error.Unavailable;
-
-    const parsed = std.json.parseFromSlice(OllamaReply, arena, response.body, .{
-        .ignore_unknown_fields = true,
-    }) catch return Error.Unavailable;
-    defer parsed.deinit();
-
-    const text = std.mem.trim(u8, parsed.value.response, " \t\r\n");
-    if (text.len == 0) return Error.Unavailable;
+    const text = try ollama.generate(io, arena, ollama_url, model, prompt, .text);
     return gpa.dupe(u8, text) catch Error.Unavailable;
 }
 

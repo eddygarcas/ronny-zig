@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
     root.linkSystemLibrary("ggml", .{});
     root.linkSystemLibrary("ggml-base", .{});
     root.addCSourceFile(.{ .file = b.path("src/whisper_shim.c"), .flags = &.{"-std=gnu11"} });
+    root.addCSourceFile(.{ .file = b.path("src/smtp_shim.c"), .flags = &.{"-std=gnu11"} });
 
     const exe = b.addExecutable(.{
         .name = "ronny",
@@ -103,6 +104,7 @@ pub fn build(b: *std.Build) void {
         probe.root_module.linkSystemLibrary("ggml-base", .{});
         probe.root_module.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{"-std=gnu11"} });
         probe.root_module.addCSourceFile(.{ .file = b.path("src/whisper_shim.c"), .flags = &.{"-std=gnu11"} });
+        probe.root_module.addCSourceFile(.{ .file = b.path("src/smtp_shim.c"), .flags = &.{"-std=gnu11"} });
 
         const probe_run = b.addRunArtifact(probe);
         if (b.args) |args| probe_run.addArgs(args);

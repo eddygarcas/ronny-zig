@@ -21,12 +21,14 @@ pub const c = @import("c");
 
 pub const ADDR_MAX = 256;
 pub const SUBJ_MAX = 512;
+pub const DATE_MAX = 64;
 
 /// Mirrors `ronny_envelope` in shim.c. Layout must stay in step with it.
 pub const Envelope = extern struct {
     uid: u32,
     from: [ADDR_MAX]u8,
     subject: [SUBJ_MAX]u8,
+    date: [DATE_MAX]u8,
 
     pub fn fromSlice(self: *const Envelope) []const u8 {
         return std.mem.sliceTo(&self.from, 0);
@@ -34,6 +36,12 @@ pub const Envelope = extern struct {
 
     pub fn subjectSlice(self: *const Envelope) []const u8 {
         return std.mem.sliceTo(&self.subject, 0);
+    }
+
+    /// The raw Date: header as the sender wrote it, so the owner sees the
+    /// same string their mail client shows rather than a reformatted one.
+    pub fn dateSlice(self: *const Envelope) []const u8 {
+        return std.mem.sliceTo(&self.date, 0);
     }
 };
 

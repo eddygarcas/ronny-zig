@@ -10,7 +10,7 @@
 //! routing decision (chat commands, no mail content) is allowed off-box.
 
 const std = @import("std");
-const http = @import("http.zig");
+const ollama = @import("ollama.zig");
 
 const log = std.log.scoped(.spam);
 
@@ -51,8 +51,6 @@ const Answer = struct {
     is_spam: bool = false,
     reason: []const u8 = "",
 };
-
-const OllamaReply = struct { response: []const u8 = "" };
 
 /// Fails **open**: if the model is unreachable the mail is still reported,
 /// because silently dropping real mail is a worse failure than an extra
@@ -106,34 +104,15 @@ fn askModel(
         \\Respond with ONLY a JSON object of the form {{"is_spam": true|false, "reason": "short reason"}}
     , .{ sender, subject, body[0..@min(body.len, 1500)] });
 
-    var payload: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(.{
-        .model = model,
-        .prompt = prompt,
-        .stream = false,
-        .format = "json",
-    }, .{}, &payload.writer);
-
-    const endpoint = try std.fmt.allocPrint(arena, "{s}/api/generate", .{ollama_url});
-    var response = try http.postJson(io, arena, endpoint, payload.writer.buffered(), &.{});
-    defer response.deinit(arena);
-    if (!response.ok()) return error.OllamaStatus;
-
-    // Ollama wraps the model's output as a JSON string inside `response`,
-    // so the payload has to be parsed twice.
-    const outer = try std.json.parseFromSlice(OllamaReply, arena, response.body, .{
+    const text = try ollama.generate(io, arena, ollama_url, model, prompt, .json);
+    const answer = try std.json.parseFromSlice(Answer, arena, text, .{
         .ignore_unknown_fields = true,
     });
-    defer outer.deinit();
-
-    const inner = try std.json.parseFromSlice(Answer, arena, outer.value.response, .{
-        .ignore_unknown_fields = true,
-    });
-    defer inner.deinit();
+    defer answer.deinit();
 
     return .{
-        .is_spam = inner.value.is_spam,
-        .reason = try arena.dupe(u8, inner.value.reason),
+        .is_spam = answer.value.is_spam,
+        .reason = try arena.dupe(u8, answer.value.reason),
     };
 }
 

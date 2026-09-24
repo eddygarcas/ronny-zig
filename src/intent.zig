@@ -128,6 +128,14 @@ const INSTRUCTIONS =
 
 pub const Error = error{ Unavailable, BadResponse };
 
+/// One past exchange. History resolves follow-ups ("what about last month
+/// instead") against the previous turn, and nothing else -- the instructions
+/// say to classify only the newest message.
+pub const Turn = struct {
+    owner: []const u8,
+    assistant: []const u8,
+};
+
 /// Asks Jev which action the message means.
 ///
 /// Returns Error.Unavailable when TypeSafe cannot be reached, so the caller
@@ -138,12 +146,13 @@ pub fn classify(
     api_key: []const u8,
     model: []const u8,
     message: []const u8,
+    history: []const Turn,
 ) Error!Decision {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = buildRequest(arena, model, message) catch return Error.Unavailable;
+    const body = buildRequest(arena, model, message, history) catch return Error.Unavailable;
 
     const auth = std.fmt.allocPrint(arena, "Bearer {s}", .{api_key}) catch return Error.Unavailable;
     var response = http.postJson(
@@ -173,20 +182,33 @@ pub fn classify(
     };
 }
 
-fn buildRequest(arena: std.mem.Allocator, model: []const u8, message: []const u8) ![]u8 {
+fn buildRequest(
+    arena: std.mem.Allocator,
+    model: []const u8,
+    message: []const u8,
+    history: []const Turn,
+) ![]u8 {
     // The criteria are a literal JSON object, so the request is assembled as
     // text rather than through a Zig struct -- a struct would need a field
     // per action and duplicate the descriptions.
-    var escaped: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(message, .{}, &escaped.writer);
-    const message_json = escaped.writer.buffered();
+    // With no history the field is left out entirely rather than sent empty,
+    // so a fresh conversation asks exactly the one-shot question.
+    var state: std.Io.Writer.Allocating = .init(arena);
+    if (history.len == 0) {
+        try std.json.Stringify.value(.{ .newest_message = message }, .{}, &state.writer);
+    } else {
+        try std.json.Stringify.value(.{
+            .newest_message = message,
+            .recent_conversation = history,
+        }, .{}, &state.writer);
+    }
 
     var instructions: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(INSTRUCTIONS, .{}, &instructions.writer);
 
     return std.fmt.allocPrint(arena,
-        \\{{"state":{{"newest_message":{s}}},"model":"{s}","questions":{{"action":{{"type":"choice","instructions":{s},"criteria":{s}}}}}}}
-    , .{ message_json, model, instructions.writer.buffered(), ACTION_CRITERIA });
+        \\{{"state":{s},"model":"{s}","questions":{{"action":{{"type":"choice","instructions":{s},"criteria":{s}}}}}}}
+    , .{ state.writer.buffered(), model, instructions.writer.buffered(), ACTION_CRITERIA });
 }
 
 test "resolve keeps a confident answer" {

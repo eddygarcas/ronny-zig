@@ -242,7 +242,7 @@ pub const Controller = struct {
         defer if (existing.len > 0) self.gpa.free(existing);
 
         const header = if (std.mem.indexOf(u8, existing, "senders:")) |idx|
-            std.mem.trimRight(u8, existing[0..idx], " \t\r\n")
+            std.mem.trimEnd(u8, existing[0..idx], " \t\r\n")
         else
             "# Ronny sender allowlist";
 

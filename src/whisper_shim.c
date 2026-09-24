@@ -43,8 +43,15 @@ void ronny_whisper_free(void) {
  * Returns the number of bytes written, or -1 on failure. Language is left to
  * auto-detection so the owner can switch between English and Spanish
  * mid-conversation without configuration.
+ *
+ * `prompt` biases the decoder toward vocabulary actually in use, and may be
+ * NULL. It is the only customization lever whisper offers -- there is no
+ * speaker enrollment -- and it is what stops "1Password" coming back as "one
+ * password". Whisper truncates it around 224 tokens, so the caller sends a
+ * slice of the vocabulary and matches the rest afterwards.
  */
-int ronny_whisper_transcribe(const float *samples, int n_samples, char *out, int cap) {
+int ronny_whisper_transcribe(const float *samples, int n_samples, const char *prompt,
+                             char *out, int cap) {
     if (g_ctx == NULL || samples == NULL || out == NULL || cap <= 0) return -1;
     out[0] = '\0';
 
@@ -56,6 +63,7 @@ int ronny_whisper_transcribe(const float *samples, int n_samples, char *out, int
     wparams.language         = NULL;   /* auto-detect */
     wparams.detect_language  = false;
     wparams.n_threads        = 4;
+    wparams.initial_prompt   = (prompt != NULL && prompt[0] != '\0') ? prompt : NULL;
 
     if (whisper_full(g_ctx, wparams, samples, n_samples) != 0) return -1;
 

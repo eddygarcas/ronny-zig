@@ -19,6 +19,11 @@ const intent = @import("intent.zig");
 const decision = @import("decision.zig");
 const transcribe = @import("transcribe.zig");
 const summarize = @import("summarize.zig");
+const ollama = @import("ollama.zig");
+const findmail = @import("findmail.zig");
+const interpret = @import("interpret.zig");
+const headers = @import("headers.zig");
+const mailer = @import("mailer.zig");
 
 /// Namespaced so each module's output is identifiable in the journal,
 /// the way the Python version's per-module loggers were.
@@ -219,4 +224,9 @@ test {
     _ = decision;
     _ = transcribe;
     _ = summarize;
+    _ = ollama;
+    _ = findmail;
+    _ = interpret;
+    _ = headers;
+    _ = mailer;
 }

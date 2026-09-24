@@ -22,7 +22,13 @@ pub const Error = error{ LoadFailed, DecodeFailed, TranscribeFailed };
 
 extern fn ronny_whisper_load(model_path: [*:0]const u8) c_int;
 extern fn ronny_whisper_free() void;
-extern fn ronny_whisper_transcribe(samples: [*]const f32, n_samples: c_int, out: [*]u8, cap: c_int) c_int;
+extern fn ronny_whisper_transcribe(
+    samples: [*]const f32,
+    n_samples: c_int,
+    prompt: ?[*:0]const u8,
+    out: [*]u8,
+    cap: c_int,
+) c_int;
 
 pub const SAMPLE_RATE = 16000;
 /// Long audio would block the caller while it transcribes.
@@ -90,7 +96,14 @@ fn decodeToPcm(io: std.Io, gpa: std.mem.Allocator, audio: []const u8) ![]f32 {
 }
 
 /// Transcribes a voice note. Caller owns the returned text.
-pub fn transcribe(io: std.Io, gpa: std.mem.Allocator, audio: []const u8) ![]u8 {
+///
+/// `prompt` primes the decoder; see buildPrompt. Pass null to skip priming.
+pub fn transcribe(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    audio: []const u8,
+    prompt: ?[:0]const u8,
+) ![]u8 {
     const samples = try decodeToPcm(io, gpa, audio);
     defer gpa.free(samples);
 
@@ -99,7 +112,13 @@ pub fn transcribe(io: std.Io, gpa: std.mem.Allocator, audio: []const u8) ![]u8 {
     const buffer = try gpa.alloc(u8, MAX_TEXT);
     errdefer gpa.free(buffer);
 
-    const written = ronny_whisper_transcribe(samples.ptr, @intCast(samples.len), buffer.ptr, MAX_TEXT);
+    const written = ronny_whisper_transcribe(
+        samples.ptr,
+        @intCast(samples.len),
+        if (prompt) |p| p.ptr else null,
+        buffer.ptr,
+        MAX_TEXT,
+    );
     if (written < 0) return Error.TranscribeFailed;
 
     const text = std.mem.trim(u8, buffer[0..@intCast(written)], " \t\r\n");
@@ -166,6 +185,335 @@ pub fn matchKey(gpa: std.mem.Allocator, phrase: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+// ---- priming ----
+
+/// Whisper truncates initial_prompt around 224 tokens, so only a slice of the
+/// vocabulary reaches the decoder. The rest still earns its keep in the
+/// matching pass below.
+pub const PROMPT_VOCAB_LIMIT = 45;
+
+/// Biases the decoder toward the vocabulary actually in use. This is the only
+/// customization lever whisper offers -- there is no speaker enrollment.
+pub fn buildPrompt(arena: std.mem.Allocator, vocabulary: []const []const u8) ![:0]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(
+        "Commands for an email assistant: read, summarise, search, reply, pause, resume, status, senders.",
+    );
+    if (vocabulary.len > 0) {
+        try out.writer.writeAll(" Names and addresses: ");
+        for (vocabulary[0..@min(vocabulary.len, PROMPT_VOCAB_LIMIT)], 0..) |entry, i| {
+            if (i > 0) try out.writer.writeAll(", ");
+            try out.writer.writeAll(entry);
+        }
+        try out.writer.writeByte('.');
+    }
+    return arena.dupeZ(u8, out.writer.buffered());
+}
+
+// ---- matching ----
+
+const KEY_MAX = 64;
+/// Names are riskier to substitute than addresses -- a wrong swap changes the
+/// meaning of a sentence -- so this is stricter than ADDRESS_THRESHOLD.
+const NAME_THRESHOLD = 0.85;
+const ADDRESS_THRESHOLD = 0.72;
+const MIN_NAME_CHARS = 4;
+
+/// Longest-common-subsequence ratio, standing in for Python's difflib. On
+/// strings this short the two agree closely enough that the thresholds tuned
+/// against difflib carry over.
+fn similarity(a: []const u8, b: []const u8) f64 {
+    if (a.len == 0 or b.len == 0) return 0;
+    if (a.len > KEY_MAX or b.len > KEY_MAX) return 0;
+
+    var prev = [_]u16{0} ** (KEY_MAX + 1);
+    var cur = [_]u16{0} ** (KEY_MAX + 1);
+    for (a) |ca| {
+        cur[0] = 0;
+        for (b, 1..) |cb, j| {
+            cur[j] = if (ca == cb) prev[j - 1] + 1 else @max(prev[j], cur[j - 1]);
+        }
+        @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+    }
+    const common: f64 = @floatFromInt(prev[b.len]);
+    return 2 * common / @as(f64, @floatFromInt(a.len + b.len));
+}
+
+const Entry = struct { key: []const u8, canonical: []const u8 };
+
+fn buildLookup(arena: std.mem.Allocator, vocabulary: []const []const u8) ![]Entry {
+    var lookup: std.ArrayList(Entry) = .empty;
+    for (vocabulary) |entry| {
+        const key = try matchKey(arena, entry);
+        if (key.len < MIN_NAME_CHARS or key.len > KEY_MAX) continue;
+
+        // First spelling wins, the way Python's setdefault did.
+        var seen = false;
+        for (lookup.items) |existing| {
+            if (std.mem.eql(u8, existing.key, key)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try lookup.append(arena, .{ .key = key, .canonical = entry });
+    }
+    return lookup.toOwnedSlice(arena);
+}
+
+fn lookupName(entries: []const Entry, key: []const u8) ?[]const u8 {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) return entry.canonical;
+    }
+
+    var best: ?Entry = null;
+    var best_score: f64 = NAME_THRESHOLD;
+    for (entries) |entry| {
+        const score = similarity(key, entry.key);
+        if (score < best_score) continue;
+
+        // A longer phrase can score well simply by containing a shorter name:
+        // "from digital ocean" matched "digitalocean" and swallowed the
+        // "from". Requiring comparable lengths replaces only the name itself.
+        const key_len: f64 = @floatFromInt(key.len);
+        const entry_len: f64 = @floatFromInt(entry.key.len);
+        if (@abs(key_len - entry_len) > @max(2.0, entry_len * 0.25)) continue;
+
+        best = entry;
+        best_score = score;
+    }
+    return if (best) |entry| entry.canonical else null;
+}
+
+fn isProtectedPhrase(phrase: []const u8) bool {
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    for (phrase) |ch| {
+        if (!std.ascii.isAlphabetic(ch)) continue;
+        if (n == buf.len) return false;
+        buf[n] = std.ascii.toLower(ch);
+        n += 1;
+    }
+    return isProtected(buf[0..n]);
+}
+
+/// Repairs brand and sender names whisper guessed at phonetically.
+/// Caller owns the result.
+pub fn snapNames(gpa: std.mem.Allocator, text: []const u8, vocabulary: []const []const u8) ![]u8 {
+    if (vocabulary.len == 0) return gpa.dupe(u8, text);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lookup = try buildLookup(arena, vocabulary);
+    if (lookup.len == 0) return gpa.dupe(u8, text);
+
+    var words: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (it.next()) |word| try words.append(arena, word);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var i: usize = 0;
+    while (i < words.items.len) {
+        var replaced = false;
+
+        // Longest n-gram first, so "acme sync" wins over "call".
+        var span: usize = 3;
+        while (span >= 1) : (span -= 1) {
+            if (i + span > words.items.len) continue;
+
+            const phrase = try std.mem.join(arena, " ", words.items[i .. i + span]);
+            if (span == 1 and isProtectedPhrase(phrase)) continue;
+
+            const key = try matchKey(arena, phrase);
+            if (key.len < MIN_NAME_CHARS or key.len > KEY_MAX) continue;
+
+            const canonical = lookupName(lookup, key) orelse continue;
+            if (i > 0) try out.writer.writeByte(' ');
+            try out.writer.writeAll(canonical);
+            if (!std.mem.eql(u8, phrase, canonical)) {
+                log.info("snapped spoken name \"{s}\" to \"{s}\"", .{ phrase, canonical });
+            }
+            i += span;
+            replaced = true;
+            break;
+        }
+
+        if (!replaced) {
+            if (i > 0) try out.writer.writeByte(' ');
+            try out.writer.writeAll(words.items[i]);
+            i += 1;
+        }
+    }
+    return gpa.dupe(u8, out.writer.buffered());
+}
+
+// ---- spoken addresses ----
+
+/// Whisper writes "@" as a word and often drops the dot too, so
+/// "sam@example.com" arrives as "sam at example dot club" -- or, at
+/// its worst, "sam at example club".
+fn isAtToken(word: []const u8) bool {
+    return std.mem.eql(u8, word, "@") or std.ascii.eqlIgnoreCase(word, "at");
+}
+
+fn isDotToken(word: []const u8) bool {
+    return std.mem.eql(u8, word, ".") or std.ascii.eqlIgnoreCase(word, "dot");
+}
+
+fn trimPunctuation(word: []const u8) []const u8 {
+    return std.mem.trim(u8, word, ".,;:!?\"'()");
+}
+
+fn isLocalPart(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, "._%+-", ch) == null) return false;
+    }
+    return true;
+}
+
+fn isLabel(word: []const u8) bool {
+    if (word.len == 0) return false;
+    for (word) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-') return false;
+    }
+    return true;
+}
+
+fn isTld(word: []const u8) bool {
+    if (word.len < 2) return false;
+    for (word) |ch| {
+        if (!std.ascii.isAlphabetic(ch)) return false;
+    }
+    return true;
+}
+
+/// Snaps a rebuilt address onto one Ronny actually knows. The candidate set is
+/// known, so this is a lookup rather than a guess; below the threshold the
+/// near-miss is left alone, because a confidently wrong address is worse than
+/// an unclear one.
+fn snapAddress(vocabulary: []const []const u8, candidate: []const u8) ?[]const u8 {
+    var lowered_buf: [KEY_MAX * 2]u8 = undefined;
+    if (candidate.len > lowered_buf.len) return null;
+    const lowered = std.ascii.lowerString(lowered_buf[0..candidate.len], candidate);
+
+    var best: ?[]const u8 = null;
+    var best_score: f64 = ADDRESS_THRESHOLD;
+    for (vocabulary) |entry| {
+        if (std.mem.indexOfScalar(u8, entry, '@') == null) continue;
+        if (std.ascii.eqlIgnoreCase(entry, lowered)) return entry;
+
+        var entry_buf: [KEY_MAX * 2]u8 = undefined;
+        if (entry.len > entry_buf.len) continue;
+        const entry_lowered = std.ascii.lowerString(entry_buf[0..entry.len], entry);
+
+        const score = similarity(lowered, entry_lowered);
+        if (score < best_score) continue;
+        best = entry;
+        best_score = score;
+    }
+    return best;
+}
+
+/// Rebuilds spoken addresses and snaps near-misses onto known senders.
+/// Caller owns the result.
+pub fn rebuildAddresses(gpa: std.mem.Allocator, text: []const u8, vocabulary: []const []const u8) ![]u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var words: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (it.next()) |word| try words.append(arena, word);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var wrote_any = false;
+
+    const emit = struct {
+        fn call(w: *std.Io.Writer, first: *bool, piece: []const u8) !void {
+            if (first.*) try w.writeByte(' ');
+            first.* = true;
+            try w.writeAll(piece);
+        }
+    }.call;
+
+    var i: usize = 0;
+    while (i < words.items.len) {
+        const rebuilt: ?struct { address: []const u8, consumed: usize } = blk: {
+            if (i + 2 >= words.items.len) break :blk null;
+            if (!isAtToken(words.items[i + 1])) break :blk null;
+
+            const local = trimPunctuation(words.items[i]);
+            if (!isLocalPart(local)) break :blk null;
+
+            const domain = trimPunctuation(words.items[i + 2]);
+
+            // "local at domain.tld" -- the dot survived.
+            if (std.mem.indexOfScalar(u8, domain, '.')) |dot| {
+                if (isLabel(domain[0..dot]) and isTld(domain[dot + 1 ..])) {
+                    const address = try std.fmt.allocPrint(arena, "{s}@{s}", .{ local, domain });
+                    break :blk .{ .address = snapAddress(vocabulary, address) orelse address, .consumed = 3 };
+                }
+                break :blk null;
+            }
+            if (!isLabel(domain)) break :blk null;
+
+            // "local at domain dot tld".
+            if (i + 4 < words.items.len and isDotToken(words.items[i + 3])) {
+                const tld = trimPunctuation(words.items[i + 4]);
+                if (isTld(tld)) {
+                    const address = try std.fmt.allocPrint(arena, "{s}@{s}.{s}", .{ local, domain, tld });
+                    break :blk .{ .address = snapAddress(vocabulary, address) orelse address, .consumed = 5 };
+                }
+            }
+
+            // "local at domain tld" -- the dot is gone too. Far too loose to
+            // trust on its own ("meet at the office" fits it), so it is only
+            // accepted when the result matches a sender Ronny actually knows.
+            if (i + 3 < words.items.len) {
+                const tld = trimPunctuation(words.items[i + 3]);
+                if (isTld(tld)) {
+                    const address = try std.fmt.allocPrint(arena, "{s}@{s}.{s}", .{ local, domain, tld });
+                    if (snapAddress(vocabulary, address)) |known| {
+                        log.info("rebuilt spoken address as \"{s}\"", .{known});
+                        break :blk .{ .address = known, .consumed = 4 };
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        if (rebuilt) |found| {
+            try emit(&out.writer, &wrote_any, found.address);
+            i += found.consumed;
+            continue;
+        }
+
+        // An address whisper got mostly right still gets snapped.
+        const word = words.items[i];
+        const bare = trimPunctuation(word);
+        if (std.mem.indexOfScalar(u8, bare, '@') != null) {
+            if (snapAddress(vocabulary, bare)) |known| {
+                try emit(&out.writer, &wrote_any, known);
+                i += 1;
+                continue;
+            }
+        }
+
+        try emit(&out.writer, &wrote_any, word);
+        i += 1;
+    }
+    return gpa.dupe(u8, out.writer.buffered());
+}
+
+/// The full repair pass: names first, then addresses. Caller owns the result.
+pub fn repair(gpa: std.mem.Allocator, text: []const u8, vocabulary: []const []const u8) ![]u8 {
+    const named = try snapNames(gpa, text, vocabulary);
+    defer gpa.free(named);
+    return rebuildAddresses(gpa, named, vocabulary);
+}
+
 test "matchKey turns spoken digits into an exact match" {
     const gpa = std.testing.allocator;
 
@@ -193,4 +541,53 @@ test "protected words are never treated as sender names" {
     try std.testing.expect(!isProtected("1Password"));
     try std.testing.expect(!isProtected("AcmeSync"));
     try std.testing.expect(!isProtected("example"));
+}
+
+test "repair fixes the names whisper actually got wrong" {
+    const gpa = std.testing.allocator;
+    const vocab = [_][]const u8{ "1Password", "AcmeSync", "example.org", "sam@example.com" };
+
+    // The two real cases: spoken digits, and a phonetic guess.
+    const one = try repair(gpa, "read the last email from one password", &vocab);
+    defer gpa.free(one);
+    try std.testing.expect(std.mem.indexOf(u8, one, "1Password") != null);
+
+    const meta = try repair(gpa, "anything from acme synch today", &vocab);
+    defer gpa.free(meta);
+    try std.testing.expect(std.mem.indexOf(u8, meta, "AcmeSync") != null);
+}
+
+test "repair leaves ordinary words alone" {
+    const gpa = std.testing.allocator;
+    const vocab = [_][]const u8{ "Mail Delivery Subsystem", "example.org" };
+
+    // "email" once scored high enough against "Mail" to be rewritten.
+    const text = try repair(gpa, "read the last email from example.org", &vocab);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("read the last email from example.org", text);
+}
+
+test "repair rebuilds a spoken address" {
+    const gpa = std.testing.allocator;
+    const vocab = [_][]const u8{"sam@example.com"};
+
+    const dotted = try repair(gpa, "read the mail from sam at example dot club", &vocab);
+    defer gpa.free(dotted);
+    try std.testing.expect(std.mem.indexOf(u8, dotted, "sam@example.com") != null);
+
+    // The dot dropped entirely -- only accepted because it lands on a known
+    // sender.
+    const loose = try repair(gpa, "read the mail from sam at example club", &vocab);
+    defer gpa.free(loose);
+    try std.testing.expect(std.mem.indexOf(u8, loose, "sam@example.com") != null);
+}
+
+test "an unknown spoken address is left alone rather than guessed at" {
+    const gpa = std.testing.allocator;
+    const vocab = [_][]const u8{"sam@example.com"};
+
+    // Plain English fits the loose shape; it must not become an address.
+    const prose = try repair(gpa, "lets meet at the office", &vocab);
+    defer gpa.free(prose);
+    try std.testing.expect(std.mem.indexOfScalar(u8, prose, '@') == null);
 }

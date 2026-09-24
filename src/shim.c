@@ -42,11 +42,13 @@ uint32_t ronny_selection_uidvalidity(mailimap *session) {
 
 #define RONNY_ADDR_MAX 256
 #define RONNY_SUBJ_MAX 512
+#define RONNY_DATE_MAX 64
 
 typedef struct {
     uint32_t uid;
     char from[RONNY_ADDR_MAX];    /* mailbox@host, lowercased by the caller */
     char subject[RONNY_SUBJ_MAX]; /* decoded to UTF-8 */
+    char date[RONNY_DATE_MAX];    /* the raw Date: header, as sent */
 } ronny_envelope;
 
 static void copy_bounded(char *dst, size_t cap, const char *src) {
@@ -145,7 +147,10 @@ int ronny_fetch_envelopes_since(mailimap *session, uint32_t first_uid,
             } else if (stat->att_type == MAILIMAP_MSG_ATT_ENVELOPE) {
                 struct mailimap_envelope *env = stat->att_data.att_env;
                 envelope_from(env, entry.from, sizeof(entry.from));
-                if (env != NULL) decode_header(entry.subject, sizeof(entry.subject), env->env_subject);
+                if (env != NULL) {
+                    decode_header(entry.subject, sizeof(entry.subject), env->env_subject);
+                    copy_bounded(entry.date, sizeof(entry.date), env->env_date);
+                }
             }
         }
 
@@ -280,7 +285,10 @@ static int envelopes_for_uids(mailimap *session, clist *uid_list,
             } else if (stat->att_type == MAILIMAP_MSG_ATT_ENVELOPE) {
                 struct mailimap_envelope *env = stat->att_data.att_env;
                 envelope_from(env, entry.from, sizeof(entry.from));
-                if (env != NULL) decode_header(entry.subject, sizeof(entry.subject), env->env_subject);
+                if (env != NULL) {
+                    decode_header(entry.subject, sizeof(entry.subject), env->env_subject);
+                    copy_bounded(entry.date, sizeof(entry.date), env->env_date);
+                }
             }
         }
         if (entry.uid != 0) out[count++] = entry;
