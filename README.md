@@ -191,3 +191,24 @@ visible in any single file — worth reading before changing behaviour:
   linker not handling the `.sframe` relocations this host's GCC emits. When
   `zig build -Dtarget=native` links cleanly, that workaround and the explicit
   system paths can all go.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
+
+The code here is MIT, but it links libraries with their own terms, none of
+which conflict:
+
+| | |
+|---|---|
+| [libetpan](https://github.com/dinhvh/libetpan) | BSD-3-Clause, BSD-3-Clause-Attribution and BSD-4-Clause |
+| [whisper.cpp / ggml](https://github.com/ggml-org/whisper.cpp) | MIT |
+| Zig standard library | MIT |
+
+Worth knowing rather than worrying about: part of libetpan is **BSD-4-Clause**,
+which carries the old advertising clause — anything advertising a product that
+includes it has to acknowledge the authors. Distributing source, as this repo
+does, doesn't trigger it; libetpan is a system dependency the user installs.
+Shipping a compiled binary would mean reproducing libetpan's copyright notices
+alongside it. Not legal advice, just the thing to look at before publishing a
+release artefact.
