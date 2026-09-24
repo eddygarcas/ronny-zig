@@ -55,6 +55,17 @@ pub fn build(b: *std.Build) void {
     // nested result structures, handing Zig flat data.
     root.addCSourceFile(.{ .file = b.path("src/shim.c"), .flags = &.{"-std=c11"} });
 
+    // whisper.cpp for voice notes. Same reasoning as the libetpan shim:
+    // whisper_full_params is a large struct with nested unions, so it is
+    // assembled in C and exposed as one flat call.
+    // ggml must be linked explicitly alongside whisper: it is what registers
+    // the compute backends, and without it whisper aborts at model load with
+    // GGML_ASSERT(device) failed. whisper-cli links all three the same way.
+    root.linkSystemLibrary("whisper", .{});
+    root.linkSystemLibrary("ggml", .{});
+    root.linkSystemLibrary("ggml-base", .{});
+    root.addCSourceFile(.{ .file = b.path("src/whisper_shim.c"), .flags = &.{"-std=c11"} });
+
     const exe = b.addExecutable(.{
         .name = "ronny",
         .root_module = root,
