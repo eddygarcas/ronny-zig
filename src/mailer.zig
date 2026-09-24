@@ -30,6 +30,18 @@ extern fn ronny_smtp_send(
     message_len: usize,
 ) c_int;
 
+/// A file to attach. The bytes are whatever they are; this module does the
+/// base64 and the framing.
+pub const Attachment = struct {
+    filename: []const u8,
+    content_type: []const u8,
+    bytes: []const u8,
+};
+
+/// Gmail caps a whole message at 25 MB and base64 inflates by a third, so
+/// this is the largest raw payload that reliably fits.
+pub const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+
 pub const Reply = struct {
     to: []const u8,
     subject: []const u8,
@@ -38,11 +50,49 @@ pub const Reply = struct {
     /// tolerated, the reply just won't nest in the client.
     in_reply_to: []const u8 = "",
     references: []const u8 = "",
+    attachments: []const Attachment = &.{},
 };
 
+/// Base64 wrapped at 76 characters, as RFC 2045 requires.
+///
+/// 57 input bytes encode to exactly 76 output characters, which is why the
+/// chunk size is that rather than a round number.
+fn writeBase64(writer: *std.Io.Writer, bytes: []const u8) !void {
+    const encoder = std.base64.standard.Encoder;
+    var line: [76]u8 = undefined;
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const chunk = bytes[i..@min(i + 57, bytes.len)];
+        try writer.writeAll(encoder.encode(&line, chunk));
+        try writer.writeAll("\r\n");
+        i += chunk.len;
+    }
+}
+
+/// Filenames reach us from Telegram and can hold anything. Rather than
+/// implement RFC 2231 for the rare case, anything outside plain ASCII is
+/// replaced so the header stays well-formed and the name stays recognisable.
+fn writeSafeFilename(writer: *std.Io.Writer, filename: []const u8) !void {
+    if (filename.len == 0) return writer.writeAll("attachment");
+    for (filename) |ch| {
+        if (ch < 0x20 or ch > 0x7e or ch == '"' or ch == '\\') {
+            try writer.writeByte('_');
+        } else {
+            try writer.writeByte(ch);
+        }
+    }
+}
+
 /// Builds the RFC 5322 message. Kept separate from sending so it can be
-/// inspected in tests without a network connection.
-pub fn compose(arena: std.mem.Allocator, from: []const u8, reply: Reply) ![]u8 {
+/// inspected in tests without a network connection -- which is also why the
+/// boundary is a parameter rather than generated in here.
+pub fn compose(
+    arena: std.mem.Allocator,
+    from: []const u8,
+    reply: Reply,
+    boundary: []const u8,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
 
     try out.writer.print("From: {s}\r\n", .{from});
@@ -60,15 +110,43 @@ pub fn compose(arena: std.mem.Allocator, from: []const u8, reply: Reply) ![]u8 {
     }
 
     try out.writer.writeAll("MIME-Version: 1.0\r\n");
+
+    // Without attachments the message stays flat text/plain -- no reason to
+    // wrap a two-line reply in MIME machinery.
+    if (reply.attachments.len == 0) {
+        try out.writer.writeAll("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+        try out.writer.writeAll(reply.body);
+        if (!std.mem.endsWith(u8, reply.body, "\r\n")) try out.writer.writeAll("\r\n");
+        return out.toOwnedSlice();
+    }
+
+    try out.writer.print("Content-Type: multipart/mixed; boundary=\"{s}\"\r\n\r\n", .{boundary});
+    try out.writer.writeAll("This is a multi-part message in MIME format.\r\n");
+
+    try out.writer.print("\r\n--{s}\r\n", .{boundary});
     try out.writer.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
-    try out.writer.writeAll("\r\n");
+    try out.writer.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
     try out.writer.writeAll(reply.body);
     if (!std.mem.endsWith(u8, reply.body, "\r\n")) try out.writer.writeAll("\r\n");
 
+    for (reply.attachments) |attachment| {
+        try out.writer.print("\r\n--{s}\r\n", .{boundary});
+        try out.writer.print("Content-Type: {s}; name=\"", .{attachment.content_type});
+        try writeSafeFilename(&out.writer, attachment.filename);
+        try out.writer.writeAll("\"\r\n");
+        try out.writer.writeAll("Content-Transfer-Encoding: base64\r\n");
+        try out.writer.writeAll("Content-Disposition: attachment; filename=\"");
+        try writeSafeFilename(&out.writer, attachment.filename);
+        try out.writer.writeAll("\"\r\n\r\n");
+        try writeBase64(&out.writer, attachment.bytes);
+    }
+
+    try out.writer.print("\r\n--{s}--\r\n", .{boundary});
     return out.toOwnedSlice();
 }
 
 pub fn send(
+    io: std.Io,
     gpa: std.mem.Allocator,
     host: []const u8,
     port: u16,
@@ -80,7 +158,14 @@ pub fn send(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const message = try compose(arena, user, reply);
+    // Random, because the boundary must not occur inside any attachment and
+    // those are arbitrary bytes.
+    var raw: [16]u8 = undefined;
+    io.random(&raw);
+    var boundary: [36]u8 = undefined;
+    const boundary_text = try std.fmt.bufPrint(&boundary, "----ronny{x}", .{&raw});
+
+    const message = try compose(arena, user, reply, boundary_text);
 
     const host_z = try arena.dupeZ(u8, host);
     const user_z = try arena.dupeZ(u8, user);
@@ -106,7 +191,7 @@ test "compose builds a threaded reply" {
         .body = "Thursday works.",
         .in_reply_to = "<abc@example.org>",
         .references = "<start@example.org>",
-    });
+        }, "BOUND");
 
     try std.testing.expect(std.mem.indexOf(u8, message, "From: me@example.com\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "To: them@example.org\r\n") != null);
@@ -126,9 +211,65 @@ test "compose omits threading headers when there is nothing to thread to" {
         .to = "them@example.org",
         .subject = "Hello",
         .body = "Body",
-    });
+    }, "BOUND");
 
     try std.testing.expect(std.mem.indexOf(u8, message, "In-Reply-To") == null);
     try std.testing.expect(std.mem.indexOf(u8, message, "References") == null);
     try std.testing.expect(std.mem.endsWith(u8, message, "Body\r\n"));
+    // No attachments means no MIME wrapper at all.
+    try std.testing.expect(std.mem.indexOf(u8, message, "multipart") == null);
+}
+
+test "compose attaches a file as base64 multipart" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const message = try compose(arena, "me@example.com", .{
+        .to = "them@example.org",
+        .subject = "Here it is",
+        .body = "Attached.",
+        .attachments = &.{.{
+            .filename = "notes.txt",
+            .content_type = "text/plain",
+            .bytes = "hello",
+        }},
+    }, "BOUND");
+
+    try std.testing.expect(std.mem.indexOf(u8, message,
+        "Content-Type: multipart/mixed; boundary=\"BOUND\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message,
+        "Content-Disposition: attachment; filename=\"notes.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message,
+        "Content-Transfer-Encoding: base64") != null);
+    // "hello" in base64.
+    try std.testing.expect(std.mem.indexOf(u8, message, "aGVsbG8=") != null);
+    // The body survives as its own part.
+    try std.testing.expect(std.mem.indexOf(u8, message, "Attached.") != null);
+    // Closing delimiter carries the trailing dashes.
+    try std.testing.expect(std.mem.endsWith(u8, message, "--BOUND--\r\n"));
+}
+
+test "base64 wraps at 76 characters" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    // 120 bytes encodes to 160 characters, so it must wrap.
+    const payload = "x" ** 120;
+    try writeBase64(&out.writer, payload);
+
+    var lines = std.mem.splitSequence(u8, std.mem.trimEnd(u8, out.writer.buffered(), "\r\n"), "\r\n");
+    while (lines.next()) |line| {
+        try std.testing.expect(line.len <= 76);
+    }
+}
+
+test "a filename that would break the header is sanitised, not dropped" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    // A quote would end the header value early; non-ASCII needs RFC 2231,
+    // which is not worth implementing for the rare case.
+    try writeSafeFilename(&out.writer, "in\"voice\u{00e9}.pdf");
+    try std.testing.expectEqualStrings("in_voice__.pdf", out.writer.buffered());
 }

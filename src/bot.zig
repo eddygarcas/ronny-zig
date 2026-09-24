@@ -131,6 +131,21 @@ const Pending = struct {
     in_reply_to: []const u8,
     references: []const u8,
     created_ns: i96,
+    /// Shown in the draft preview. The owner has to see what they are
+    /// approving; a file they did not notice is a file they did not approve.
+    attachments: []const mailer.Attachment,
+};
+
+/// A file the owner uploaded, waiting to be attached to the next draft.
+///
+/// Held separately from the draft because the two arrive in either order --
+/// "reply saying here you go" then the file, or the file with a caption.
+const Staged = struct {
+    arena: std.heap.ArenaAllocator,
+    filename: []const u8,
+    content_type: []const u8,
+    bytes: []const u8,
+    created_ns: i96,
 };
 
 const Turn = struct {
@@ -146,6 +161,7 @@ pub const Bot = struct {
     session: ?imap.Session = null,
     last_message: ?LastMessage = null,
     pending: ?Pending = null,
+    staged: ?Staged = null,
 
     history: std.ArrayList(Turn) = .empty,
     vocabulary: []const []const u8 = &.{},
@@ -170,6 +186,7 @@ pub const Bot = struct {
         if (self.session) |*session| session.deinit();
         if (self.last_message) |*message| message.arena.deinit();
         if (self.pending) |*pending| pending.arena.deinit();
+        if (self.staged) |*staged| staged.arena.deinit();
         if (self.vocabulary_arena) |*arena| arena.deinit();
         for (self.history.items) |turn| {
             self.cfg.gpa.free(turn.owner);
@@ -236,6 +253,118 @@ pub const Bot = struct {
         if (message.voice orelse message.audio) |voice| {
             return self.handleVoice(arena, chat_id, voice);
         }
+        if (message.document) |document| {
+            return self.handleUpload(arena, chat_id, document, message.caption);
+        }
+        if (message.photo) |sizes| {
+            if (sizes.len == 0) return;
+            // Telegram sends every rendition smallest-first and strips the
+            // filename, so take the largest and name it here.
+            const largest = sizes[sizes.len - 1];
+            return self.handleUpload(arena, chat_id, .{
+                .file_id = largest.file_id,
+                .file_name = "photo.jpg",
+                .mime_type = "image/jpeg",
+                .file_size = largest.file_size,
+            }, message.caption);
+        }
+    }
+
+    /// Takes an uploaded file and holds it for the next draft.
+    ///
+    /// Staged rather than acted on immediately, because the file and the
+    /// instruction arrive in either order: a caption with the upload, or a
+    /// "reply saying here you go" before or after it.
+    fn handleUpload(
+        self: *Bot,
+        arena: std.mem.Allocator,
+        chat_id: []const u8,
+        document: telegram.Document,
+        caption: ?[]const u8,
+    ) !void {
+        if (!try self.ownerCheck(arena, chat_id, "")) return;
+
+        const filename = document.file_name orelse "attachment";
+        var size_buf: [32]u8 = undefined;
+        if (document.file_size > mailer.MAX_ATTACHMENT_BYTES) {
+            return self.client.sendMessage(try std.fmt.allocPrint(
+                arena,
+                "{s} is {s}. Mail won't carry more than about 18 MB, so I can't attach it.",
+                .{ filename, attachments_mod.humanSize(document.file_size, &size_buf) },
+            ));
+        }
+
+        self.client.sendTyping();
+        const bytes = self.client.downloadFile(arena, document.file_id) catch |err| {
+            log.err("could not download upload {s}: {s}", .{ filename, @errorName(err) });
+            return self.client.sendMessage(
+                "Couldn't download that file from Telegram -- try sending it again.",
+            );
+        };
+
+        try self.stage(filename, document.mime_type orelse "application/octet-stream", bytes);
+        log.info("staged {s} ({d} bytes) for the next draft", .{ filename, bytes.len });
+
+        // A caption is the instruction that came with the file, so act on it
+        // rather than making the owner repeat themselves.
+        if (caption) |text| {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (trimmed.len > 0) {
+                try self.client.sendMessage(try std.fmt.allocPrint(
+                    arena,
+                    "Got {s} ({s}).",
+                    .{ filename, attachments_mod.humanSize(bytes.len, &size_buf) },
+                ));
+                return self.handleText(arena, chat_id, trimmed);
+            }
+        }
+
+        try self.client.sendMessage(try std.fmt.allocPrint(
+            arena,
+            "Got {s} ({s}). Tell me what to do with it -- \"reply to that saying here's the file\", for example. I'll show you the draft before anything is sent.",
+            .{ filename, attachments_mod.humanSize(bytes.len, &size_buf) },
+        ));
+    }
+
+    /// Allocations finish before the arena is moved into place; see `remember`.
+    fn stage(self: *Bot, filename: []const u8, content_type: []const u8, bytes: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const owned_name = try arena.dupe(u8, filename);
+        const owned_type = try arena.dupe(u8, content_type);
+        const owned_bytes = try arena.dupe(u8, bytes);
+
+        if (self.staged) |*previous| previous.arena.deinit();
+        self.staged = .{
+            .arena = arena_state,
+            .filename = owned_name,
+            .content_type = owned_type,
+            .bytes = owned_bytes,
+            .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+        };
+    }
+
+    fn discardStaged(self: *Bot) void {
+        if (self.staged) |*staged| staged.arena.deinit();
+        self.staged = null;
+    }
+
+    /// The staged file, if there is one and it has not gone stale.
+    fn freshStaged(self: *Bot) ?*Staged {
+        if (self.staged == null) return null;
+        const staged = &self.staged.?;
+        const age = @divTrunc(
+            std.Io.Clock.now(.boot, self.cfg.io).nanoseconds - staged.created_ns,
+            std.time.ns_per_s,
+        );
+        if (age > PENDING_REPLY_TTL_SECONDS) {
+            log.info("staged file {s} expired", .{staged.filename});
+            self.discardStaged();
+            return null;
+        }
+        return staged;
     }
 
     /// Until an owner chat id is configured the bot is inert, and says so.
@@ -1053,6 +1182,26 @@ pub const Bot = struct {
         const in_reply_to = try pending_alloc.dupe(u8, original.message_id);
         const references = try pending_alloc.dupe(u8, original.references);
 
+        // A staged upload rides along with the draft, so what gets approved
+        // and what gets sent are the same thing.
+        var attached: []const mailer.Attachment = &.{};
+        var attachment_line: []const u8 = "";
+        if (self.freshStaged()) |staged| {
+            const copy = try pending_alloc.alloc(mailer.Attachment, 1);
+            copy[0] = .{
+                .filename = try pending_alloc.dupe(u8, staged.filename),
+                .content_type = try pending_alloc.dupe(u8, staged.content_type),
+                .bytes = try pending_alloc.dupe(u8, staged.bytes),
+            };
+            attached = copy;
+
+            var size_buf: [32]u8 = undefined;
+            attachment_line = try std.fmt.allocPrint(arena, "Attached: {s} ({s})\n", .{
+                staged.filename,
+                attachments_mod.humanSize(staged.bytes.len, &size_buf),
+            });
+        }
+
         if (self.pending) |*previous| previous.arena.deinit();
         self.pending = .{
             .arena = pending_arena,
@@ -1062,14 +1211,17 @@ pub const Bot = struct {
             .in_reply_to = in_reply_to,
             .references = references,
             .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+            .attachments = attached,
         };
-        log.info("drafted a reply to {s}; awaiting confirmation", .{recipient});
+        log.info("drafted a reply to {s} with {d} attachment(s); awaiting confirmation", .{
+            recipient, attached.len,
+        });
 
         return telegram.truncate(try std.fmt.allocPrint(arena,
             \\{s}DRAFT -- not sent.
             \\To: {s}
             \\Subject: {s}
-            \\
+            \\{s}
             \\{s}
             \\
             \\---
@@ -1078,6 +1230,7 @@ pub const Bot = struct {
             if (replaced) "*** THIS REPLACES YOUR PREVIOUS DRAFT -- read it again ***\n\n" else "",
             recipient,
             subject,
+            attachment_line,
             trimmed,
         }));
     }
@@ -1094,6 +1247,7 @@ pub const Bot = struct {
         }
 
         mailer.send(
+            self.cfg.io,
             self.cfg.gpa,
             self.cfg.smtp_host,
             self.cfg.smtp_port,
@@ -1105,6 +1259,7 @@ pub const Bot = struct {
                 .body = pending.body,
                 .in_reply_to = pending.in_reply_to,
                 .references = pending.references,
+                .attachments = pending.attachments,
             },
         ) catch |err| {
             log.err("failed to send the reply to {s}: {s}", .{ pending.to, @errorName(err) });
@@ -1113,6 +1268,9 @@ pub const Bot = struct {
         };
 
         const reply = try std.fmt.allocPrint(arena, "Sent to {s}.", .{pending.to});
+        // The file has been used; leaving it staged would silently attach it
+        // to the next unrelated draft.
+        self.discardStaged();
         self.discardPending();
         return reply;
     }
@@ -1122,6 +1280,7 @@ pub const Bot = struct {
         const pending = &self.pending.?;
         const reply = try std.fmt.allocPrint(arena, "Discarded the draft to {s}. Nothing was sent.", .{pending.to});
         log.info("discarded the pending reply to {s}", .{pending.to});
+        self.discardStaged();
         self.discardPending();
         return reply;
     }
