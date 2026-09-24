@@ -112,6 +112,7 @@ pub fn transcribe(
     const buffer = try gpa.alloc(u8, MAX_TEXT);
     errdefer gpa.free(buffer);
 
+    const started = std.Io.Clock.now(.boot, io);
     const written = ronny_whisper_transcribe(
         samples.ptr,
         @intCast(samples.len),
@@ -120,12 +121,21 @@ pub fn transcribe(
         MAX_TEXT,
     );
     if (written < 0) return Error.TranscribeFailed;
+    const elapsed_ms = @divTrunc(
+        std.Io.Clock.now(.boot, io).nanoseconds - started.nanoseconds,
+        std.time.ns_per_ms,
+    );
 
     const text = std.mem.trim(u8, buffer[0..@intCast(written)], " \t\r\n");
     const owned = try gpa.dupe(u8, text);
     gpa.free(buffer);
 
-    log.info("transcribed {d:.1}s of audio", .{@as(f32, @floatFromInt(samples.len)) / @as(f32, SAMPLE_RATE)});
+    // Both numbers, because the ratio is the thing worth watching: on the CPU
+    // backend this runs near real time, on the GPU it should be a fraction.
+    const seconds = @as(f32, @floatFromInt(samples.len)) / @as(f32, SAMPLE_RATE);
+    log.info("transcribed {d:.1}s of audio in {d}ms ({d:.2}x real time)", .{
+        seconds, elapsed_ms, @as(f32, @floatFromInt(elapsed_ms)) / 1000.0 / seconds,
+    });
     return owned;
 }
 

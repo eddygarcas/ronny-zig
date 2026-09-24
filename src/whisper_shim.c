@@ -62,7 +62,12 @@ int ronny_whisper_transcribe(const float *samples, int n_samples, const char *pr
     wparams.no_timestamps    = true;
     wparams.language         = NULL;   /* auto-detect */
     wparams.detect_language  = false;
-    wparams.n_threads        = 4;
+    /* Measured on this host (i7-8086K, 6c/12t, medium model, CPU backend):
+     * encode per 30s window was 13.2s at 4 threads, 6.6s at 8, 6.1s at 12.
+     * Eight is the knee -- hyperthreads add 7% while contending with Ollama
+     * and the watcher for the same cores. Revisit if this ever runs on the
+     * GPU, where the thread count stops mattering. */
+    wparams.n_threads        = 8;
     wparams.initial_prompt   = (prompt != NULL && prompt[0] != '\0') ? prompt : NULL;
 
     if (whisper_full(g_ctx, wparams, samples, n_samples) != 0) return -1;
