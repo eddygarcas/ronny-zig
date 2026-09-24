@@ -165,6 +165,10 @@ const Staged = struct {
     filename: []const u8,
     content_type: []const u8,
     bytes: []const u8,
+    /// Where it came from, shown in the draft. A file pulled off a message
+    /// the search picked is only as right as that pick, so the preview names
+    /// the message too -- a wrong invoice should be visible, not inferred.
+    source: []const u8,
     created_ns: i96,
 };
 
@@ -324,7 +328,7 @@ pub const Bot = struct {
             );
         };
 
-        try self.stage(filename, document.mime_type orelse "application/octet-stream", bytes);
+        try self.stage(filename, document.mime_type orelse "application/octet-stream", bytes, "");
         log.info("staged {s} ({d} bytes) for the next draft", .{ filename, bytes.len });
 
         // A caption is the instruction that came with the file, so act on it
@@ -349,7 +353,7 @@ pub const Bot = struct {
     }
 
     /// Allocations finish before the arena is moved into place; see `remember`.
-    fn stage(self: *Bot, filename: []const u8, content_type: []const u8, bytes: []const u8) !void {
+    fn stage(self: *Bot, filename: []const u8, content_type: []const u8, bytes: []const u8, source: []const u8) !void {
         var arena_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
         errdefer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -357,6 +361,7 @@ pub const Bot = struct {
         const owned_name = try arena.dupe(u8, filename);
         const owned_type = try arena.dupe(u8, content_type);
         const owned_bytes = try arena.dupe(u8, bytes);
+        const owned_source = try arena.dupe(u8, source);
 
         if (self.staged) |*previous| previous.arena.deinit();
         self.staged = .{
@@ -364,6 +369,7 @@ pub const Bot = struct {
             .filename = owned_name,
             .content_type = owned_type,
             .bytes = owned_bytes,
+            .source = owned_source,
             .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
         };
     }
@@ -1248,6 +1254,10 @@ pub const Bot = struct {
 
         // A re-draft must be obvious: the owner must never confirm a body they
         // believe they reviewed while a different one is actually pending.
+        // Same rule as compose: if a file was asked for and none uploaded,
+        // take it from the message being replied to, or say why not.
+        if (try self.stageFromOpenMessage(arena, instruction_text)) |problem| return problem;
+
         return self.stageDraft(arena, .{
             .to = recipient,
             .subject = subject,
@@ -1306,10 +1316,17 @@ pub const Bot = struct {
             attached = copy;
 
             var size_buf: [32]u8 = undefined;
-            attachment_line = try std.fmt.allocPrint(arena, "Attached: {s} ({s})\n", .{
-                staged.filename,
-                attachments_mod.humanSize(staged.bytes.len, &size_buf),
-            });
+            attachment_line = if (staged.source.len > 0)
+                try std.fmt.allocPrint(arena, "Attached: {s} ({s}) -- from \"{s}\"\n", .{
+                    staged.filename,
+                    attachments_mod.humanSize(staged.bytes.len, &size_buf),
+                    staged.source,
+                })
+            else
+                try std.fmt.allocPrint(arena, "Attached: {s} ({s})\n", .{
+                    staged.filename,
+                    attachments_mod.humanSize(staged.bytes.len, &size_buf),
+                });
         }
 
         if (self.pending) |*previous| previous.arena.deinit();
@@ -1357,6 +1374,98 @@ pub const Bot = struct {
     /// The recipient is *selected* from addresses that have really written to
     /// this mailbox -- never produced by a model. See contacts.zig for why
     /// that distinction is the whole design here.
+    /// Words that mean "put a file on this".
+    ///
+    /// Deterministic on purpose: this only decides whether the owner *asked*
+    /// for an attachment, which their own words answer plainly. Which file
+    /// they meant is a judgement, and that goes to the local model below.
+    fn mentionsAttaching(text: []const u8) bool {
+        const markers = [_][]const u8{
+            "attach", "attaching", "attached", "attachment",
+            "enclose", "enclosing", "enclosed",
+        };
+        for (markers) |marker| {
+            if (std.ascii.indexOfIgnoreCase(text, marker) != null) return true;
+        }
+        return false;
+    }
+
+    /// Stages a file from the message currently open, when the owner asked
+    /// for one and has not uploaded anything.
+    ///
+    /// Returns null when there is nothing to complain about, or a sentence
+    /// explaining why it could not be done. Silence is not an option here:
+    /// a body that promises an invoice and a draft that carries none is a
+    /// contradiction the owner should never have to notice for themselves,
+    /// and it went out that way once already.
+    fn stageFromOpenMessage(self: *Bot, arena: std.mem.Allocator, request: []const u8) !?[]const u8 {
+        if (!mentionsAttaching(request)) return null;
+        if (self.freshStaged() != null) return null; // an upload already wins
+
+        if (self.last_message == null) {
+            return "You asked me to attach something, but I don't have a message open to take it from. Read or find one first.";
+        }
+        const original = &self.last_message.?;
+        if (original.attachments.len == 0) {
+            return try std.fmt.allocPrint(
+                arena,
+                "You asked me to attach something, but \"{s}\" has no attachments. Upload the file here and I'll put it on the draft.",
+                .{original.subject},
+            );
+        }
+
+        const choice = attachments_mod.choose(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            request,
+            original.attachments,
+        ) orelse {
+            return try self.doListAttachments(arena);
+        };
+
+        const part = original.attachments[choice];
+        var size_buf: [32]u8 = undefined;
+        if (part.size > mailer.MAX_ATTACHMENT_BYTES) {
+            return try std.fmt.allocPrint(
+                arena,
+                "{s} is {s}, which is more than mail will carry.",
+                .{ part.filenameSlice(), attachments_mod.humanSize(part.size, &size_buf) },
+            );
+        }
+
+        const Context = struct {
+            uid: u32,
+            index: u32,
+            buffer: []u8,
+            bytes: []u8 = &.{},
+
+            fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                ctx.bytes = try session.fetchAttachment(ctx.uid, ctx.index, ctx.buffer);
+            }
+        };
+        const capacity = @min(
+            @as(usize, part.size) + (part.size / 4) + 64 * 1024,
+            attachments_mod.MAX_BYTES,
+        );
+        var context: Context = .{
+            .uid = original.uid,
+            .index = part.index,
+            .buffer = try arena.alloc(u8, capacity),
+        };
+        self.withMailbox(&context, Context.run) catch |err| {
+            log.err("could not pull {s} for a draft: {s}", .{ part.filenameSlice(), @errorName(err) });
+            return "Couldn't pull that file off the server, so I haven't drafted anything.";
+        };
+
+        try self.stage(part.filenameSlice(), part.mimeTypeSlice(), context.bytes, original.subject);
+        log.info("staged {s} ({d} bytes) from the open message for the next draft", .{
+            part.filenameSlice(), context.bytes.len,
+        });
+        return null;
+    }
+
     /// A literal address in the owner's own message.
     ///
     /// This outranks everything else and consults no model. An address the
@@ -1445,6 +1554,14 @@ pub const Bot = struct {
         if (said.len == 0) {
             try self.rememberComposing(recipient, label, "");
             return std.fmt.allocPrint(arena, "What should I say to {s}?", .{recipient});
+        }
+
+        // Asked for an attachment and has not uploaded one: take it from the
+        // message currently open, or say plainly why not. Drafting a body
+        // that promises a file it does not carry is how one went out empty.
+        if (try self.stageFromOpenMessage(arena, said)) |problem| {
+            try self.rememberComposing(recipient, label, said);
+            return problem;
         }
         self.discardComposing();
 
@@ -1675,4 +1792,18 @@ test "a mis-transcribed address is still address-shaped, which is why voice cann
     try std.testing.expectEqualStrings("name@example.com", Bot.ownerTypedAddress("email edu name@example.com").?);
     try std.testing.expectEqualStrings("you.name@example.com", Bot.ownerTypedAddress("email you.name@example.com").?);
     try std.testing.expectEqualStrings("youname@example.com", Bot.ownerTypedAddress("email youname@example.com").?);
+}
+
+test "an attachment request is recognised from the owner's own words" {
+    // Deterministic on purpose: whether a file was *asked for* is plain in
+    // the wording. Which file is meant is the judgement, and that goes to
+    // the local model.
+    try std.testing.expect(Bot.mentionsAttaching("compose an email attaching this last invoice"));
+    try std.testing.expect(Bot.mentionsAttaching("reply and attach the pdf"));
+    try std.testing.expect(Bot.mentionsAttaching("send it with the invoice attached"));
+    try std.testing.expect(Bot.mentionsAttaching("enclose the spreadsheet"));
+
+    // No file mentioned: nothing should be pulled off the open message.
+    try std.testing.expect(!Bot.mentionsAttaching("say I'll meet you at 5 tomorrow"));
+    try std.testing.expect(!Bot.mentionsAttaching("reply saying Wednesday works"));
 }
