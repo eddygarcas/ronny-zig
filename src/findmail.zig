@@ -91,6 +91,7 @@ pub fn buildQuery(
     first_line = std.mem.trim(u8, first_line, " \t\r\"");
     if (first_line.len == 0) first_line = question;
     first_line = try balanceQuotes(arena, first_line);
+    first_line = try stripOperators(arena, first_line);
     first_line = try trimToTerms(arena, first_line);
 
     // Filtering promotions Gmail-side is far cheaper than fetching newsletters
@@ -98,6 +99,71 @@ pub fn buildQuery(
     const query = try std.fmt.allocPrint(arena, "newer_than:{d}d {s} -category:promotions", .{ days, first_line });
     log.info("gmail query: {s}", .{query});
     return query;
+}
+
+/// Gmail search operators the model is told not to emit, and does anyway.
+///
+/// Observed live: asked for "the last invoice email from AcmeSync", it
+/// produced `(...) FROM AcmeSync`. Gmail needs `from:` with a colon, so bare
+/// `FROM` became a literal word that had to appear in the message, and the
+/// search returned nothing at all -- which reads from the outside exactly
+/// like an empty mailbox.
+///
+/// The prompt already forbids these. It is the third thing that prompt has
+/// been ignored about today, after quoting and length, so the rule is
+/// enforced here instead of requested there.
+const OPERATORS = [_][]const u8{
+    "from",  "to",     "cc",    "bcc",      "subject", "label",
+    "has",   "in",     "is",    "category", "filename", "list",
+    "newer", "older",  "newer_than", "older_than", "after", "before",
+    "larger", "smaller", "rfc822msgid", "deliveredto",
+};
+
+fn isOperatorToken(token: []const u8) bool {
+    // `from:` and friends, with the colon.
+    if (std.mem.indexOfScalar(u8, token, ':')) |colon| {
+        const name = token[0..colon];
+        for (OPERATORS) |operator| {
+            if (std.ascii.eqlIgnoreCase(name, operator)) return true;
+        }
+        return false;
+    }
+    // Bare `FROM`, which is how it actually came out. Only all-caps, so the
+    // ordinary English words are left alone -- "invoice from AcmeSync" in a
+    // quoted phrase is a legitimate search term.
+    for (token) |ch| {
+        if (std.ascii.isLower(ch)) return false;
+    }
+    for (OPERATORS) |operator| {
+        if (std.ascii.eqlIgnoreCase(token, operator)) return true;
+    }
+    return false;
+}
+
+/// Drops operator tokens the model added on its own. The caller supplies the
+/// date window and the promotions filter; nothing else belongs here.
+fn stripOperators(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var dropped: usize = 0;
+
+    var quoted = false;
+    var tokens = std.mem.tokenizeAny(u8, query, " \t");
+    while (tokens.next()) |token| {
+        // Never touch anything inside a quoted phrase.
+        if (!quoted and isOperatorToken(token)) {
+            dropped += 1;
+            continue;
+        }
+        for (token) |ch| {
+            if (ch == '"') quoted = !quoted;
+        }
+        if (out.writer.buffered().len > 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(token);
+    }
+
+    if (dropped == 0) return query;
+    log.warn("dropped {d} search operator(s) the model added on its own", .{dropped});
+    return out.writer.buffered();
 }
 
 /// A Gmail query worth sending. Past this the model has stopped generating
@@ -409,4 +475,26 @@ test "isBulk spots newsletters by their own headers" {
     try std.testing.expect(isBulk("List-Unsubscribe: <https://example.com/u>\r\n"));
     try std.testing.expect(isBulk("list-id: <news.example.com>\r\n"));
     try std.testing.expect(!isBulk("From: sam@example.com\r\nSubject: Thursday\r\n"));
+}
+
+test "search operators the model invents are stripped" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Exactly what came back from a real request, which returned 0 results:
+    // Gmail wants `from:` with a colon, so bare FROM had to appear as a word.
+    try std.testing.expectEqualStrings(
+        "(last invoice OR billing) AcmeSync",
+        try stripOperators(arena, "(last invoice OR billing) FROM AcmeSync"),
+    );
+    try std.testing.expectEqualStrings(
+        "invoice",
+        try stripOperators(arena, "from:someone@x.com invoice newer_than:30d"),
+    );
+
+    // Ordinary words and quoted phrases are left alone -- "from" inside a
+    // phrase is a legitimate search term, not an operator.
+    const plain = "(invoice OR \"payment from AcmeSync\") billing";
+    try std.testing.expectEqualStrings(plain, try stripOperators(arena, plain));
 }
