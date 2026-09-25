@@ -141,7 +141,7 @@ const ACTION_CRITERIA =
     \\  "get_attachment": "Send the owner a file attached to the email just shown. Examples: 'send me the invoice', 'download the pdf', 'give me that attachment', 'forward me the spreadsheet from it'",
     \\  "add_sender": "Add an email address or domain to the watched-sender allowlist, so that mail arriving from it is notified. The request names the address or the person. Examples: 'add example@example.com to be notified', 'watch acme.com', 'let me know when anna@acme.com writes'",
     \\  "remove_sender": "Remove an email address or domain from the watched-sender allowlist.",
-    \\  "list_senders": "Show which PEOPLE the assistant watches -- the sender allowlist. About addresses and domains, never about what the assistant can do. Examples: 'who are you watching?', 'list the senders', 'show me the allowlist'",
+    \\  "list_senders": "Show which PEOPLE the assistant watches -- the sender allowlist. About addresses and domains, never about what the assistant can do. Examples: 'who are you watching?', 'what are you watching?', 'which senders are you monitoring?', 'list the senders', 'show me the allowlist'",
     \\  "pause": "Stop sending notifications entirely, for now, until told to resume. Not for silencing only certain hours of the day, which is change_setting.",
     \\  "resume": "Start sending notifications again after a pause.",
     \\  "status": "Report the assistant's own state: active or paused, and how many senders it watches. Not about mail content, and not its configurable settings, which is show_settings.",

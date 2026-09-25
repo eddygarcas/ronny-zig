@@ -292,7 +292,12 @@ fn cleanTerms(arena: std.mem.Allocator, terms: []const []const u8) ![]const []co
     for (terms) |raw| {
         if (out.items.len >= MAX_TERMS) break;
 
-        const bare = std.mem.trim(u8, raw, "\"+");
+        // Every quote goes, not just the ones at the ends. A term that kept
+        // an internal one went out as
+        //   ... OR "consolidated job" 24th September" OR ...
+        // which is a broken query: the quote that should have closed the
+        // phrase opened a new one, and everything after it shifted meaning.
+        const bare = try stripQuotes(arena, std.mem.trim(u8, raw, " \t+"));
         if (bare.len == 0) continue;
 
         // Gmail search is case-insensitive, so a case variant is not a second
@@ -335,6 +340,15 @@ fn isDistinctive(term: []const u8) bool {
         if (std.ascii.isUpper(ch) or std.ascii.isDigit(ch)) return true;
     }
     return false;
+}
+
+fn stripQuotes(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '"') == null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    for (text) |ch| {
+        if (ch != '"') try out.append(arena, ch);
+    }
+    return std.mem.trim(u8, out.items, " \t");
 }
 
 /// Words too ordinary to search on their own.
@@ -1134,4 +1148,25 @@ test "a query the quote scan cannot split is still broken into terms" {
         try std.testing.expect(std.mem.indexOfScalar(u8, word, '"') == null);
         try std.testing.expect(!std.ascii.eqlIgnoreCase(word, "or"));
     }
+}
+
+test "no term reaches the query carrying a quote" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Seen live: an unbalanced quote survived into a term, and the rendered
+    // query read  ... OR "consolidated job" 24th September" OR ...
+    const terms = try cleanTerms(arena, &.{ "\"consolidated job\" 24th September\"", "order" });
+    for (terms) |term| {
+        const inner = term[1 .. term.len - 1];
+        try std.testing.expect(std.mem.indexOfScalar(u8, inner, '"') == null);
+    }
+
+    const query = try renderQuery(arena, terms, 365);
+    var quotes: usize = 0;
+    for (query) |ch| {
+        if (ch == '"') quotes += 1;
+    }
+    try std.testing.expect(quotes % 2 == 0);
 }

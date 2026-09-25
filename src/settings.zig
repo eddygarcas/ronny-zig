@@ -324,8 +324,13 @@ fn roleOf(prefix: []const u8) ?Role {
 pub fn parseChange(text: []const u8, current: Settings) ?Change {
     // Switching quiet hours off comes first: "notify me at any time" contains
     // a time word but is the opposite of setting one.
+    // "quite" is accepted alongside "quiet": it is the transposition everyone
+    // makes, it is what a transcript sometimes hears, and there is no other
+    // thing "turn off quite hours" could mean. Seen live -- Jev routed it to
+    // change_setting at full confidence and this parser then refused it,
+    // which looks like the feature is broken rather than the spelling.
     if (containsAny(text, &.{ "any time", "anytime", "all the time", "round the clock", "24/7", "whenever" }) or
-        (containsIgnoreCase(text, "quiet") and
+        (containsAny(text, &.{ "quiet", "quite" }) and
             containsAny(text, &.{ "off", "no ", "stop", "cancel", "disable", "remove", "clear", "don't", "dont" })))
     {
         return .quiet_off;
@@ -487,4 +492,12 @@ test "a settings change with nothing to change in it is refused" {
     // which looks exactly like everything working.
     try std.testing.expectEqual(@as(?Change, null), parseChange("change my settings", off));
     try std.testing.expectEqual(@as(?Change, null), parseChange("make it better", off));
+}
+
+test "the quiet/quite transposition is accepted" {
+    const on: Settings = .{ .quiet_from = 22 * 60, .quiet_to = 8 * 60 };
+    // Typed live, routed correctly by Jev, and refused here -- which reads
+    // as a broken feature rather than a misspelling.
+    try std.testing.expectEqual(Change.quiet_off, parseChange("Turn off quite hours", on).?);
+    try std.testing.expectEqual(Change.quiet_off, parseChange("turn off quiet hours", on).?);
 }
