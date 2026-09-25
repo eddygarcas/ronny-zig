@@ -19,6 +19,7 @@ const std = @import("std");
 const imap = @import("imap.zig");
 const ollama = @import("ollama.zig");
 const rerank = @import("rerank.zig");
+const dates = @import("dates.zig");
 
 const log = std.log.scoped(.findmail);
 
@@ -62,7 +63,20 @@ pub const Match = struct {
     candidate: Candidate,
     /// The model's one-line justification, or empty when ranking was skipped.
     why: []const u8 = "",
+    /// Shown for want of anything better -- recency order, or the closest of
+    /// a batch that nothing in cleared the bar. The caller uses this to
+    /// decide whether the search is worth retrying differently; saying "no
+    /// confident match" out loud beats inferring it from the text.
+    weak: bool = false,
 };
+
+/// Did the ranker actually find something, as opposed to shrugging?
+fn anyConfident(matches: []const Match) bool {
+    for (matches) |match| {
+        if (!match.weak) return true;
+    }
+    return false;
+}
 
 pub const Found = struct {
     /// The Gmail query actually used. Shown to the owner when nothing matched,
@@ -409,9 +423,9 @@ fn keywordTerms(arena: std.mem.Allocator, terms: []const []const u8) ![]const []
 }
 
 /// The canonical query. The only thing that came from the model is the words.
-pub fn renderQuery(arena: std.mem.Allocator, terms: []const []const u8, days: u16) ![]const u8 {
+pub fn renderQuery(arena: std.mem.Allocator, terms: []const []const u8, time_filter: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
-    try out.writer.print("newer_than:{d}d (", .{days});
+    try out.writer.print("{s} (", .{time_filter});
     for (terms, 0..) |term, i| {
         if (i > 0) try out.writer.writeAll(" OR ");
         try out.writer.writeAll(term);
@@ -727,6 +741,7 @@ fn rankWithJev(
         if (best) |item| {
             try out.append(arena, .{
                 .candidate = item.candidate,
+                .weak = true,
                 .why = try std.fmt.allocPrint(
                     arena,
                     "closest of {d}, relevance {d:.2} -- probably not the one",
@@ -770,7 +785,7 @@ pub fn rank(
         fn call(a: std.mem.Allocator, items: []const Candidate) []const Match {
             var out: std.ArrayList(Match) = .empty;
             for (items[0..@min(items.len, RESULT_LIMIT)]) |candidate| {
-                out.append(a, .{ .candidate = candidate }) catch break;
+                out.append(a, .{ .candidate = candidate, .weak = true }) catch break;
             }
             return out.items;
         }
@@ -865,7 +880,26 @@ pub fn find(
     _ = try session.examine(.all_mail);
 
     const window = days orelse DEFAULT_DAYS;
-    const terms_all = try buildTerms(io, arena, ollama_url, model, question);
+
+    // A date in the request is the most precise thing in it, and as a search
+    // term it is nearly useless: a message sent on 24 September almost never
+    // contains the string "24 September". Pull it out, hand it to Gmail in
+    // its own syntax, and keep it out of the words.
+    var time_filter: []const u8 = try std.fmt.allocPrint(arena, "newer_than:{d}d", .{window});
+    var subject = question;
+    if (dates.find(dates.today(), question)) |found| {
+        const stripped = try dates.without(arena, question, found);
+        // Only if something is left to search for. "what came in yesterday"
+        // is a recent_mail question that reached here by mistake, and an
+        // empty term list would match the entire mailbox.
+        if (stripped.len > 0) {
+            time_filter = try dates.render(arena, found.range);
+            subject = stripped;
+            log.info("date filter {s} from the request; searching for \"{s}\"", .{ time_filter, subject });
+        }
+    }
+
+    const terms_all = try buildTerms(io, arena, ollama_url, model, subject);
 
     // Narrow first, broad only if narrow came up short.
     //
@@ -881,14 +915,14 @@ pub fn find(
     const narrow_terms = terms_all[0..@min(terms_all.len, NARROW_TERMS)];
 
     var terms = narrow_terms;
-    var query = try renderQuery(arena, terms, window);
+    var query = try renderQuery(arena, terms, time_filter);
     log.info("gmail query: {s}", .{query});
     var candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
 
     if (candidates.len < ENOUGH_CANDIDATES and terms_all.len > narrow_terms.len) {
         log.info("narrow query found {d}; broadening", .{candidates.len});
         terms = terms_all;
-        query = try renderQuery(arena, terms, window);
+        query = try renderQuery(arena, terms, time_filter);
         log.info("gmail query: {s}", .{query});
         candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
     }
@@ -901,19 +935,50 @@ pub fn find(
         if (words.len > 0 and !sameTerms(words, terms)) {
             log.info("phrases matched nothing; falling back to their keywords", .{});
             terms = words;
-            query = try renderQuery(arena, terms, window);
+            query = try renderQuery(arena, terms, time_filter);
             log.info("gmail query: {s}", .{query});
             candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
         }
     }
 
     log.info("gmail returned {d} candidate(s)", .{candidates.len});
-    if (candidates.len == 0) return .{ .query = query, .matches = &.{} };
 
-    return .{
-        .query = query,
-        .matches = rank(io, arena, ranker, question, candidates),
-    };
+    const matches = if (candidates.len == 0)
+        &[_]Match{}
+    else
+        rank(io, arena, ranker, question, candidates);
+
+    // A date narrows, which is the point, and that cuts both ways: a date the
+    // owner misremembered now hides the message, where before it was
+    // harmlessly ignored as a useless search term. Seen immediately -- asked
+    // for mail "from the 24th of September", the message had actually arrived
+    // on the 21st, so the filter excluded the only thing worth finding.
+    //
+    // The date is the first thing to doubt, because it is the one fact
+    // supplied from memory while the words came from the message itself. The
+    // test is whether the *ranker* found anything, not whether the search
+    // did: six irrelevant messages inside the window is the same failure as
+    // none, and only the ranker can tell the difference.
+    const dated = !std.mem.startsWith(u8, time_filter, "newer_than:");
+    if (dated and !anyConfident(matches)) {
+        const wide = try std.fmt.allocPrint(arena, "newer_than:{d}d", .{window});
+        log.info("nothing convincing in that date range; retrying without the date", .{});
+        const wide_query = try renderQuery(arena, terms, wide);
+        log.info("gmail query: {s}", .{wide_query});
+        const wider = try collect(arena, session, try arena.dupeZ(u8, wide_query), terms);
+        if (wider.len > 0) {
+            const retried = rank(io, arena, ranker, question, wider);
+            // Only keep it if dropping the date actually helped. Otherwise
+            // the dated answer was the more honest one.
+            if (anyConfident(retried)) {
+                log.info("found {d} outside the requested date range", .{retried.len});
+                return .{ .query = wide_query, .matches = retried };
+            }
+        }
+    }
+
+    if (candidates.len == 0) return .{ .query = query, .matches = &.{} };
+    return .{ .query = query, .matches = matches };
 }
 
 fn sameTerms(a: []const []const u8, b: []const []const u8) bool {
@@ -1098,7 +1163,7 @@ test "the rendered query is canonical whatever the model did" {
     const terms = try cleanTerms(arena, try parseTerms(arena, "influx db OR influxdb"));
     try std.testing.expectEqualStrings(
         "newer_than:365d (\"influx db\" OR influxdb) -category:promotions",
-        try renderQuery(arena, terms, 365),
+        try renderQuery(arena, terms, "newer_than:365d"),
     );
 }
 
@@ -1163,7 +1228,7 @@ test "no term reaches the query carrying a quote" {
         try std.testing.expect(std.mem.indexOfScalar(u8, inner, '"') == null);
     }
 
-    const query = try renderQuery(arena, terms, 365);
+    const query = try renderQuery(arena, terms, "newer_than:365d");
     var quotes: usize = 0;
     for (query) |ch| {
         if (ch == '"') quotes += 1;

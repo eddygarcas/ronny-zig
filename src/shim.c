@@ -32,6 +32,23 @@
  * hours?" cannot be answered from std alone. libc already knows, via TZ and
  * /etc/localtime, and asking it is one line.
  */
+/* Today's date in local time, as year/month/day.
+ *
+ * Same reason as ronny_local_minutes: Zig's standard library has no timezone
+ * database, and "yesterday" is a question about the owner's calendar, not
+ * UTC's. libc already knows, via TZ and /etc/localtime. */
+void ronny_today(int *year, int *month, int *day) {
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) == NULL) {
+        *year = 0; *month = 1; *day = 1;
+        return;
+    }
+    *year = local.tm_year + 1900;
+    *month = local.tm_mon + 1;
+    *day = local.tm_mday;
+}
+
 int ronny_local_minutes(void) {
     time_t now = time(NULL);
     struct tm local;

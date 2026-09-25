@@ -31,6 +31,7 @@ const summarize = @import("summarize.zig");
 const ollama = @import("ollama.zig");
 const findmail = @import("findmail.zig");
 const rerank = @import("rerank.zig");
+const dates = @import("dates.zig");
 const attachments = @import("attachments.zig");
 const contacts = @import("contacts.zig");
 const settings = @import("settings.zig");
@@ -359,6 +360,7 @@ test {
     _ = ollama;
     _ = findmail;
     _ = rerank;
+    _ = dates;
     _ = attachments;
     _ = contacts;
     _ = settings;

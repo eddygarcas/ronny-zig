@@ -279,6 +279,7 @@ you knowing their address. `[days]` defaults to the look-back in `/settings`.
 | "any mail from acme.com this week?" | `/search <who> [days]` | lists several messages from one sender: dates and subjects, no bodies |
 | "what came in this morning?" | `/recent [days]` | lists what arrived lately whoever sent it. Defaults to today |
 | "find the email about the pricing discussion" | `/find <topic>` | searches by what a message was *about*, with no sender named |
+| "find the invoice from the 24th of September" | — | a date in the request becomes a real date filter, not a search term |
 | "show me the last email from anna" | `/read [who] [days]` | the full body of one message. The sender is optional |
 | "summarise it" | `/summarize [who] [days]` | the same message, summarised by the local model |
 

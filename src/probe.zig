@@ -263,7 +263,7 @@ pub fn main(init: std.process.Init) !void {
     // looks like "no such email" and is not.
     _ = session.examine(.all_mail) catch {};
     const terms = findmail.buildTerms(init.io, arena, "http://127.0.0.1:11434", "qwen2.5", question) catch &[_][]const u8{};
-    const query = findmail.renderQuery(arena, terms, 365) catch "";
+    const query = findmail.renderQuery(arena, terms, "newer_than:365d") catch "";
     std.debug.print("  query: {s}\n", .{query});
 
     const candidates = findmail.collect(arena, &session, try arena.dupeZ(u8, query), terms) catch &[_]findmail.Candidate{};
