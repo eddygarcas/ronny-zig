@@ -87,6 +87,27 @@ Everything account-specific is in `.env` (gitignored, copy from
 `.env.example`) and `config/senders.yaml`. No addresses, tokens or paths are
 baked into the code. Nothing here should ever be hardcoded into source.
 
+## Building it
+
+**Always build with both flags.** Not a preference — a plain `zig build`
+relinks against the distro's CPU-only whisper in `/usr/lib`, which loads
+fine, transcribes fine, and is ~150x slower:
+
+```
+zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
+```
+
+This has regressed twice, the second time from routine rebuilds during an
+unrelated feature. Two ways to tell which one you have:
+
+```
+readelf -d zig-out/bin/ronny | grep RUNPATH     # must name whisper-cuda/lib
+journalctl -u ronny-bot | grep "whisper backend" # must say CUDA0, not CPU
+```
+
+Ronny logs a warning naming this command when it starts on CPU, so the
+journal is the quickest check after a deploy.
+
 ## Managing it
 
 ```
@@ -94,9 +115,8 @@ systemctl status|restart ronny-watch ronny-bot ronny-watchdog
 journalctl -u ronny-watch -u ronny-bot -f
 ```
 
-Rebuilds need the whisper prefix flag or voice silently regresses — see
-`README.md`. No firewall rule is needed; Ronny only makes outbound
-connections.
+Deploying is a rebuild plus `sudo systemctl restart ronny-bot ronny-watch`.
+No firewall rule is needed; Ronny only makes outbound connections.
 
 ## Known limitations
 

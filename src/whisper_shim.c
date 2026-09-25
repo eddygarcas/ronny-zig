@@ -31,6 +31,43 @@ int ronny_whisper_load(const char *model_path) {
     return g_ctx == NULL ? -1 : 0;
 }
 
+/* Names the fastest backend ggml actually registered, e.g. "CUDA0" or "CPU".
+ *
+ * Exists because the difference is invisible until you measure it: a build
+ * without -Dwhisper-prefix links the distro's CPU-only whisper, loads fine,
+ * transcribes fine, and is ~150x slower. That regression shipped twice --
+ * once when the CUDA build was first set up, and once when a routine
+ * `zig build` silently relinked over it. whisper.cpp prints the backend to
+ * its own log, which is not somewhere a service's own warnings are looked
+ * for, so Ronny reports it itself. */
+int ronny_whisper_backend(char *out, int max_out) {
+    if (out == NULL || max_out <= 0) return -1;
+    out[0] = '\0';
+
+    /* A GPU device, if any, otherwise the last device seen. Device 0 is not
+     * reliably the accelerator. */
+    const char *best = NULL;
+    size_t count = ggml_backend_dev_count();
+    for (size_t i = 0; i < count; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev == NULL) continue;
+        const char *name = ggml_backend_dev_name(dev);
+        if (name == NULL) continue;
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            best = name;
+            break;
+        }
+        if (best == NULL) best = name;
+    }
+    if (best == NULL) return -1;
+
+    size_t len = strlen(best);
+    if (len >= (size_t)max_out) len = (size_t)max_out - 1;
+    memcpy(out, best, len);
+    out[len] = '\0';
+    return (int)len;
+}
+
 void ronny_whisper_free(void) {
     if (g_ctx != NULL) {
         whisper_free(g_ctx);

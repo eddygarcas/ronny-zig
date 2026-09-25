@@ -22,6 +22,7 @@ pub const Error = error{ LoadFailed, DecodeFailed, TranscribeFailed };
 
 extern fn ronny_whisper_load(model_path: [*:0]const u8) c_int;
 extern fn ronny_whisper_free() void;
+extern fn ronny_whisper_backend(out: [*]u8, max_out: c_int) c_int;
 extern fn ronny_whisper_transcribe(
     samples: [*]const f32,
     n_samples: c_int,
@@ -42,6 +43,23 @@ pub fn load(model_path: [:0]const u8) Error!void {
     if (ronny_whisper_load(model_path.ptr) != 0) {
         log.err("could not load the whisper model at {s}", .{model_path});
         return Error.LoadFailed;
+    }
+
+    // Say which backend is live, loudly if it is the slow one. A CPU-linked
+    // build loads and transcribes perfectly well, just ~150x slower, so the
+    // only symptom is "voice feels sluggish" -- which took a log dig to
+    // diagnose twice. The warning is phrased so the fix is in the message.
+    var backend_buffer: [32]u8 = undefined;
+    const written = ronny_whisper_backend(&backend_buffer, backend_buffer.len);
+    const backend = if (written > 0) backend_buffer[0..@intCast(written)] else "unknown";
+    if (written > 0 and std.mem.startsWith(u8, backend, "CPU")) {
+        log.warn(
+            "whisper is running on {s}, not the GPU -- transcription will be very slow. " ++
+                "Rebuild with: zig build -Doptimize=ReleaseSafe -Dwhisper-prefix=\"$HOME/.local/opt/whisper-cuda\"",
+            .{backend},
+        );
+    } else {
+        log.info("whisper backend: {s}", .{backend});
     }
     log.info("whisper model loaded from {s}", .{model_path});
 }
