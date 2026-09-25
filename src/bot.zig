@@ -37,6 +37,7 @@ const mailer = @import("mailer.zig");
 const attachments_mod = @import("attachments.zig");
 const contacts_mod = @import("contacts.zig");
 const settings_mod = @import("settings.zig");
+const speech_mod = @import("speech.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -81,10 +82,11 @@ pub const HELP_TEXT =
     \\/cancel - discard the drafted reply
     \\/pause - stop notifications temporarily
     \\/resume - resume notifications
-    \\/settings - show my settings (quiet hours, default look-back)
+    \\/settings - show my settings (quiet hours, default look-back, summaries as text or voice)
     \\
     \\Settings change in plain language too: "don't notify me before 8am",
-    \\"no notifications between 10pm and 7am", "look back 30 days by default".
+    \\"no notifications between 10pm and 7am", "look back 30 days by default",
+    \\"send summaries as voice messages", "summaries in Spanish".
     \\Spoken out loud, I read the new value back and wait for a typed yes.
     \\
     \\When a reply is drafted, just answer 'yes' to send or 'no' to discard.
@@ -127,6 +129,17 @@ pub const Config = struct {
     /// Spoken yes/no never confirms a send by default: a misheard word would
     /// send mail the owner did not approve.
     voice_can_confirm_send: bool = false,
+
+    /// Text-to-speech for summaries, when piper is configured. Null means
+    /// the "summaries: voice" setting quietly delivers text.
+    speech: ?speech_mod.Config = null,
+};
+
+/// A reply that should go out as audio: the caption stays text, the body is
+/// spoken. Set by the summarising actions for the duration of one turn.
+const SpokenReply = struct {
+    caption: []const u8,
+    body: []const u8,
 };
 
 /// The last message Ronny actually fetched and showed. A reply may only ever
@@ -229,6 +242,9 @@ pub const Bot = struct {
     staged: ?Staged = null,
     composing: ?Composing = null,
     pending_setting: ?PendingSetting = null,
+    /// Side channel from a summarising action to the send in handleText.
+    /// Arena-owned by the turn that set it; cleared at the start of each.
+    spoken_reply: ?SpokenReply = null,
 
     history: std.ArrayList(Turn) = .empty,
     vocabulary: []const []const u8 = &.{},
@@ -531,13 +547,47 @@ pub const Bot = struct {
         // which the bot looks dead. Say something first.
         self.client.sendTyping();
 
+        self.spoken_reply = null;
         const reply = if (text[0] == '/')
             try self.handleCommand(arena, text)
         else
             try self.handleNaturalLanguage(arena, text, spoken);
 
+        // History records the text either way: "reply to it" after a voice
+        // summary must know what was said, and the model reads history.
+        if (self.spoken_reply) |voice| {
+            self.spoken_reply = null;
+            if (self.sendSpoken(arena, voice)) return self.record(text, reply);
+        }
         try self.client.sendMessage(reply);
         try self.record(text, reply);
+    }
+
+    /// Speaks and sends `voice`, or returns false so the caller falls back
+    /// to text. Never an error: a summary the owner cannot hear is still one
+    /// they can read.
+    fn sendSpoken(self: *Bot, arena: std.mem.Allocator, voice: SpokenReply) bool {
+        const tts = self.cfg.speech orelse {
+            log.warn("summaries are set to voice but PIPER_BIN is not configured; sending text", .{});
+            return false;
+        };
+        const language = self.settings.reload().language;
+        const audio = speech_mod.synthesize(self.cfg.io, arena, tts, language, voice.body) catch |err| {
+            log.warn("could not speak the summary ({s}); sending text", .{@errorName(err)});
+            return false;
+        };
+        self.client.sendVoice(arena, audio, voice.caption) catch |err| {
+            log.warn("voice message not sent ({s}); sending text", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    /// Marks the reply being built as one to speak, when the owner has asked
+    /// for that. The caller still returns the text form.
+    fn offerSpoken(self: *Bot, caption: []const u8, body: []const u8) void {
+        if (self.settings.reload().summaries != .voice) return;
+        self.spoken_reply = .{ .caption = caption, .body = body };
     }
 
     fn handleVoice(self: *Bot, arena: std.mem.Allocator, chat_id: []const u8, voice: telegram.Voice) !void {
@@ -931,6 +981,11 @@ pub const Bot = struct {
             try out.writer.writeAll("\nQuiet hours: off");
         }
         try out.writer.print("\nDefault look-back: {d} days", .{current.default_days});
+        try out.writer.print("\nSummaries: {s}", .{current.summaries.label()});
+        if (current.summaries == .voice and self.cfg.speech == null) {
+            try out.writer.writeAll(" -- but PIPER_BIN isn't set in .env, so you get text until it is");
+        }
+        try out.writer.print("\nLanguage: {s}", .{current.language.name()});
         try out.writer.print("\nVoice can confirm send: {s} (set in .env)", .{
             if (self.cfg.voice_can_confirm_send) "yes" else "no",
         });
@@ -950,7 +1005,7 @@ pub const Bot = struct {
             // Refusing beats guessing here: a wrong quiet window shows up as
             // no notifications, which is indistinguishable from working.
             log.info("no settings change found in: {s}", .{text});
-            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\" or \"look back 30 days by default\" -- /settings shows what I have now.";
+            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\", \"look back 30 days by default\", \"send summaries as voice messages\" or \"summaries in Spanish\" -- /settings shows what I have now.";
         };
 
         // A typed change is unambiguous and applies immediately. A *spoken*
@@ -998,6 +1053,15 @@ pub const Bot = struct {
                 "That sets the default look-back to {d} day(s).",
                 .{days},
             ),
+            .summaries => |delivery| switch (delivery) {
+                .voice => "That switches summaries to voice messages.",
+                .text => "That switches summaries back to text.",
+            },
+            .language => |language| try std.fmt.allocPrint(
+                arena,
+                "That switches summaries to {s}.",
+                .{language.name()},
+            ),
         };
     }
 
@@ -1014,6 +1078,8 @@ pub const Bot = struct {
                 current.quiet_to = window.to;
             },
             .default_days => |days| current.default_days = days,
+            .summaries => |delivery| current.summaries = delivery,
+            .language => |language| current.language = language,
         }
 
         self.settings.save(current) catch |err| {
@@ -1037,6 +1103,20 @@ pub const Bot = struct {
                 arena,
                 "Default look-back set to {d} day(s).",
                 .{days},
+            ),
+            .summaries => |delivery| switch (delivery) {
+                // Saved either way: once piper is configured and the bot
+                // restarted, the choice is already made.
+                .voice => if (self.cfg.speech != null)
+                    "Summaries will come as voice messages from now on -- new mail from the watcher and any you ask me for."
+                else
+                    "Saved -- but voice summaries need PIPER_BIN in .env and a restart, so you'll get text until then.",
+                .text => "Summaries back to text.",
+            },
+            .language => |language| try std.fmt.allocPrint(
+                arena,
+                "Summaries in {s} from now on.",
+                .{language.name()},
             ),
         };
     }
@@ -1473,6 +1553,7 @@ pub const Bot = struct {
             arena,
             self.cfg.ollama_url,
             self.cfg.ollama_model,
+            self.settings.reload().language,
             original.from,
             original.subject,
             original.body,
@@ -1483,11 +1564,9 @@ pub const Bot = struct {
                 .{ original.subject, original.date, original.body },
             ));
         };
-        return telegram.truncate(try std.fmt.allocPrint(
-            arena,
-            "{s} ({s})\n\n{s}",
-            .{ original.subject, original.date, summary },
-        ));
+        const caption = try std.fmt.allocPrint(arena, "{s} ({s})", .{ original.subject, original.date });
+        self.offerSpoken(caption, summary);
+        return telegram.truncate(try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ caption, summary }));
     }
 
     fn doRead(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
@@ -1533,6 +1612,7 @@ pub const Bot = struct {
             arena,
             self.cfg.ollama_url,
             self.cfg.ollama_model,
+            self.settings.reload().language,
             latest.from,
             latest.subject,
             latest.body,
@@ -1543,11 +1623,9 @@ pub const Bot = struct {
                 .{ latest.subject, latest.date, latest.body },
             ));
         };
-        return telegram.truncate(try std.fmt.allocPrint(
-            arena,
-            "{s} ({s})\n\n{s}",
-            .{ latest.subject, latest.date, summary },
-        ));
+        const caption = try std.fmt.allocPrint(arena, "{s} ({s})", .{ latest.subject, latest.date });
+        self.offerSpoken(caption, summary);
+        return telegram.truncate(try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ caption, summary }));
     }
 
     fn doFind(self: *Bot, arena: std.mem.Allocator, question: []const u8) ![]const u8 {

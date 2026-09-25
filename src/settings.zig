@@ -33,6 +33,16 @@ pub const Settings = struct {
     /// How far back the mail commands look when the request doesn't say.
     default_days: u16 = 14,
 
+    /// Whether a summary arrives as text or as a voice message. Text unless
+    /// asked; voice also needs piper configured in .env, and falls back to
+    /// text when it is not, so choosing it can never lose a summary.
+    summaries: Delivery = .text,
+
+    /// The language summaries are written -- and, when spoken, read -- in.
+    /// One setting for both on purpose: a Spanish summary read by an
+    /// English voice is the failure this prevents.
+    language: Language = .en,
+
     pub fn quietEnabled(self: Settings) bool {
         return self.quiet_from != OFF and self.quiet_to != OFF;
     }
@@ -55,6 +65,33 @@ pub const Settings = struct {
         const minutes = ronny_local_minutes();
         if (minutes < 0) return false; // can't tell the time: never suppress
         return self.isQuietAt(@intCast(minutes));
+    }
+};
+
+pub const Delivery = enum {
+    text,
+    voice,
+
+    pub fn label(self: Delivery) []const u8 {
+        return switch (self) {
+            .text => "text",
+            .voice => "voice messages",
+        };
+    }
+};
+
+/// The languages the owner speaks. Closed on purpose: each needs a piper
+/// voice on disk and a name the summariser is told to write in, so a new
+/// one is a deployment step, not a chat message.
+pub const Language = enum {
+    en,
+    es,
+
+    pub fn name(self: Language) []const u8 {
+        return switch (self) {
+            .en => "English",
+            .es => "Spanish",
+        };
     }
 };
 
@@ -187,6 +224,8 @@ pub const Change = union(enum) {
     quiet_hours: struct { from: i16, to: i16 },
     quiet_off,
     default_days: u16,
+    summaries: Delivery,
+    language: Language,
 };
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -292,6 +331,75 @@ fn scanDayCount(text: []const u8) ?u16 {
 
 const Role = enum { start, end };
 
+const VOICE_WORDS = [_][]const u8{ "voice", "audio", "aloud", "out loud", "spoken", "speak", "say it", "read it to me", "read them to me" };
+const TEXT_WORDS = [_][]const u8{ "text", "written", "typed", "writing", "in writing" };
+
+/// Phrases that, in front of a modality word, mean the *other* one is
+/// wanted: "instead of text", "rather than voice", "stop the audio",
+/// "from voice to text".
+const REJECTING = [_][]const u8{ "instead of", "rather than", "not ", "no ", "stop", "don't", "dont", "without", "off", "disable", "from", "cancel", "less" };
+
+const Mention = struct { at: usize, rejected: bool };
+
+/// The last place one of `words` appears, and whether the words just before
+/// it reject it. Last rather than first because "answer in voice, not text"
+/// and "text, not voice" both put the operative word at the end of a clause.
+fn scanModality(text: []const u8, words: []const []const u8) ?Mention {
+    var best: ?Mention = null;
+    for (words) |word| {
+        var from: usize = 0;
+        while (std.ascii.indexOfIgnoreCasePos(text, from, word)) |at| : (from = at + word.len) {
+            // A whole word: "context" contains "text", "textbook" too.
+            if (at > 0 and std.ascii.isAlphanumeric(text[at - 1])) continue;
+            const after = at + word.len;
+            if (after < text.len and std.ascii.isAlphanumeric(text[after]) and
+                !std.mem.eql(u8, word, "speak") and !std.mem.eql(u8, word, "voice") and !std.mem.eql(u8, word, "text"))
+            {
+                continue;
+            }
+            const window_start = at -| 24;
+            const rejected = containsAny(text[window_start..at], &REJECTING);
+            if (best == null or at >= best.?.at) best = .{ .at = at, .rejected = rejected };
+        }
+    }
+    return best;
+}
+
+/// "answer by voice", "summaries as text", "voice instead of text" -> which
+/// way summaries should arrive, or null when it does not say.
+fn scanDelivery(text: []const u8) ?Delivery {
+    const voice = scanModality(text, &VOICE_WORDS);
+    const written = scanModality(text, &TEXT_WORDS);
+
+    if (voice == null and written == null) return null;
+
+    // "read them to me" style phrasing carries the summary word implicitly,
+    // but a bare "text" could be "text me" -- require the request to be
+    // about summaries, answers or replies when only the text side appears.
+    if (voice == null) {
+        if (!containsAny(text, &.{ "summar", "answer", "repl", "respond", "message", "notif", "mode", "back to" })) return null;
+        return if (written.?.rejected) .voice else .text;
+    }
+    if (written == null) return if (voice.?.rejected) .text else .voice;
+
+    // Both named: the one that is not rejected wins; if neither or both are,
+    // the one named last does. "from text to voice" rejects text via "from".
+    if (voice.?.rejected != written.?.rejected) return if (voice.?.rejected) .text else .voice;
+    return if (voice.?.at > written.?.at) .voice else .text;
+}
+
+const SPANISH_WORDS = [_][]const u8{ "spanish", "español", "espanol", "castellano", "castilian" };
+const ENGLISH_WORDS = [_][]const u8{ "english", "inglés", "ingles" };
+
+/// "summaries in Spanish", "speak English" -> the language, or null. Both
+/// named is refused rather than guessed.
+fn scanLanguage(text: []const u8) ?Language {
+    const spanish = containsAny(text, &SPANISH_WORDS);
+    const english = containsAny(text, &ENGLISH_WORDS);
+    if (spanish == english) return null;
+    return if (spanish) .es else .en;
+}
+
 /// Which end of the window a time is, judged by the last preposition in front
 /// of it. "before 8am" names the end; "after 10pm" names the start.
 fn roleOf(prefix: []const u8) ?Role {
@@ -322,6 +430,12 @@ fn roleOf(prefix: []const u8) ?Role {
 /// Reads a settings change out of what the owner actually wrote, or returns
 /// null so the caller can say it did not understand rather than guess.
 pub fn parseChange(text: []const u8, current: Settings) ?Change {
+    // Delivery and language first: neither mentions a time or a day count,
+    // and "no more voice summaries" must not be read as quiet hours off
+    // just because it says "no".
+    if (scanDelivery(text)) |delivery| return .{ .summaries = delivery };
+    if (scanLanguage(text)) |language| return .{ .language = language };
+
     // Switching quiet hours off comes first: "notify me at any time" contains
     // a time word but is the opposite of setting one.
     // "quite" is accepted alongside "quiet": it is the transposition everyone
@@ -363,6 +477,67 @@ pub fn parseChange(text: []const u8, current: Settings) ?Change {
             .to = if (current.quiet_to == OFF) DEFAULT_QUIET_TO else current.quiet_to,
         } },
     };
+}
+
+test "the delivery setting is read from either side of the sentence" {
+    const cases = [_]struct { text: []const u8, want: Delivery }{
+        .{ .text = "answer me by voice", .want = .voice },
+        .{ .text = "send summaries as voice messages", .want = .voice },
+        .{ .text = "read summaries out loud", .want = .voice },
+        .{ .text = "voice instead of text", .want = .voice },
+        .{ .text = "answer in voice, not text", .want = .voice },
+        .{ .text = "switch from text to voice", .want = .voice },
+        .{ .text = "summaries as text", .want = .text },
+        .{ .text = "text rather than voice", .want = .text },
+        .{ .text = "stop the voice messages", .want = .text },
+        .{ .text = "no more voice summaries", .want = .text },
+        .{ .text = "turn off voice", .want = .text },
+        .{ .text = "go back to text summaries", .want = .text },
+        .{ .text = "switch from voice to text", .want = .text },
+    };
+    for (cases) |case| {
+        const change = parseChange(case.text, .{}) orelse {
+            std.debug.print("no change parsed from: {s}\n", .{case.text});
+            return error.TestUnexpectedResult;
+        };
+        if (change != .summaries or change.summaries != case.want) {
+            std.debug.print("wrong change for: {s}\n", .{case.text});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a bare 'text' is not a delivery change, and quiet hours still parse" {
+    // "text me" is about how to reach the owner, not about summaries.
+    try std.testing.expect(parseChange("text me", .{}) == null);
+    // The quiet-hours parser still gets its turn.
+    const change = parseChange("no notifications between 10pm and 7am", .{}).?;
+    try std.testing.expect(change == .quiet_hours);
+    // A day count still wins over nothing.
+    try std.testing.expect(parseChange("look back 30 days", .{}).? == .default_days);
+}
+
+test "the language is read when one is named, refused when both are" {
+    try std.testing.expect(parseChange("summaries in spanish", .{}).?.language == .es);
+    try std.testing.expect(parseChange("resúmenes en español", .{}).?.language == .es);
+    try std.testing.expect(parseChange("back to english", .{}).?.language == .en);
+    try std.testing.expect(parseChange("spanish or english, whichever", .{}) == null);
+}
+
+test "delivery and language survive a round trip through the store's JSON" {
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    const saved: Settings = .{ .summaries = .voice, .language = .es };
+    try std.json.Stringify.value(saved, .{}, &buffer.writer);
+    const parsed = try std.json.parseFromSlice(Settings, std.testing.allocator, buffer.writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.summaries == .voice);
+    try std.testing.expect(parsed.value.language == .es);
+    // A file written before these existed still reads, with the defaults.
+    const old = try std.json.parseFromSlice(Settings, std.testing.allocator, "{\"default_days\":7}", .{ .ignore_unknown_fields = true });
+    defer old.deinit();
+    try std.testing.expect(old.value.summaries == .text);
+    try std.testing.expect(old.value.language == .en);
 }
 
 test "quiet hours wrap past midnight, which is the normal case" {

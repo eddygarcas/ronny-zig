@@ -110,6 +110,7 @@ Everything still works; Jev is just better at refusing to guess.
 | **Zig 0.16** | builds it | 0.15 will not work — the standard library moved a lot |
 | **libetpan** | IMAP, MIME, SMTP | `pacman -S libetpan`, `apt install libetpan-dev`, `brew install libetpan` |
 | **whisper.cpp** | voice notes | optional; skip it and Ronny is text-only |
+| **piper** | summaries read aloud | optional; `pip install piper-tts` in a venv, see [Voice summaries](#voice-summaries) |
 | **Ollama** | everything that reads mail | a local model — see below for which |
 | **A Gmail account with 2-Step Verification** | the mailbox | app passwords require it |
 | **A Telegram account** | the control channel | one bot per mailbox, never shared |
@@ -247,6 +248,10 @@ than restated — a summary of two lines is not shorter than the two lines. If
 the model is unreachable the notification still arrives, without the summary:
 a summary improves a notification, it is never a precondition for one.
 
+Ask for it and the same notification arrives as a **voice message**: the two
+header lines stay as the caption, so the chat is still scannable, and the
+summary is the audio. See [Voice summaries](#voice-summaries).
+
 ## User guide
 
 Everything Ronny can do is one of the actions below — that list is closed on
@@ -320,11 +325,14 @@ Two rules apply to voice when writing mail:
 
 | Say | Or type | What happens |
 |---|---|---|
-| "what are your settings?" | `/settings` | quiet hours, default look-back, and the two `.env`-only settings |
+| "what are your settings?" | `/settings` | quiet hours, default look-back, how summaries arrive, and the two `.env`-only settings |
 | "don't notify me before 8am" | — | sets quiet hours |
 | "no notifications between 10pm and 7am" | — | sets both ends at once |
 | "turn off quiet hours" | — | back to notifying whenever mail arrives |
 | "look back 30 days by default" | — | changes the default `[days]` for the mail commands |
+| "send summaries as voice messages" | — | every summary, from the watcher or on request, arrives as audio |
+| "back to text summaries" | — | and back |
+| "summaries in Spanish" | — | the language summaries are written in, and read in |
 
 **Quiet hours hold mail, they do not drop it.** During the window the watcher
 stops scanning, so the read position stays where it is and everything that
@@ -439,6 +447,40 @@ Check it took with `ldd zig-out/bin/ronny | grep ggml`: every line should
 point at your prefix, none at `/usr/lib`. A plain `zig build` reverts to the
 system package, which is a large and silent voice regression.
 
+## Voice summaries
+
+Summaries are the one thing Ronny writes that already reads like speech —
+three sentences of prose, no subject lines or numbered lists — so they are
+the one thing it will read aloud. Say *"send summaries as voice messages"*
+and from then on a new-mail notification, *"summarise it"* and `/summarize`
+all arrive as a Telegram voice message. The header (sender and subject, or
+subject and date) stays as the text caption, so the chat is still scannable
+without playing anything; the summary is the audio. *"Back to text
+summaries"* reverses it. The choice lives in the settings file with quiet
+hours, so it applies to the watcher's next notification without a restart.
+
+Drafts, approvals and everything else stay text. The send gate rests on a
+typed yes, and a spoken "type yes to send it" would invite exactly the
+spoken yes it then refuses.
+
+The voice is [piper](https://github.com/OHF-Voice/piper1-gpl), a local
+text-to-speech engine: a summary is derived from a message body, so it does
+not leave the machine to be spoken. It runs on CPU in about a second and a
+half per summary, so the GPU stays with whisper and Ollama. Install it into
+a venv and download one voice per language you speak — the commands and the
+`.env` lines are in [`.env.example`](.env.example); voice samples are at
+[rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples).
+
+**Language is a setting, not a guess.** *"Summaries in Spanish"* tells the
+summariser to write in Spanish and picks the Spanish voice; the two are one
+setting on purpose, because a Spanish summary read by an English voice is
+the failure this prevents. English is the default.
+
+**It fails to text, always.** Piper missing, the venv broken, ffmpeg
+failing, Telegram refusing the upload — each one logs a warning and sends
+the summary as text. Setting "voice" before `PIPER_BIN` is configured is
+saved and takes effect once it is; `/settings` says so in the meantime.
+
 ## Running a second instance
 
 Point it at a different mailbox with its own `.env` and `config/senders.yaml`.
@@ -460,6 +502,7 @@ and what must not.
 | `src/headers.zig` | RFC 5322 header reading; where a recipient comes from |
 | `src/spam.zig` | Header checks, then a local judgment call. Fails open |
 | `src/settings.zig` | The knobs, and reading a change out of plain words without a model |
+| `src/speech.zig` | Summaries read aloud: piper, then ffmpeg to Opus, then a voice message |
 | `src/watchdog.zig` | Journal tailing, incident detection, diagnosis |
 | `src/shim.c` | libetpan: IMAP, MIME walking, transfer decoding |
 | `src/smtp_shim.c` | libetpan SMTP, STARTTLS |

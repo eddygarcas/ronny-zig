@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ollama = @import("ollama.zig");
+const settings = @import("settings.zig");
 
 const log = std.log.scoped(.summarize);
 
@@ -36,6 +37,7 @@ pub fn summarize(
     gpa: std.mem.Allocator,
     ollama_url: []const u8,
     model: []const u8,
+    language: settings.Language,
     sender: []const u8,
     subject: []const u8,
     body: []const u8,
@@ -44,14 +46,17 @@ pub fn summarize(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // The language is named explicitly even for English: a local model
+    // otherwise tends to answer in the email's language, and a summary the
+    // owner may hear read by an English voice must be in English.
     const prompt = std.fmt.allocPrint(arena,
-        \\Summarize this email in at most 3 short sentences. State what it is about and anything the recipient is being asked to do. Plain text only, no preamble, no markdown.
+        \\Summarize this email in at most 3 short sentences, written in {s}. State what it is about and anything the recipient is being asked to do. Plain text only, no preamble, no markdown.
         \\
         \\From: {s}
         \\Subject: {s}
         \\
         \\{s}
-    , .{ sender, subject, body[0..@min(body.len, 4000)] }) catch return Error.Unavailable;
+    , .{ language.name(), sender, subject, body[0..@min(body.len, 4000)] }) catch return Error.Unavailable;
 
     return generate(io, gpa, ollama_url, model, prompt);
 }
@@ -107,6 +112,7 @@ pub fn forNotification(
     gpa: std.mem.Allocator,
     ollama_url: []const u8,
     model: []const u8,
+    language: settings.Language,
     sender: []const u8,
     subject: []const u8,
     body: []const u8,
@@ -118,7 +124,7 @@ pub fn forNotification(
         return tidy(gpa, trimmed) catch null;
     }
 
-    return summarize(io, gpa, ollama_url, model, sender, subject, trimmed) catch |err| {
+    return summarize(io, gpa, ollama_url, model, language, sender, subject, trimmed) catch |err| {
         log.warn("no summary for mail from {s}: {s}", .{ sender, @errorName(err) });
         return null;
     };

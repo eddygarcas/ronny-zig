@@ -146,6 +146,21 @@ trip to discover:
   against the API it was written for.
 - **`CMAKE_CUDA_ARCHITECTURES`** set to just the card you have.
 
+## Host-specific: piper for voice summaries
+
+Text-to-speech is not linked at all. `src/speech.zig` spawns the `piper`
+command-line tool, which in the maintained
+[piper1-gpl](https://github.com/OHF-Voice/piper1-gpl) is a Python entry
+point over onnxruntime — there is no C library to shim, and a fresh process
+costs about 1.5 s per summary on this CPU, next to the tens of seconds the
+summary itself took. It lives in a venv under `~/.local/opt/piper` beside
+`whisper-cuda`, with voices in `~/.local/opt/piper/voices`; `.env` points at
+both. Nothing about it is in the build, so a plain rebuild cannot regress it
+the way the whisper prefix can. The failure to watch for is different: the
+venv's Python being upgraded underneath it, which shows up in the journal as
+`could not speak the summary (SynthesisFailed); sending text` and costs the
+owner nothing but the voice.
+
 `addWhisperPaths` in `build.zig` sets an **rpath** as well as a library path.
 Without it the binary links fine and then fails to start under systemd, which
 has no `LD_LIBRARY_PATH` — a failure that appears only in production.

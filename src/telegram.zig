@@ -218,6 +218,46 @@ pub const Client = struct {
         log.info("sent {s} ({d} bytes) to the owner", .{ filename, bytes.len });
     }
 
+    /// Telegram caps a voice caption at 1024 characters, unlike a message.
+    pub const MAX_CAPTION_CHARS = 1000;
+
+    /// Sends a voice message: OGG/Opus bytes that Telegram will show as a
+    /// playable bubble, with `caption` as the text beneath it. Used for
+    /// summaries when the owner has asked to hear them.
+    ///
+    /// The caption is what keeps the chat scannable: the sender and subject
+    /// stay readable in the list without playing anything.
+    pub fn sendVoice(
+        self: *Client,
+        arena: std.mem.Allocator,
+        ogg_opus: []const u8,
+        caption: []const u8,
+    ) !void {
+        if (ogg_opus.len > MAX_UPLOAD_BYTES) return Error.FileTooLarge;
+
+        const endpoint = try self.url(arena, "sendVoice");
+        var response = http.postMultipart(self.io, arena, endpoint, &.{
+            .{ .text = .{ .name = "chat_id", .value = self.owner_chat_id } },
+            .{ .text = .{ .name = "caption", .value = caption[0..@min(caption.len, MAX_CAPTION_CHARS)] } },
+            .{ .file = .{
+                .name = "voice",
+                .filename = "summary.ogg",
+                .content_type = "audio/ogg",
+                .bytes = ogg_opus,
+            } },
+        }) catch return Error.SendFailed;
+        defer response.deinit(arena);
+
+        if (!response.ok()) {
+            log.warn("sendVoice returned {d}: {s}", .{
+                @intFromEnum(response.status),
+                response.body[0..@min(response.body.len, 200)],
+            });
+            return Error.SendFailed;
+        }
+        log.info("sent a voice message ({d} bytes) to the owner", .{ogg_opus.len});
+    }
+
     /// Downloads a voice note. Returns the audio bytes, owned by `arena`.
     pub fn downloadFile(self: *Client, arena: std.mem.Allocator, file_id: []const u8) ![]u8 {
         var payload: std.Io.Writer.Allocating = .init(arena);

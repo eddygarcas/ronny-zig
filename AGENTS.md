@@ -63,6 +63,7 @@ re-read each scan so chat commands take effect without a restart.
 | `src/attachments.zig` | Which attached file the owner meant (local model) |
 | `src/contacts.zig` | Who a new email can go to. Selected, never generated |
 | `src/transcribe.zig` | Voice notes, plus the transcript repair pass |
+| `src/speech.zig` | Summaries read aloud: piper, then ffmpeg to Opus. Fails soft to text |
 | `src/watchdog.zig` | Journal tailing, incident classification, diagnosis |
 | `src/ollama.zig` | The one door to the local model |
 | `src/*.c` | libetpan (IMAP/MIME/SMTP) and whisper.cpp boundaries |

@@ -30,7 +30,13 @@ and update `WATCH_UNIT` / `BOT_UNIT` in `src/watchdog.zig` to match, or the
 watchdog will follow the wrong journal and report the wrong service as hung.
 
 **What it can share:** the Ollama instance, the TypeSafe key, the binary
-itself, and the whisper model file. None of those hold per-account state.
+itself, the whisper model file, and the piper venv and voices. None of those
+hold per-account state.
+
+**Its own settings file.** `RONNY_SETTINGS_FILE` holds what the owner set
+from chat: quiet hours, the default look-back, and whether summaries arrive
+as text or voice and in which language. Two owners sharing one would keep
+switching each other's summaries.
 
 ## First run
 

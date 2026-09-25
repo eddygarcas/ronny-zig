@@ -35,6 +35,7 @@ const dates = @import("dates.zig");
 const attachments = @import("attachments.zig");
 const contacts = @import("contacts.zig");
 const settings = @import("settings.zig");
+const speech = @import("speech.zig");
 const interpret = @import("interpret.zig");
 const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
@@ -56,6 +57,11 @@ const Config = struct {
     ollama_model: []const u8,
     telegram_token: []const u8,
     telegram_chat_id: []const u8,
+    /// Null when piper is not configured: summaries are then text whatever
+    /// the chat setting says.
+    speech: ?speech.Config,
+    /// The watcher re-reads this per notification; the bot writes it.
+    settings: *settings.Store,
 };
 
 fn envOptional(init: std.process.Init, name: []const u8) !?[:0]u8 {
@@ -67,6 +73,25 @@ fn envFlag(init: std.process.Init, name: []const u8) bool {
     const value = init.environ_map.get(name) orelse return false;
     return std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+/// Text-to-speech is optional and needs four things from .env. The binary
+/// being set is what switches it on; the rest default to what a piper venv
+/// laid out next to it looks like, so most installs set only PIPER_BIN.
+fn loadSpeech(init: std.process.Init) !?speech.Config {
+    const arena = init.arena.allocator();
+    const bin = (try envOptional(init, "PIPER_BIN")) orelse return null;
+    const voices_dir = (try envOptional(init, "PIPER_VOICES_DIR")) orelse blk: {
+        // <venv>/bin/piper -> <venv>/voices
+        const venv = std.fs.path.dirname(std.fs.path.dirname(bin) orelse ".") orelse ".";
+        break :blk try std.fmt.allocPrintSentinel(arena, "{s}/voices", .{venv}, 0);
+    };
+    return .{
+        .bin = bin,
+        .voices_dir = voices_dir,
+        .voice_en = (try envOptional(init, "PIPER_VOICE_EN")) orelse try arena.dupeZ(u8, "en_US-lessac-medium"),
+        .voice_es = (try envOptional(init, "PIPER_VOICE_ES")) orelse try arena.dupeZ(u8, "es_ES-davefx-medium"),
+    };
 }
 
 fn envRequired(init: std.process.Init, name: []const u8) ![:0]u8 {
@@ -153,6 +178,7 @@ fn runBot(init: std.process.Init) !void {
         // Off by default: this is the one setting that lets message text
         // leave the machine. See rerank.zig.
         .typesafe_rank_mail = envFlag(init, "TYPESAFE_RANK_MAIL"),
+        .speech = try loadSpeech(init),
     };
 
     var bot = bot_mod.Bot.init(cfg, &controller, &settings_store);
@@ -175,6 +201,9 @@ fn runWatcher(init: std.process.Init) !void {
     const settings_path = (try envOptional(init, "RONNY_SETTINGS_FILE")) orelse
         try arena.dupeZ(u8, "data/settings.json");
 
+    var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
+    var settings_store = settings.Store.init(init.io, arena, settings_path);
+
     const cfg: Config = .{
         .io = init.io,
         .gpa = arena,
@@ -182,10 +211,10 @@ fn runWatcher(init: std.process.Init) !void {
         .ollama_model = (try envOptional(init, "OLLAMA_MODEL")) orelse try arena.dupeZ(u8, "qwen2.5"),
         .telegram_token = try envRequired(init, "TELEGRAM_BOT_TOKEN"),
         .telegram_chat_id = try envRequired(init, "TELEGRAM_OWNER_CHAT_ID"),
+        .speech = try loadSpeech(init),
+        .settings = &settings_store,
     };
-
-    var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
-    var settings_store = settings.Store.init(init.io, arena, settings_path);
+    if (cfg.speech) |tts| log.info("voice summaries available: piper at {s}", .{tts.bin});
     var state = state_mod.State.load(init.io, arena, state_path);
 
     log.info("connecting to {s} as {s}", .{ host, user });
@@ -320,20 +349,25 @@ fn notifyIfWanted(
     // mistaken for the model having cleared it.
     const suffix: []const u8 = if (verdict.checked) "" else " [spam check unavailable]";
 
+    // Re-read here too: the bot writes these, and "summaries as voice" said
+    // in chat should apply to the next mail, not the next restart.
+    const prefs = cfg.settings.reload();
+
     const summary = summarize.forNotification(
-        cfg.io, cfg.gpa, cfg.ollama_url, cfg.ollama_model,
+        cfg.io, cfg.gpa, cfg.ollama_url, cfg.ollama_model, prefs.language,
         sender, subject, message.bodySlice(),
     );
     defer if (summary) |owned| cfg.gpa.free(owned);
 
+    const header = try std.fmt.allocPrint(cfg.gpa, "\u{1F4E7} Ronny: mail from {s}\nSubject: {s}{s}", .{
+        sender, subject, suffix,
+    });
+    defer cfg.gpa.free(header);
+
     const text = if (summary) |body|
-        try std.fmt.allocPrint(cfg.gpa, "\u{1F4E7} Ronny: mail from {s}\nSubject: {s}{s}\n\n{s}", .{
-            sender, subject, suffix, body,
-        })
+        try std.fmt.allocPrint(cfg.gpa, "{s}\n\n{s}", .{ header, body })
     else
-        try std.fmt.allocPrint(cfg.gpa, "\u{1F4E7} Ronny: mail from {s}\nSubject: {s}{s}", .{
-            sender, subject, suffix,
-        });
+        try cfg.gpa.dupe(u8, header);
     defer cfg.gpa.free(text);
 
     var client: telegram.Client = .{
@@ -342,11 +376,51 @@ fn notifyIfWanted(
         .token = cfg.telegram_token,
         .owner_chat_id = cfg.telegram_chat_id,
     };
+
+    // A voice summary is the header as caption and the summary as audio.
+    // Anything going wrong on that path -- piper missing, ffmpeg failing,
+    // the upload refused -- sends the text instead: the notification is
+    // the service, the voice is a nicety on top of it.
+    if (prefs.summaries == .voice and summary != null) {
+        if (cfg.speech) |tts| {
+            if (speakAndSend(cfg, &client, tts, prefs.language, header, summary.?)) {
+                log.info("notified about mail from {s} ({s}) by voice", .{ sender, subject });
+                return;
+            }
+        } else {
+            log.warn("summaries are set to voice but PIPER_BIN is not configured; sending text", .{});
+        }
+    }
+
     try client.sendMessage(telegram.truncate(text));
     log.info("notified about mail from {s} ({s})", .{ sender, subject });
 }
 
+fn speakAndSend(
+    cfg: Config,
+    client: *telegram.Client,
+    tts: speech.Config,
+    language: settings.Language,
+    caption: []const u8,
+    summary: []const u8,
+) bool {
+    var arena_state: std.heap.ArenaAllocator = .init(cfg.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const audio = speech.synthesize(cfg.io, arena, tts, language, summary) catch |err| {
+        log.warn("could not speak the summary ({s}); sending text", .{@errorName(err)});
+        return false;
+    };
+    client.sendVoice(arena, audio, caption) catch |err| {
+        log.warn("voice message not sent ({s}); sending text", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
 test {
+    _ = speech;
     _ = imap;
     _ = state_mod;
     _ = controller_mod;

@@ -2,7 +2,9 @@
 //!
 //! Read-only and Telegram-free on purpose: the Python service is still live,
 //! and a second getUpdates poller on the same token would silently swallow the
-//! owner's real messages.
+//! owner's real messages. The one exception is outbound: with
+//! PROBE_SEND_VOICE=1 the speech check also *sends* its test clip to the
+//! owner, which never touches getUpdates and so cannot conflict.
 
 const std = @import("std");
 const imap = @import("imap.zig");
@@ -12,6 +14,9 @@ const mailer = @import("mailer.zig");
 const intent = @import("intent.zig");
 const contacts = @import("contacts.zig");
 const summarize = @import("summarize.zig");
+const speech = @import("speech.zig");
+const settings = @import("settings.zig");
+const telegram = @import("telegram.zig");
 
 const VOCAB_ENTRY = 96;
 const VOCAB_MAX = 300;
@@ -21,7 +26,47 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const env = init.environ_map;
 
-    // Routing first, because it needs no mailbox and the criteria changing is
+    // Speech first: it needs no mailbox either, and the thing most likely to
+    // be wrong is the machine (venv, voices, ffmpeg), not the code.
+    if (env.get("PIPER_BIN")) |bin| {
+        std.debug.print("=== speech ===\n", .{});
+        const tts: speech.Config = .{
+            .bin = try arena.dupeZ(u8, bin),
+            .voices_dir = try arena.dupeZ(u8, env.get("PIPER_VOICES_DIR") orelse "voices"),
+            .voice_en = try arena.dupeZ(u8, env.get("PIPER_VOICE_EN") orelse "en_US-lessac-medium"),
+            .voice_es = try arena.dupeZ(u8, env.get("PIPER_VOICE_ES") orelse "es_ES-davefx-medium"),
+        };
+        const lines = [_]struct { language: settings.Language, text: []const u8 }{
+            .{ .language = .en, .text = "This is Ronny. Maria from accounting says the quarterly invoice is attached and asks you to approve it by Friday. Details at https://example.com/invoice." },
+            .{ .language = .es, .text = "Soy Ronny. María, de contabilidad, dice que la factura trimestral va adjunta y te pide que la apruebes antes del viernes." },
+        };
+        for (lines) |line| {
+            const started = std.Io.Clock.now(.boot, init.io).nanoseconds;
+            const audio = speech.synthesize(init.io, arena, tts, line.language, line.text) catch |err| {
+                std.debug.print("  FAIL {s}: {s}\n", .{ line.language.name(), @errorName(err) });
+                continue;
+            };
+            const elapsed_ms = @divTrunc(std.Io.Clock.now(.boot, init.io).nanoseconds - started, std.time.ns_per_ms);
+            std.debug.print("  ok   {s}: {d} bytes of ogg/opus in {d}ms\n", .{ line.language.name(), audio.len, elapsed_ms });
+
+            if (env.get("PROBE_SEND_VOICE") != null) {
+                var client: telegram.Client = .{
+                    .io = init.io,
+                    .gpa = arena,
+                    .token = env.get("TELEGRAM_BOT_TOKEN").?,
+                    .owner_chat_id = env.get("TELEGRAM_OWNER_CHAT_ID").?,
+                };
+                client.sendVoice(arena, audio, "Ronny probe: a test voice summary, nothing arrived") catch |err| {
+                    std.debug.print("  FAIL sendVoice: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                std.debug.print("  sent to the owner\n", .{});
+            }
+        }
+        std.debug.print("\n", .{});
+    }
+
+    // Routing next, because it needs no mailbox and the criteria changing is
     // the thing most likely to have broken something already working.
     if (env.get("TYPESAFE_API_KEY")) |key| {
         if (key.len > 0) {
@@ -65,6 +110,13 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "look back 30 days by default", .want = .change_setting },
                 .{ .text = "what are your settings?", .want = .show_settings },
                 .{ .text = "what are my quiet hours?", .want = .show_settings },
+                // Summaries as voice or text, and their language, are
+                // settings -- not a request to summarise something.
+                .{ .text = "send summaries as voice messages", .want = .change_setting },
+                .{ .text = "answer me by voice from now on", .want = .change_setting },
+                .{ .text = "back to text summaries", .want = .change_setting },
+                .{ .text = "summaries in Spanish please", .want = .change_setting },
+                .{ .text = "are summaries voice or text?", .want = .show_settings },
                 // "list of actions" went to list_senders twice in real use --
                 // both are "a list", and only one is about people.
                 .{ .text = "Show me the list of actions please.", .want = .help },
@@ -175,6 +227,7 @@ pub fn main(init: std.process.Init) !void {
                 arena,
                 env.get("OLLAMA_URL") orelse "http://127.0.0.1:11434",
                 env.get("OLLAMA_MODEL") orelse "qwen2.5",
+                .en,
                 envelope.fromSlice(),
                 envelope.subjectSlice(),
                 message.bodySlice(),
