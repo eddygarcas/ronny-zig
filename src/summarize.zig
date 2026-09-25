@@ -56,6 +56,74 @@ pub fn summarize(
     return generate(io, gpa, ollama_url, model, prompt);
 }
 
+/// Below this, a body is already shorter than any summary of it would be, so
+/// the notification carries the text itself instead of asking the model to
+/// restate it. Not a tuned figure -- roughly a phone screen of text -- but it
+/// keeps "Thanks, see you Tuesday" from becoming three sentences of summary,
+/// and saves an Ollama call on the short mail that makes up most of a day.
+pub const SHORT_BODY_CHARS = 300;
+
+/// Collapses the blank-line padding that automated mail is full of.
+///
+/// The verbatim path shows a short body as-is, and a real one looked like
+/// this in Telegram: a line of text, three blank lines, a row of "=", two
+/// more blanks, "OK". Honest, but most of the notification was whitespace.
+/// Runs of blank lines become one, and trailing spaces go; nothing is
+/// removed, so the text still says what the email said.
+///
+/// Caller owns the result.
+fn tidy(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+
+    var blank_run: usize = 0;
+    var wrote_any = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) {
+            blank_run += 1;
+            continue;
+        }
+        if (wrote_any) try out.writer.writeAll(if (blank_run > 0) "\n\n" else "\n");
+        blank_run = 0;
+        try out.writer.writeAll(line);
+        wrote_any = true;
+    }
+    return out.toOwnedSlice();
+}
+
+/// What goes under the sender and subject in a notification: a summary, the
+/// text itself when it is short enough not to need one, or nothing at all.
+///
+/// Returns null rather than an error. A summary improves a notification; it
+/// is never a precondition for one -- the same reasoning as the spam gate
+/// failing open. Ollama being slow or down must not cost the owner the mail
+/// itself, which is the whole point of the service.
+///
+/// Caller frees a non-null result.
+pub fn forNotification(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ollama_url: []const u8,
+    model: []const u8,
+    sender: []const u8,
+    subject: []const u8,
+    body: []const u8,
+) ?[]u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (trimmed.len <= SHORT_BODY_CHARS) {
+        return tidy(gpa, trimmed) catch null;
+    }
+
+    return summarize(io, gpa, ollama_url, model, sender, subject, trimmed) catch |err| {
+        log.warn("no summary for mail from {s}: {s}", .{ sender, @errorName(err) });
+        return null;
+    };
+}
+
 pub const Draft = struct {
     subject: []const u8,
     body: []const u8,
@@ -135,4 +203,25 @@ pub fn draftReply(
         log.warn("drafting failed ({s}); using the instruction verbatim", .{@errorName(err)});
         return gpa.dupe(u8, instruction) catch Error.Unavailable;
     };
+}
+
+test "a short body keeps its text and loses its padding" {
+    const gpa = std.testing.allocator;
+
+    // Observed in the probe against real mail: an automated upload report
+    // whose notification was mostly blank lines and a rule of "=".
+    const raw = "Upload process report  \n\n\n===========\n\n\nOK\n\nThanks!\n";
+    const tidied = try tidy(gpa, raw);
+    defer gpa.free(tidied);
+    try std.testing.expectEqualStrings("Upload process report\n\n===========\n\nOK\n\nThanks!", tidied);
+
+    // A single newline stays a single newline -- collapsing those would run
+    // separate lines together and change what the message says.
+    const listy = try tidy(gpa, "one\ntwo\nthree");
+    defer gpa.free(listy);
+    try std.testing.expectEqualStrings("one\ntwo\nthree", listy);
+
+    const blank = try tidy(gpa, "\n\n   \n");
+    defer gpa.free(blank);
+    try std.testing.expectEqualStrings("", blank);
 }

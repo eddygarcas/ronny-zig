@@ -279,7 +279,7 @@ fn scanOnce(
 }
 
 /// The notification pipeline for one matching message: fetch it, run the
-/// spam gate, and report it unless suppressed.
+/// spam gate, summarise it, and report it unless suppressed.
 fn notifyIfWanted(
     cfg: Config,
     session: *imap.Session,
@@ -314,9 +314,21 @@ fn notifyIfWanted(
     // A skipped check is flagged in the message itself, so it is never
     // mistaken for the model having cleared it.
     const suffix: []const u8 = if (verdict.checked) "" else " [spam check unavailable]";
-    const text = try std.fmt.allocPrint(cfg.gpa, "\u{1F4E7} Ronny: mail from {s}\nSubject: {s}{s}", .{
-        sender, subject, suffix,
-    });
+
+    const summary = summarize.forNotification(
+        cfg.io, cfg.gpa, cfg.ollama_url, cfg.ollama_model,
+        sender, subject, message.bodySlice(),
+    );
+    defer if (summary) |owned| cfg.gpa.free(owned);
+
+    const text = if (summary) |body|
+        try std.fmt.allocPrint(cfg.gpa, "\u{1F4E7} Ronny: mail from {s}\nSubject: {s}{s}\n\n{s}", .{
+            sender, subject, suffix, body,
+        })
+    else
+        try std.fmt.allocPrint(cfg.gpa, "\u{1F4E7} Ronny: mail from {s}\nSubject: {s}{s}", .{
+            sender, subject, suffix,
+        });
     defer cfg.gpa.free(text);
 
     var client: telegram.Client = .{

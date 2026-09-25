@@ -224,6 +224,22 @@ On first run the watcher baselines to the mailbox's current position rather
 than treating every existing message as new — otherwise a large mailbox would
 produce one notification per message.
 
+## What a notification looks like
+
+```
+📧 Ronny: mail from anna@acme.com
+Subject: Thursday's numbers
+
+The sender is asking you to review the Q3 figures before Thursday's
+call and flag anything that looks wrong in the services line.
+```
+
+The summary is written by the local model from the message body, so mail
+content never leaves the machine. Short messages are shown as they are rather
+than restated — a summary of two lines is not shorter than the two lines. If
+the model is unreachable the notification still arrives, without the summary:
+a summary improves a notification, it is never a precondition for one.
+
 ## User guide
 
 Everything Ronny can do is one of the actions below — that list is closed on

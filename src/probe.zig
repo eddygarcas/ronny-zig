@@ -11,6 +11,7 @@ const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
 const intent = @import("intent.zig");
 const contacts = @import("contacts.zig");
+const summarize = @import("summarize.zig");
 
 const VOCAB_ENTRY = 96;
 const VOCAB_MAX = 300;
@@ -149,6 +150,43 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("\n=== raw body, first 400 chars (what the ranker sees) ===\n{s}\n", .{
             body[0..@min(body.len, 400)],
         });
+    }
+
+    // The notification body, exactly as the watcher would build it. Run
+    // against real recent mail because that is where the shapes are: bulk
+    // HTML, one-line replies, threads quoting themselves.
+    std.debug.print("\n=== notification summaries (real recent mail) ===\n", .{});
+    {
+        var recent: [5]imap.Envelope = undefined;
+        const found = try session.searchRecent(3, &recent);
+        for (found) |envelope| {
+            var message: imap.Message = undefined;
+            session.fetchMessage(envelope.uid, &message) catch continue;
+
+            const started = std.Io.Clock.now(.boot, init.io).nanoseconds;
+            const summary = summarize.forNotification(
+                init.io,
+                arena,
+                env.get("OLLAMA_URL") orelse "http://127.0.0.1:11434",
+                env.get("OLLAMA_MODEL") orelse "qwen2.5",
+                envelope.fromSlice(),
+                envelope.subjectSlice(),
+                message.bodySlice(),
+            );
+            const elapsed_ms = @divTrunc(
+                std.Io.Clock.now(.boot, init.io).nanoseconds - started,
+                std.time.ns_per_ms,
+            );
+
+            const body_len = std.mem.trim(u8, message.bodySlice(), " \t\r\n").len;
+            std.debug.print("\n  subject: {s}\n  body {d} chars -> {s} in {d}ms\n  {?s}\n", .{
+                envelope.subjectSlice(),
+                body_len,
+                if (body_len == 0) "nothing" else if (body_len <= summarize.SHORT_BODY_CHARS) "verbatim" else "summarised",
+                elapsed_ms,
+                summary,
+            });
+        }
     }
 
     std.debug.print("\n=== contact book ===\n", .{});
