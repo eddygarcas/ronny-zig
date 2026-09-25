@@ -65,6 +65,12 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "look back 30 days by default", .want = .change_setting },
                 .{ .text = "what are your settings?", .want = .show_settings },
                 .{ .text = "what are my quiet hours?", .want = .show_settings },
+                // "list of actions" went to list_senders twice in real use --
+                // both are "a list", and only one is about people.
+                .{ .text = "Show me the list of actions please.", .want = .help },
+                .{ .text = "I need the list of the actions that I can do in this bot.", .want = .help },
+                .{ .text = "who are you watching?", .want = .list_senders },
+                .{ .text = "show me the list of senders", .want = .list_senders },
                 // Silencing everything indefinitely is still pause, not a
                 // quiet window.
                 .{ .text = "stop notifying me until I say otherwise", .want = .pause },
@@ -241,8 +247,38 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    std.debug.print("\n=== find: content search ===\n", .{});
-    const question = "find the email about self-hosted deployment";
+    // `zig build probe -- "find the email about X"` to chase a specific
+    // failure; the default keeps the step useful with no arguments.
+    const args = try init.minimal.args.toSlice(arena);
+    const question: []const u8 = if (args.len > 1)
+        args[1]
+    else
+        "find the email about self-hosted deployment";
+
+    std.debug.print("\n=== find: content search ===\n  question: {s}\n", .{question});
+
+    // Both halves are printed separately because they fail differently: a bad
+    // Gmail query returns nothing to rank, whereas a good query whose text
+    // the ranker cannot see returns plenty and matches none. The second one
+    // looks like "no such email" and is not.
+    const query = findmail.buildQuery(init.io, arena, "http://127.0.0.1:11434", "qwen2.5", question, 365) catch "";
+    std.debug.print("  query: {s}\n", .{query});
+
+    const candidates = findmail.collect(arena, &session, try arena.dupeZ(u8, query)) catch &[_]findmail.Candidate{};
+    std.debug.print("  {d} candidate(s); what the ranker is shown of each:\n", .{candidates.len});
+    for (candidates, 0..) |candidate, i| {
+        const seen = candidate.snippet[0..@min(candidate.snippet.len, 250)];
+        const terms_present = std.ascii.indexOfIgnoreCase(seen, "influx") != null;
+        std.debug.print("\n  [{d}] {s}\n      snippet {d} chars, shown {d}{s}\n      {s}\n", .{
+            i,
+            candidate.subject,
+            candidate.snippet.len,
+            seen.len,
+            if (terms_present) "  <-- term IS visible" else "",
+            seen,
+        });
+    }
+
     const found = try findmail.find(
         init.io,
         arena,
@@ -250,9 +286,9 @@ pub fn main(init: std.process.Init) !void {
         "http://127.0.0.1:11434",
         "qwen2.5",
         question,
-        120,
+        365,
     );
-    std.debug.print("  query: {s}\n", .{found.query});
+    std.debug.print("\n  ranked {d} match(es):\n", .{found.matches.len});
     for (found.matches) |match| {
         std.debug.print("  - {s}\n    from {s} | {s}\n    {s}\n", .{
             match.candidate.subject, match.candidate.from, match.candidate.date, match.why,

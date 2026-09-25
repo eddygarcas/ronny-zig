@@ -93,6 +93,7 @@ pub fn buildQuery(
     first_line = try balanceQuotes(arena, first_line);
     first_line = try stripOperators(arena, first_line);
     first_line = try trimToTerms(arena, first_line);
+    first_line = try tidyOrTerms(arena, first_line);
 
     // Filtering promotions Gmail-side is far cheaper than fetching newsletters
     // and discarding them; isBulk below stays as a backstop for the rest.
@@ -163,6 +164,78 @@ fn stripOperators(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
 
     if (dropped == 0) return query;
     log.warn("dropped {d} search operator(s) the model added on its own", .{dropped});
+    return out.writer.buffered();
+}
+
+/// Quotes multi-word OR terms and drops repeats.
+///
+/// Observed live, asked twice for the same thing:
+///
+///   (InfluxDB OR influx db OR "influx db" OR influxdb OR "influx db" OR influx db)
+///   (InfluxDB OR influxdb)
+///
+/// The second found the mail. The first found seven unrelated messages --
+/// calendar invitations and wiki notifications -- because a bare `influx db`
+/// is not one term to Gmail, it is `influx AND db`, and a space binds tighter
+/// than OR. So the group stopped meaning "any of these" and started pulling
+/// in mail that contained neither word as written. From the outside that is
+/// indistinguishable from "you have no email about InfluxDB", which is what
+/// the owner was told.
+///
+/// The fourth thing the query prompt has been ignored about, after quoting,
+/// length and injected operators. Same conclusion each time: if it matters,
+/// do not ask the model for it, fix it afterwards.
+fn tidyOrTerms(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
+    const open = std.mem.indexOfScalar(u8, query, '(') orelse return query;
+    const close = std.mem.lastIndexOfScalar(u8, query, ')') orelse return query;
+    if (close <= open + 1) return query;
+
+    var terms: std.ArrayList([]const u8) = .empty;
+    var changed = false;
+
+    var parts = std.mem.splitSequence(u8, query[open + 1 .. close], " OR ");
+    while (parts.next()) |raw| {
+        const term = std.mem.trim(u8, raw, " \t");
+        if (term.len == 0) {
+            changed = true;
+            continue;
+        }
+
+        // Compare on the bare words, so "influx db" and influx db are one
+        // term rather than two spellings of it.
+        const bare = std.mem.trim(u8, term, "\"");
+        if (bare.len == 0) {
+            changed = true;
+            continue;
+        }
+        var seen = false;
+        for (terms.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, existing, "\""), bare)) seen = true;
+        }
+        if (seen) {
+            changed = true;
+            continue;
+        }
+
+        if (std.mem.indexOfScalar(u8, bare, ' ') != null and term[0] != '"') {
+            try terms.append(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{bare}));
+            changed = true;
+        } else {
+            try terms.append(arena, term);
+        }
+    }
+
+    if (!changed or terms.items.len == 0) return query;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(query[0 .. open + 1]);
+    for (terms.items, 0..) |term, i| {
+        if (i > 0) try out.writer.writeAll(" OR ");
+        try out.writer.writeAll(term);
+    }
+    try out.writer.writeAll(query[close..]);
+
+    log.info("tidied the OR terms to {d}", .{terms.items.len});
     return out.writer.buffered();
 }
 
@@ -497,4 +570,40 @@ test "search operators the model invents are stripped" {
     // phrase is a legitimate search term, not an operator.
     const plain = "(invoice OR \"payment from AcmeSync\") billing";
     try std.testing.expectEqualStrings(plain, try stripOperators(arena, plain));
+}
+
+test "unquoted multi-word OR terms are quoted, and repeats dropped" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The exact query that returned seven unrelated messages. A bare
+    // `influx db` is `influx AND db` to Gmail, not one term.
+    try std.testing.expectEqualStrings(
+        "(InfluxDB OR \"influx db\")",
+        try tidyOrTerms(arena, "(InfluxDB OR influx db OR \"influx db\" OR influxdb OR \"influx db\" OR influx db)"),
+    );
+
+    // Gmail search is case-insensitive, so a case variant is not a second
+    // term -- it is the same search run twice, and it goes.
+    try std.testing.expectEqualStrings(
+        "(InfluxDB)",
+        try tidyOrTerms(arena, "(InfluxDB OR influxdb)"),
+    );
+
+    // Genuinely different words all survive, in the order given.
+    try std.testing.expectEqualStrings(
+        "(invoice OR receipt OR payment)",
+        try tidyOrTerms(arena, "(invoice OR receipt OR payment)"),
+    );
+
+    // Already-correct phrases are not re-quoted, and the surrounding query
+    // survives untouched.
+    try std.testing.expectEqualStrings(
+        "newer_than:365d (calendly OR \"are you free\") -category:promotions",
+        try tidyOrTerms(arena, "newer_than:365d (calendly OR \"are you free\") -category:promotions"),
+    );
+
+    // Nothing to do without a group.
+    try std.testing.expectEqualStrings("invoice", try tidyOrTerms(arena, "invoice"));
 }

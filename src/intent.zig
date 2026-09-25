@@ -138,13 +138,13 @@ const ACTION_CRITERIA =
     \\  "get_attachment": "Send the owner a file attached to the email just shown. Examples: 'send me the invoice', 'download the pdf', 'give me that attachment', 'forward me the spreadsheet from it'",
     \\  "add_sender": "Add an email address or domain to the watched-sender allowlist, so that mail arriving from it is notified. The request names the address or the person. Examples: 'add example@example.com to be notified', 'watch acme.com', 'let me know when anna@acme.com writes'",
     \\  "remove_sender": "Remove an email address or domain from the watched-sender allowlist.",
-    \\  "list_senders": "Show which senders are currently on the allowlist.",
+    \\  "list_senders": "Show which PEOPLE the assistant watches -- the sender allowlist. About addresses and domains, never about what the assistant can do. Examples: 'who are you watching?', 'list the senders', 'show me the allowlist'",
     \\  "pause": "Stop sending notifications entirely, for now, until told to resume. Not for silencing only certain hours of the day, which is change_setting.",
     \\  "resume": "Start sending notifications again after a pause.",
     \\  "status": "Report the assistant's own state: active or paused, and how many senders it watches. Not about mail content, and not its configurable settings, which is show_settings.",
     \\  "show_settings": "Show the assistant's own configuration -- its quiet hours, and how far back mail commands look by default. Examples: 'what are your settings?', 'what are my quiet hours?', 'how far back do you search?'",
     \\  "change_setting": "Change one of the assistant's own settings: the hours during which it must not notify, or the default number of days the mail commands look back. The request is about the assistant's behaviour, NOT about which senders it watches (add_sender/remove_sender) and NOT about stopping notifications altogether (pause). Examples: 'don't notify me before 8am', 'no notifications between 10pm and 7am', 'turn off quiet hours', 'look back 30 days by default'",
-    \\  "help": "Explain what the assistant can do.",
+    \\  "help": "List what the assistant itself can DO -- its actions, commands or capabilities. Note 'list of actions' and 'list of commands' are this, not the sender list. Examples: 'what can you do?', 'show me the list of actions', 'which commands do you have?', 'help'",
     \\  "unknown": "None of the other options fit, or the request is something this assistant cannot do at all -- forwarding a message on to a third party, deleting or filing mail, calendars, contacts, or anything unrelated to this mailbox."
     \\}
 ;

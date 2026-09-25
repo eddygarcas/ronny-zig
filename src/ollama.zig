@@ -29,6 +29,52 @@ pub const Format = enum {
 /// Every failure -- unreachable host, non-2xx, unparseable body, empty answer
 /// -- collapses to Unavailable, because every caller's response is the same:
 /// fall back to something that doesn't need the model.
+/// Replaces invalid UTF-8 so the prompt survives being turned into JSON.
+///
+/// Not defensive tidying -- without this the request is silently malformed.
+/// Zig 0.16's std.json.Stringify, handed a []u8 that is not valid UTF-8,
+/// emits it as an ARRAY OF BYTE NUMBERS rather than a string:
+///
+///   {"prompt":[72,101,32,115,97,105,100,32,147,...]}
+///
+/// Ollama then answers 400, and every caller degrades quietly: the spam gate
+/// fails open and tags the mail "[spam check unavailable]", the notification
+/// loses its summary, content search falls back to recency. Seen live as
+/// `ollama returned 400 for model qwen2.5` on a content search.
+///
+/// The trigger is ordinary: one windows-1252 smart quote or a latin-1 accent
+/// in a message body, which a bilingual mailbox sees constantly. The deeper
+/// fix is honouring each MIME part's charset when decoding, in shim.c;
+/// this is the boundary that stops a bad byte breaking the request at all.
+fn validUtf8(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return text;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+
+    var i: usize = 0;
+    var replaced: usize = 0;
+    while (i < text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            try out.writer.writeAll("\u{FFFD}");
+            replaced += 1;
+            i += 1;
+            continue;
+        };
+        if (i + width > text.len or !std.unicode.utf8ValidateSlice(text[i..][0..width])) {
+            try out.writer.writeAll("\u{FFFD}");
+            replaced += 1;
+            i += 1;
+            continue;
+        }
+        try out.writer.writeAll(text[i..][0..width]);
+        i += width;
+    }
+
+    log.warn("replaced {d} invalid UTF-8 byte(s) in a prompt", .{replaced});
+    return out.writer.buffered();
+}
+
 pub fn generate(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -41,7 +87,7 @@ pub fn generate(
     const stringify_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     std.json.Stringify.value(.{
         .model = model,
-        .prompt = prompt,
+        .prompt = validUtf8(arena, prompt) catch prompt,
         .stream = false,
         .format = if (format == .json) @as(?[]const u8, "json") else null,
     }, stringify_options, &payload.writer) catch return Error.Unavailable;
@@ -86,4 +132,27 @@ pub fn generateJson(
         return Error.Unavailable;
     };
     return parsed.value;
+}
+
+test "a prompt with non-UTF-8 bytes still serialises as a JSON string" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Valid text is passed straight through, same pointer, no copy.
+    const clean = "Summarise this: hola, ¿qué tal?";
+    try std.testing.expectEqual(clean.ptr, (try validUtf8(arena, clean)).ptr);
+
+    // windows-1252 smart quotes, exactly as they arrive in a mail body.
+    const dirty = "He said \x93hello\x94 to me";
+    const fixed = try validUtf8(arena, dirty);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(fixed));
+    try std.testing.expectEqualStrings("He said \u{FFFD}hello\u{FFFD} to me", fixed);
+
+    // The regression itself: the encoded payload must contain a JSON string,
+    // not the array of byte numbers Stringify produces for invalid UTF-8.
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(.{ .prompt = fixed }, .{}, &out.writer);
+    const json = out.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"prompt\":\""));
 }
