@@ -31,13 +31,46 @@ pub const Config = struct {
     voice_en: [:0]const u8,
     voice_es: [:0]const u8,
 
-    pub fn voiceFor(self: Config, language: settings.Language) [:0]const u8 {
+    /// The voice that reads `language`: the one the owner chose from chat
+    /// if they did, otherwise the .env default.
+    pub fn voiceForLanguage(self: Config, prefs: *const settings.Settings, language: settings.Language) []const u8 {
         return switch (language) {
-            .en => self.voice_en,
-            .es => self.voice_es,
+            .en => if (prefs.voice_en.isSet()) prefs.voice_en.slice() else self.voice_en,
+            .es => if (prefs.voice_es.isSet()) prefs.voice_es.slice() else self.voice_es,
         };
     }
+
+    /// The voice for the language summaries are currently in.
+    pub fn voiceFor(self: Config, prefs: *const settings.Settings) []const u8 {
+        return self.voiceForLanguage(prefs, prefs.language);
+    }
 };
+
+/// The voices installed: every <name>.onnx in the voices directory, sorted.
+/// This list is the only place a chat-chosen voice can come from. Empty if
+/// the directory cannot be read, which then reads as "no voices to choose".
+pub fn available(io: std.Io, arena: std.mem.Allocator, cfg: Config) []const []const u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, cfg.voices_dir, .{ .iterate = true }) catch |err| {
+        log.warn("could not list voices in {s}: {s}", .{ cfg.voices_dir, @errorName(err) });
+        return &.{};
+    };
+    defer dir.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".onnx")) continue;
+        const name = arena.dupe(u8, entry.name[0 .. entry.name.len - ".onnx".len]) catch continue;
+        names.append(arena, name) catch continue;
+    }
+    std.mem.sort([]const u8, names.items, {}, lessThan);
+    return names.items;
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
 
 /// A summary is three sentences; anything much past this is a body being
 /// read verbatim, which nobody wants as audio.
@@ -48,12 +81,13 @@ pub const MAX_CHARS = 2000;
 const OPUS_BITRATE = "32k";
 const MAX_AUDIO_BYTES = 8 * 1024 * 1024;
 
-/// Speaks `text` and returns OGG/Opus bytes, owned by `gpa`.
+/// Speaks `text` with `voice` (a name as `available` lists it, or a .env
+/// default) and returns OGG/Opus bytes, owned by `gpa`.
 pub fn synthesize(
     io: std.Io,
     gpa: std.mem.Allocator,
     cfg: Config,
-    language: settings.Language,
+    voice: []const u8,
     text: []const u8,
 ) ![]u8 {
     const spoken = try spokenForm(gpa, text);
@@ -80,7 +114,6 @@ pub fn synthesize(
     defer std.Io.Dir.cwd().deleteFile(io, wav_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, ogg_path) catch {};
 
-    const voice = cfg.voiceFor(language);
     try run(io, &.{
         cfg.bin,        "-m",      voice,           "--data-dir", cfg.voices_dir,
         "--input-file", text_path, "--output-file", wav_path,

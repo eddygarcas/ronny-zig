@@ -43,6 +43,14 @@ pub const Settings = struct {
     /// English voice is the failure this prevents.
     language: Language = .en,
 
+    /// Which piper voice reads each language, chosen by name from the
+    /// voices on disk. Unset means the .env default. Selected, never
+    /// generated: a name that is not a file in the voices directory is
+    /// refused when it is set, so this can only ever name something that
+    /// exists.
+    voice_en: VoiceName = .{},
+    voice_es: VoiceName = .{},
+
     pub fn quietEnabled(self: Settings) bool {
         return self.quiet_from != OFF and self.quiet_to != OFF;
     }
@@ -94,6 +102,63 @@ pub const Language = enum {
         };
     }
 };
+
+/// A piper voice name such as "en_US-hfc_male-medium", held inline so a
+/// Settings stays a plain value with nothing to free. Serialises as a JSON
+/// string; anything that does not look like a voice name reads back as
+/// unset rather than failing the whole settings file.
+pub const VoiceName = struct {
+    buf: [MAX]u8 = [_]u8{0} ** MAX,
+    len: u8 = 0,
+
+    pub const MAX = 48;
+
+    pub fn from(text: []const u8) ?VoiceName {
+        if (text.len == 0 or text.len > MAX) return null;
+        for (text) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return null;
+        }
+        var name: VoiceName = .{};
+        @memcpy(name.buf[0..text.len], text);
+        name.len = @intCast(text.len);
+        return name;
+    }
+
+    pub fn slice(self: *const VoiceName) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    pub fn isSet(self: *const VoiceName) bool {
+        return self.len > 0;
+    }
+
+    pub fn jsonStringify(self: VoiceName, jw: anytype) !void {
+        try jw.write(self.slice());
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !VoiceName {
+        return switch (try source.nextAlloc(allocator, options.allocate.?)) {
+            inline .string, .allocated_string => |text| VoiceName.from(text) orelse .{},
+            else => error.UnexpectedToken,
+        };
+    }
+};
+
+/// "en_US-hfc_male-medium" -> English. Piper names every voice
+/// <language>_<REGION>-<speaker>-<quality>, so the prefix is the language.
+pub fn languageOfVoice(name: []const u8) ?Language {
+    if (std.mem.startsWith(u8, name, "en_")) return .en;
+    if (std.mem.startsWith(u8, name, "es_")) return .es;
+    return null;
+}
+
+/// "en_US-hfc_male-medium" -> "hfc_male": the part the owner would say.
+pub fn speakerOfVoice(name: []const u8) []const u8 {
+    const first = std.mem.indexOfScalar(u8, name, '-') orelse return name;
+    const last = std.mem.lastIndexOfScalar(u8, name, '-') orelse return name;
+    if (last <= first + 1) return name[first + 1 ..];
+    return name[first + 1 .. last];
+}
 
 pub const Store = struct {
     io: std.Io,
@@ -226,6 +291,8 @@ pub const Change = union(enum) {
     default_days: u16,
     summaries: Delivery,
     language: Language,
+    /// Always a name from the voices on disk; see scanVoice.
+    voice: VoiceName,
 };
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -388,6 +455,43 @@ fn scanDelivery(text: []const u8) ?Delivery {
     return if (voice.?.at > written.?.at) .voice else .text;
 }
 
+/// Is `needle` in `text` as a whole word -- not "ald" inside "herald".
+fn containsWord(text: []const u8, needle: []const u8) bool {
+    var from: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(text, from, needle)) |at| : (from = at + 1) {
+        const before_ok = at == 0 or !(std.ascii.isAlphanumeric(text[at - 1]) or text[at - 1] == '_');
+        const after = at + needle.len;
+        const after_ok = after >= text.len or !(std.ascii.isAlphanumeric(text[after]) or text[after] == '_');
+        if (before_ok and after_ok) return true;
+    }
+    return false;
+}
+
+/// "use john's voice", "switch to hfc male", "en_US-ryan-medium" -> that
+/// voice, if it is one of `voices`. The full name wins over a speaker
+/// match, and among speaker matches the first in the (sorted) list does,
+/// so "ryan" with ryan-high and ryan-medium both installed picks high.
+fn scanVoice(text: []const u8, voices: []const []const u8) ?VoiceName {
+    for (voices) |name| {
+        if (containsWord(text, name)) return VoiceName.from(name);
+    }
+    for (voices) |name| {
+        if (languageOfVoice(name) == null) continue;
+        const speaker = speakerOfVoice(name);
+        if (containsWord(text, speaker)) return VoiceName.from(name);
+        // "hfc male" for hfc_male: the underscore is not something anyone
+        // says out loud.
+        if (std.mem.indexOfScalar(u8, speaker, '_') != null) {
+            var spaced: [VoiceName.MAX]u8 = undefined;
+            const spoken = spaced[0..speaker.len];
+            @memcpy(spoken, speaker);
+            std.mem.replaceScalar(u8, spoken, '_', ' ');
+            if (containsWord(text, spoken)) return VoiceName.from(name);
+        }
+    }
+    return null;
+}
+
 const SPANISH_WORDS = [_][]const u8{ "spanish", "español", "espanol", "castellano", "castilian" };
 const ENGLISH_WORDS = [_][]const u8{ "english", "inglés", "ingles" };
 
@@ -429,8 +533,16 @@ fn roleOf(prefix: []const u8) ?Role {
 
 /// Reads a settings change out of what the owner actually wrote, or returns
 /// null so the caller can say it did not understand rather than guess.
-pub fn parseChange(text: []const u8, current: Settings) ?Change {
-    // Delivery and language first: neither mentions a time or a day count,
+///
+/// `voices` is what is installed, as speech.available lists it. A voice can
+/// only be chosen from that list, which is what keeps the setting from ever
+/// naming a file that does not exist.
+pub fn parseChange(text: []const u8, current: Settings, voices: []const []const u8) ?Change {
+    // A voice by name first: "use the voice john" says "voice", and read by
+    // the delivery parser alone it would merely switch summaries to audio.
+    if (scanVoice(text, voices)) |voice| return .{ .voice = voice };
+
+    // Delivery and language next: neither mentions a time or a day count,
     // and "no more voice summaries" must not be read as quiet hours off
     // just because it says "no".
     if (scanDelivery(text)) |delivery| return .{ .summaries = delivery };
@@ -496,7 +608,7 @@ test "the delivery setting is read from either side of the sentence" {
         .{ .text = "switch from voice to text", .want = .text },
     };
     for (cases) |case| {
-        const change = parseChange(case.text, .{}) orelse {
+        const change = parseChange(case.text, .{}, &.{}) orelse {
             std.debug.print("no change parsed from: {s}\n", .{case.text});
             return error.TestUnexpectedResult;
         };
@@ -509,19 +621,19 @@ test "the delivery setting is read from either side of the sentence" {
 
 test "a bare 'text' is not a delivery change, and quiet hours still parse" {
     // "text me" is about how to reach the owner, not about summaries.
-    try std.testing.expect(parseChange("text me", .{}) == null);
+    try std.testing.expect(parseChange("text me", .{}, &.{}) == null);
     // The quiet-hours parser still gets its turn.
-    const change = parseChange("no notifications between 10pm and 7am", .{}).?;
+    const change = parseChange("no notifications between 10pm and 7am", .{}, &.{}).?;
     try std.testing.expect(change == .quiet_hours);
     // A day count still wins over nothing.
-    try std.testing.expect(parseChange("look back 30 days", .{}).? == .default_days);
+    try std.testing.expect(parseChange("look back 30 days", .{}, &.{}).? == .default_days);
 }
 
 test "the language is read when one is named, refused when both are" {
-    try std.testing.expect(parseChange("summaries in spanish", .{}).?.language == .es);
-    try std.testing.expect(parseChange("resúmenes en español", .{}).?.language == .es);
-    try std.testing.expect(parseChange("back to english", .{}).?.language == .en);
-    try std.testing.expect(parseChange("spanish or english, whichever", .{}) == null);
+    try std.testing.expect(parseChange("summaries in spanish", .{}, &.{}).?.language == .es);
+    try std.testing.expect(parseChange("resúmenes en español", .{}, &.{}).?.language == .es);
+    try std.testing.expect(parseChange("back to english", .{}, &.{}).?.language == .en);
+    try std.testing.expect(parseChange("spanish or english, whichever", .{}, &.{}) == null);
 }
 
 test "delivery and language survive a round trip through the store's JSON" {
@@ -540,14 +652,61 @@ test "delivery and language survive a round trip through the store's JSON" {
     try std.testing.expect(old.value.language == .en);
 }
 
+test "a voice is chosen by name from what is installed, and only from that" {
+    const installed = [_][]const u8{ "en_US-hfc_male-medium", "en_US-ryan-high", "en_US-ryan-medium", "es_ES-davefx-medium" };
+    const cases = [_]struct { text: []const u8, want: []const u8 }{
+        .{ .text = "use ryan's voice", .want = "en_US-ryan-high" },
+        .{ .text = "switch to en_US-ryan-medium", .want = "en_US-ryan-medium" },
+        .{ .text = "use the hfc male voice", .want = "en_US-hfc_male-medium" },
+        .{ .text = "hfc_male please", .want = "en_US-hfc_male-medium" },
+        .{ .text = "Spanish voice davefx", .want = "es_ES-davefx-medium" },
+    };
+    for (cases) |case| {
+        const change = parseChange(case.text, .{}, &installed) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(change == .voice);
+        try std.testing.expectEqualStrings(case.want, change.voice.slice());
+    }
+    // Not installed: falls through, and "voice" alone is then a delivery change.
+    const other = parseChange("use the voice amy", .{}, &installed).?;
+    try std.testing.expect(other == .summaries);
+    // A speaker name inside another word is not a match.
+    const ald_installed = [_][]const u8{"es_MX-ald-medium"};
+    try std.testing.expect(parseChange("the herald newsletter", .{}, &ald_installed) == null);
+}
+
+test "a voice name knows its language and its speaker" {
+    try std.testing.expect(languageOfVoice("en_US-hfc_male-medium") == .en);
+    try std.testing.expect(languageOfVoice("es_MX-claude-high") == .es);
+    try std.testing.expect(languageOfVoice("fr_FR-siwis-medium") == null);
+    try std.testing.expectEqualStrings("hfc_male", speakerOfVoice("en_US-hfc_male-medium"));
+    try std.testing.expectEqualStrings("claude", speakerOfVoice("es_MX-claude-high"));
+    try std.testing.expectEqualStrings("odd", speakerOfVoice("odd"));
+}
+
+test "a voice name round-trips as a JSON string and bad ones read as unset" {
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buffer.deinit();
+    const saved: Settings = .{ .voice_en = VoiceName.from("en_US-john-medium").? };
+    try std.json.Stringify.value(saved, .{}, &buffer.writer);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.writer.buffered(), "\"voice_en\":\"en_US-john-medium\"") != null);
+    const parsed = try std.json.parseFromSlice(Settings, std.testing.allocator, buffer.writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("en_US-john-medium", parsed.value.voice_en.slice());
+    try std.testing.expect(!parsed.value.voice_es.isSet());
+
+    const odd = try std.json.parseFromSlice(Settings, std.testing.allocator, "{\"voice_en\":\"../../etc/passwd\"}", .{});
+    defer odd.deinit();
+    try std.testing.expect(!odd.value.voice_en.isSet());
+}
+
 test "quiet hours wrap past midnight, which is the normal case" {
     const overnight: Settings = .{ .quiet_from = 22 * 60, .quiet_to = 8 * 60 };
 
-    try std.testing.expect(overnight.isQuietAt(23 * 60));      // 23:00
-    try std.testing.expect(overnight.isQuietAt(3 * 60));       // 03:00
-    try std.testing.expect(overnight.isQuietAt(22 * 60));      // exactly 22:00
-    try std.testing.expect(!overnight.isQuietAt(8 * 60));      // exactly 08:00, awake
-    try std.testing.expect(!overnight.isQuietAt(12 * 60));     // midday
+    try std.testing.expect(overnight.isQuietAt(23 * 60)); // 23:00
+    try std.testing.expect(overnight.isQuietAt(3 * 60)); // 03:00
+    try std.testing.expect(overnight.isQuietAt(22 * 60)); // exactly 22:00
+    try std.testing.expect(!overnight.isQuietAt(8 * 60)); // exactly 08:00, awake
+    try std.testing.expect(!overnight.isQuietAt(12 * 60)); // midday
 
     // A daytime window must not accidentally wrap.
     const daytime: Settings = .{ .quiet_from = 9 * 60, .quiet_to = 17 * 60 };
@@ -622,27 +781,27 @@ test "settings changes are read from the owner's own wording" {
     try std.testing.expectEqual(Change{ .quiet_hours = .{
         .from = DEFAULT_QUIET_FROM,
         .to = 8 * 60,
-    } }, parseChange("don't notify me before 8am", off).?);
+    } }, parseChange("don't notify me before 8am", off, &.{}).?);
 
     // Both ends named, in either order, mean the same window.
     const window = Change{ .quiet_hours = .{ .from = 22 * 60, .to = 7 * 60 } };
-    try std.testing.expectEqual(window, parseChange("no notifications between 10pm and 7am", off).?);
-    try std.testing.expectEqual(window, parseChange("quiet hours from 22:00 to 07:00", off).?);
-    try std.testing.expectEqual(window, parseChange("10pm-7am", off).?);
-    try std.testing.expectEqual(window, parseChange("quiet before 7am and after 10pm", off).?);
+    try std.testing.expectEqual(window, parseChange("no notifications between 10pm and 7am", off, &.{}).?);
+    try std.testing.expectEqual(window, parseChange("quiet hours from 22:00 to 07:00", off, &.{}).?);
+    try std.testing.expectEqual(window, parseChange("10pm-7am", off, &.{}).?);
+    try std.testing.expectEqual(window, parseChange("quiet before 7am and after 10pm", off, &.{}).?);
 
     // One edge named leaves the other alone rather than resetting it.
     const evening: Settings = .{ .quiet_from = 23 * 60, .quiet_to = 6 * 60 };
     try std.testing.expectEqual(Change{ .quiet_hours = .{
         .from = 23 * 60,
         .to = 9 * 60,
-    } }, parseChange("actually let me sleep until 9am", evening).?);
+    } }, parseChange("actually let me sleep until 9am", evening, &.{}).?);
     try std.testing.expectEqual(Change{ .quiet_hours = .{
         .from = 21 * 60,
         .to = 6 * 60,
-    } }, parseChange("start quiet hours at 9pm", evening).?);
+    } }, parseChange("start quiet hours at 9pm", evening, &.{}).?);
 
-    try std.testing.expectEqual(Change{ .default_days = 30 }, parseChange("look back 30 days by default", off).?);
+    try std.testing.expectEqual(Change{ .default_days = 30 }, parseChange("look back 30 days by default", off, &.{}).?);
 }
 
 test "turning quiet hours off is never mistaken for setting them" {
@@ -656,7 +815,7 @@ test "turning quiet hours off is never mistaken for setting them" {
         "notify me at any time",
         "notify me whenever, even at 3am",
     }) |request| {
-        try std.testing.expectEqual(Change.quiet_off, parseChange(request, on).?);
+        try std.testing.expectEqual(Change.quiet_off, parseChange(request, on, &.{}).?);
     }
 }
 
@@ -665,14 +824,14 @@ test "a settings change with nothing to change in it is refused" {
     // Better to say "I didn't understand" than to silence the mailbox on a
     // guess: the failure mode of a wrong quiet window is no notifications,
     // which looks exactly like everything working.
-    try std.testing.expectEqual(@as(?Change, null), parseChange("change my settings", off));
-    try std.testing.expectEqual(@as(?Change, null), parseChange("make it better", off));
+    try std.testing.expectEqual(@as(?Change, null), parseChange("change my settings", off, &.{}));
+    try std.testing.expectEqual(@as(?Change, null), parseChange("make it better", off, &.{}));
 }
 
 test "the quiet/quite transposition is accepted" {
     const on: Settings = .{ .quiet_from = 22 * 60, .quiet_to = 8 * 60 };
     // Typed live, routed correctly by Jev, and refused here -- which reads
     // as a broken feature rather than a misspelling.
-    try std.testing.expectEqual(Change.quiet_off, parseChange("Turn off quite hours", on).?);
-    try std.testing.expectEqual(Change.quiet_off, parseChange("turn off quiet hours", on).?);
+    try std.testing.expectEqual(Change.quiet_off, parseChange("Turn off quite hours", on, &.{}).?);
+    try std.testing.expectEqual(Change.quiet_off, parseChange("turn off quiet hours", on, &.{}).?);
 }

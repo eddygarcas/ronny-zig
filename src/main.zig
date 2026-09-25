@@ -383,7 +383,7 @@ fn notifyIfWanted(
     // the service, the voice is a nicety on top of it.
     if (prefs.summaries == .voice and summary != null) {
         if (cfg.speech) |tts| {
-            if (speakAndSend(cfg, &client, tts, prefs.language, header, summary.?)) {
+            if (speakAndSend(cfg, &client, tts.voiceFor(&prefs), header, summary.?)) {
                 log.info("notified about mail from {s} ({s}) by voice", .{ sender, subject });
                 return;
             }
@@ -399,8 +399,7 @@ fn notifyIfWanted(
 fn speakAndSend(
     cfg: Config,
     client: *telegram.Client,
-    tts: speech.Config,
-    language: settings.Language,
+    voice: []const u8,
     caption: []const u8,
     summary: []const u8,
 ) bool {
@@ -408,7 +407,7 @@ fn speakAndSend(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const audio = speech.synthesize(cfg.io, arena, tts, language, summary) catch |err| {
+    const audio = speech.synthesize(cfg.io, arena, cfg.speech.?, voice, summary) catch |err| {
         log.warn("could not speak the summary ({s}); sending text", .{@errorName(err)});
         return false;
     };

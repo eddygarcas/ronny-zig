@@ -36,13 +36,18 @@ pub fn main(init: std.process.Init) !void {
             .voice_en = try arena.dupeZ(u8, env.get("PIPER_VOICE_EN") orelse "en_US-lessac-medium"),
             .voice_es = try arena.dupeZ(u8, env.get("PIPER_VOICE_ES") orelse "es_ES-davefx-medium"),
         };
+        const installed = speech.available(init.io, arena, tts);
+        std.debug.print("  {d} voice(s) installed:", .{installed.len});
+        for (installed) |name| std.debug.print(" {s}", .{settings.speakerOfVoice(name)});
+        std.debug.print("\n", .{});
         const lines = [_]struct { language: settings.Language, text: []const u8 }{
             .{ .language = .en, .text = "This is Ronny. Maria from accounting says the quarterly invoice is attached and asks you to approve it by Friday. Details at https://example.com/invoice." },
             .{ .language = .es, .text = "Soy Ronny. María, de contabilidad, dice que la factura trimestral va adjunta y te pide que la apruebes antes del viernes." },
         };
         for (lines) |line| {
             const started = std.Io.Clock.now(.boot, init.io).nanoseconds;
-            const audio = speech.synthesize(init.io, arena, tts, line.language, line.text) catch |err| {
+            const prefs: settings.Settings = .{ .language = line.language };
+            const audio = speech.synthesize(init.io, arena, tts, tts.voiceFor(&prefs), line.text) catch |err| {
                 std.debug.print("  FAIL {s}: {s}\n", .{ line.language.name(), @errorName(err) });
                 continue;
             };
@@ -117,6 +122,9 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "back to text summaries", .want = .change_setting },
                 .{ .text = "summaries in Spanish please", .want = .change_setting },
                 .{ .text = "are summaries voice or text?", .want = .show_settings },
+                .{ .text = "use john's voice", .want = .change_setting },
+                .{ .text = "switch to the ryan voice for English", .want = .change_setting },
+                .{ .text = "which voices do you have?", .want = .show_settings },
                 // "list of actions" went to list_senders twice in real use --
                 // both are "a list", and only one is about people.
                 .{ .text = "Show me the list of actions please.", .want = .help },

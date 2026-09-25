@@ -86,7 +86,7 @@ pub const HELP_TEXT =
     \\
     \\Settings change in plain language too: "don't notify me before 8am",
     \\"no notifications between 10pm and 7am", "look back 30 days by default",
-    \\"send summaries as voice messages", "summaries in Spanish".
+    \\"send summaries as voice messages", "summaries in Spanish", "use john's voice".
     \\Spoken out loud, I read the new value back and wait for a typed yes.
     \\
     \\When a reply is drafted, just answer 'yes' to send or 'no' to discard.
@@ -571,8 +571,8 @@ pub const Bot = struct {
             log.warn("summaries are set to voice but PIPER_BIN is not configured; sending text", .{});
             return false;
         };
-        const language = self.settings.reload().language;
-        const audio = speech_mod.synthesize(self.cfg.io, arena, tts, language, voice.body) catch |err| {
+        const prefs = self.settings.reload();
+        const audio = speech_mod.synthesize(self.cfg.io, arena, tts, tts.voiceFor(&prefs), voice.body) catch |err| {
             log.warn("could not speak the summary ({s}); sending text", .{@errorName(err)});
             return false;
         };
@@ -986,6 +986,20 @@ pub const Bot = struct {
             try out.writer.writeAll(" -- but PIPER_BIN isn't set in .env, so you get text until it is");
         }
         try out.writer.print("\nLanguage: {s}", .{current.language.name()});
+        if (self.cfg.speech) |tts| {
+            try out.writer.print("\nVoices: {s} for English, {s} for Spanish", .{
+                settings_mod.speakerOfVoice(tts.voiceForLanguage(&current, .en)),
+                settings_mod.speakerOfVoice(tts.voiceForLanguage(&current, .es)),
+            });
+            const installed = speech_mod.available(self.cfg.io, arena, tts);
+            if (installed.len > 0) {
+                try out.writer.writeAll("\nInstalled voices:");
+                for (installed) |name| {
+                    const language = settings_mod.languageOfVoice(name) orelse continue;
+                    try out.writer.print(" {s} ({s})", .{ settings_mod.speakerOfVoice(name), @tagName(language) });
+                }
+            }
+        }
         try out.writer.print("\nVoice can confirm send: {s} (set in .env)", .{
             if (self.cfg.voice_can_confirm_send) "yes" else "no",
         });
@@ -1000,12 +1014,13 @@ pub const Bot = struct {
         spoken: bool,
     ) ![]const u8 {
         const current = self.settings.reload();
+        const installed: []const []const u8 = if (self.cfg.speech) |tts| speech_mod.available(self.cfg.io, arena, tts) else &.{};
 
-        const change = settings_mod.parseChange(text, current) orelse {
+        const change = settings_mod.parseChange(text, current, installed) orelse {
             // Refusing beats guessing here: a wrong quiet window shows up as
             // no notifications, which is indistinguishable from working.
             log.info("no settings change found in: {s}", .{text});
-            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\", \"look back 30 days by default\", \"send summaries as voice messages\" or \"summaries in Spanish\" -- /settings shows what I have now.";
+            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\", \"look back 30 days by default\", \"send summaries as voice messages\", \"summaries in Spanish\" or \"use john's voice\" -- /settings shows what I have now, including the voices installed.";
         };
 
         // A typed change is unambiguous and applies immediately. A *spoken*
@@ -1062,6 +1077,14 @@ pub const Bot = struct {
                 "That switches summaries to {s}.",
                 .{language.name()},
             ),
+            .voice => |name| try std.fmt.allocPrint(
+                arena,
+                "That switches the {s} voice to {s}.",
+                .{
+                    (settings_mod.languageOfVoice(name.slice()) orelse settings_mod.Language.en).name(),
+                    settings_mod.speakerOfVoice(name.slice()),
+                },
+            ),
         };
     }
 
@@ -1080,6 +1103,12 @@ pub const Bot = struct {
             .default_days => |days| current.default_days = days,
             .summaries => |delivery| current.summaries = delivery,
             .language => |language| current.language = language,
+            // parseChange only returns names from the installed list, and
+            // the list only holds en_/es_ names, so the prefix is known.
+            .voice => |name| switch (settings_mod.languageOfVoice(name.slice()) orelse .en) {
+                .en => current.voice_en = name,
+                .es => current.voice_es = name,
+            },
         }
 
         self.settings.save(current) catch |err| {
@@ -1106,9 +1135,15 @@ pub const Bot = struct {
             ),
             .summaries => |delivery| switch (delivery) {
                 // Saved either way: once piper is configured and the bot
-                // restarted, the choice is already made.
-                .voice => if (self.cfg.speech != null)
-                    "Summaries will come as voice messages from now on -- new mail from the watcher and any you ask me for."
+                // restarted, the choice is already made. The voice is named
+                // so "use the voice amy" with no amy installed -- which lands
+                // here as a plain switch to audio -- is visibly not that.
+                .voice => if (self.cfg.speech) |tts|
+                    try std.fmt.allocPrint(
+                        arena,
+                        "Summaries will come as voice messages from now on -- new mail from the watcher and any you ask me for. Read by {s}; /settings lists the other voices installed.",
+                        .{settings_mod.speakerOfVoice(tts.voiceFor(&current))},
+                    )
                 else
                     "Saved -- but voice summaries need PIPER_BIN in .env and a restart, so you'll get text until then.",
                 .text => "Summaries back to text.",
@@ -1118,6 +1153,19 @@ pub const Bot = struct {
                 "Summaries in {s} from now on.",
                 .{language.name()},
             ),
+            .voice => |name| blk: {
+                const language = settings_mod.languageOfVoice(name.slice()) orelse .en;
+                const speaker = settings_mod.speakerOfVoice(name.slice());
+                // Say when they will not hear it yet, because "I changed the
+                // voice and nothing happened" is the obvious next message.
+                const caveat: []const u8 = if (current.summaries != .voice)
+                    " Summaries are text right now -- say \"send summaries as voice messages\" to hear it."
+                else if (current.language != language)
+                    try std.fmt.allocPrint(arena, " Summaries are in {s} right now, so you'll hear it once they're in {s}.", .{ current.language.name(), language.name() })
+                else
+                    "";
+                break :blk try std.fmt.allocPrint(arena, "{s} voice set to {s}.{s}", .{ language.name(), speaker, caveat });
+            },
         };
     }
 
@@ -2358,8 +2406,8 @@ test "a spoken settings change is read back as the value that would be stored" {
     // This read-back is the whole guard. Whisper hearing "nine" for "eight"
     // is invisible in the transcript -- both are plausible sentences -- but
     // wrong in the parsed window, which is what gets shown here.
-    const heard = settings_mod.parseChange("don't notify me before 8am", .{}).?;
-    const misheard = settings_mod.parseChange("don't notify me before 9am", .{}).?;
+    const heard = settings_mod.parseChange("don't notify me before 8am", .{}, &.{}).?;
+    const misheard = settings_mod.parseChange("don't notify me before 9am", .{}, &.{}).?;
 
     try std.testing.expectEqualStrings(
         "That sets quiet hours to 22:00-08:00.",
@@ -2372,10 +2420,10 @@ test "a spoken settings change is read back as the value that would be stored" {
 
     try std.testing.expectEqualStrings(
         "That sets the default look-back to 30 day(s).",
-        try Bot.describeChange(arena, settings_mod.parseChange("look back 30 days", .{}).?),
+        try Bot.describeChange(arena, settings_mod.parseChange("look back 30 days", .{}, &.{}).?),
     );
     try std.testing.expectEqualStrings(
         "That turns quiet hours off -- I'd notify you whenever mail arrives.",
-        try Bot.describeChange(arena, settings_mod.parseChange("turn off quiet hours", .{}).?),
+        try Bot.describeChange(arena, settings_mod.parseChange("turn off quiet hours", .{}, &.{}).?),
     );
 }

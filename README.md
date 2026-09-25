@@ -333,6 +333,7 @@ Two rules apply to voice when writing mail:
 | "send summaries as voice messages" | — | every summary, from the watcher or on request, arrives as audio |
 | "back to text summaries" | — | and back |
 | "summaries in Spanish" | — | the language summaries are written in, and read in |
+| "use john's voice" | — | which installed voice reads them; `/settings` lists what is installed |
 
 **Quiet hours hold mail, they do not drop it.** During the window the watcher
 stops scanning, so the read position stays where it is and everything that
@@ -475,6 +476,26 @@ a venv and download one voice per language you speak — the commands and the
 summariser to write in Spanish and picks the Spanish voice; the two are one
 setting on purpose, because a Spanish summary read by an English voice is
 the failure this prevents. English is the default.
+
+**The voice is chosen by name, from what is installed.** *"Use john's
+voice"* or *"switch to hfc male"* picks a voice for that voice's language;
+`/settings` shows the current pair and every voice on disk. A name is only
+ever matched against the files in the voices directory — the setting cannot
+name something that is not there — so installing a voice is a download into
+that directory, nothing more. Piper's files carry no gender, so if that is
+what you are choosing by, here is the median pitch of each voice on this
+machine reading one sentence, measured rather than guessed (adult male
+speech is roughly 85–155 Hz, female 165–255 Hz):
+
+| Voice | Hz | | Voice | Hz |
+|---|---|---|---|---|
+| `en_US-joe-medium` | 95 | | `es_ES-carlfm-x_low` | 117 |
+| `en_US-hfc_male-medium` | 116 | | `es_ES-sharvard-medium` | 119 |
+| `en_US-john-medium` | 119 | | `es_ES-davefx-medium` | 131 |
+| `en_US-ryan-medium` | 156 | | `es_MX-ald-medium` | 147 |
+| `en_US-lessac-medium` | 188 | | `es_MX-claude-high` | 179 |
+
+The defaults are `hfc_male` and `davefx`.
 
 **It fails to text, always.** Piper missing, the venv broken, ffmpeg
 failing, Telegram refusing the upload — each one logs a warning and sends
