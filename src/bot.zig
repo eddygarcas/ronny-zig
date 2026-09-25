@@ -127,6 +127,9 @@ pub const Config = struct {
 /// target this, which is what keeps recipients coming from real headers.
 const LastMessage = struct {
     arena: std.heap.ArenaAllocator,
+    /// Which mailbox `uid` belongs to. Re-select it before fetching again --
+    /// the same UID in another mailbox is a different message, or none.
+    mailbox: imap.Mailbox = .inbox,
     /// Needed to fetch an attachment later; the metadata comes back with the
     /// message but the bytes are pulled on demand.
     uid: u32,
@@ -1069,6 +1072,9 @@ pub const Bot = struct {
 
     const Latest = struct {
         uid: u32,
+        /// A UID is only meaningful in the mailbox it was found in, and
+        /// content search looks in a different one from everything else.
+        mailbox: imap.Mailbox = .inbox,
         from: []const u8,
         subject: []const u8,
         date: []const u8,
@@ -1102,6 +1108,10 @@ pub const Bot = struct {
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
                 ctx.found = null;
+                // INBOX, not All Mail: "the latest email" means one that
+                // arrived, and All Mail also holds the owner's own Sent
+                // messages, which would win on recency.
+                _ = try session.examine(.inbox);
                 // Both return newest first, so one slot is enough.
                 const hits = if (ctx.target.len == 0)
                     try session.searchRecent(ctx.days, ctx.buffer)
@@ -1164,6 +1174,7 @@ pub const Bot = struct {
         self.last_message = .{
             .arena = arena_state,
             .uid = latest.uid,
+            .mailbox = latest.mailbox,
             .from = from,
             .reply_to = reply_to,
             .subject = subject,
@@ -1240,10 +1251,12 @@ pub const Bot = struct {
         const Context = struct {
             uid: u32,
             index: u32,
+            mailbox: imap.Mailbox,
             buffer: []u8,
             bytes: []u8 = &.{},
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                _ = try session.examine(ctx.mailbox);
                 ctx.bytes = try session.fetchAttachment(ctx.uid, ctx.index, ctx.buffer);
             }
         };
@@ -1257,6 +1270,7 @@ pub const Bot = struct {
         var context: Context = .{
             .uid = original.uid,
             .index = part.index,
+            .mailbox = original.mailbox,
             .buffer = try arena.alloc(u8, capacity),
         };
         self.withMailbox(&context, Context.run) catch |err| {
@@ -1306,6 +1320,7 @@ pub const Bot = struct {
             hits: []imap.Envelope = &.{},
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                _ = try session.examine(.inbox);
                 ctx.hits = try session.searchFrom(ctx.target, ctx.days, ctx.buffer);
             }
         };
@@ -1351,6 +1366,7 @@ pub const Bot = struct {
             hits: []imap.Envelope = &.{},
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                _ = try session.examine(.inbox);
                 ctx.hits = try session.searchRecent(ctx.days, ctx.buffer);
             }
         };
@@ -1367,7 +1383,7 @@ pub const Bot = struct {
 
         // Open the newest, so "read it" or "does it have attachments" works
         // straight after without naming anyone.
-        self.rememberFound(arena, context.hits[0].uid) catch |err| {
+        self.rememberFound(arena, context.hits[0].uid, .inbox) catch |err| {
             log.warn("could not open the newest message: {s}", .{@errorName(err)});
         };
 
@@ -1556,7 +1572,7 @@ pub const Bot = struct {
         // Remember the best match, so "does that have attachments?" or "reply
         // to it" resolves against what was just found rather than whatever
         // was last read.
-        self.rememberFound(arena, found.matches[0].candidate.uid) catch |err| {
+        self.rememberFound(arena, found.matches[0].candidate.uid, .all_mail) catch |err| {
             log.warn("could not open the top match: {s}", .{@errorName(err)});
         };
 
@@ -1575,20 +1591,26 @@ pub const Bot = struct {
     }
 
     /// Opens a message found by content search, so follow-ups have a target.
-    fn rememberFound(self: *Bot, arena: std.mem.Allocator, uid: u32) !void {
+    fn rememberFound(self: *Bot, arena: std.mem.Allocator, uid: u32, from: imap.Mailbox) !void {
         const Context = struct {
             arena: std.mem.Allocator,
             uid: u32,
+            mailbox: imap.Mailbox,
             found: ?Latest = null,
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
                 ctx.found = null;
+                // The UID came from a search in this mailbox; fetching it
+                // after a SELECT of another one would quietly return a
+                // different message.
+                _ = try session.examine(ctx.mailbox);
                 var message: imap.Message = undefined;
                 try session.fetchMessage(ctx.uid, &message);
 
                 const raw = message.headersSlice();
                 ctx.found = .{
                     .uid = ctx.uid,
+                    .mailbox = ctx.mailbox,
                     .from = if (try headers_mod.value(ctx.arena, raw, "From")) |value|
                         headers_mod.address(value) orelse value
                     else
@@ -1602,7 +1624,7 @@ pub const Bot = struct {
             }
         };
 
-        var context: Context = .{ .arena = arena, .uid = uid };
+        var context: Context = .{ .arena = arena, .uid = uid, .mailbox = from };
         try self.withMailbox(&context, Context.run);
         if (context.found) |latest| try self.remember(latest);
     }
@@ -1828,10 +1850,12 @@ pub const Bot = struct {
         const Context = struct {
             uid: u32,
             index: u32,
+            mailbox: imap.Mailbox,
             buffer: []u8,
             bytes: []u8 = &.{},
 
             fn run(ctx: *@This(), session: *imap.Session) anyerror!void {
+                _ = try session.examine(ctx.mailbox);
                 ctx.bytes = try session.fetchAttachment(ctx.uid, ctx.index, ctx.buffer);
             }
         };
@@ -1842,6 +1866,7 @@ pub const Bot = struct {
         var context: Context = .{
             .uid = original.uid,
             .index = part.index,
+            .mailbox = original.mailbox,
             .buffer = try arena.alloc(u8, capacity),
         };
         self.withMailbox(&context, Context.run) catch |err| {

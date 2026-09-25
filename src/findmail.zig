@@ -27,6 +27,11 @@ const log = std.log.scoped(.findmail);
 pub const CANDIDATE_LIMIT = 20;
 pub const RESULT_LIMIT = 5;
 pub const SNIPPET_CHARS = 400;
+/// How much of a body is read looking for the matched words. A 250-character
+/// window taken from the top of the message is what the ranker used to see,
+/// while Gmail had matched on the whole body -- so a mention below the
+/// greeting was invisible and the ranker rejected mail that did match.
+pub const SCAN_CHARS = 6000;
 pub const DEFAULT_DAYS = 365;
 
 /// Room to drop bulk mail and still have a full candidate list. Bounded
@@ -300,18 +305,21 @@ fn isBulk(message_headers: []const u8) bool {
         std.ascii.indexOfIgnoreCase(message_headers, "list-id:") != null;
 }
 
-/// Readable text for the ranker.
+/// Readable text, tags stripped and whitespace collapsed.
 ///
 /// HTML-only mail otherwise reaches the model as raw markup
 /// ("<!DOCTYPE html>..."), which tells it nothing about the content.
-fn snippet(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+///
+/// Reads far more than the ranker will be shown, because `excerpt` has to
+/// find the matching words before it can decide which part to show.
+fn stripTags(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var in_tag = false;
     var pending_space = false;
     var written: usize = 0;
 
     var i: usize = 0;
-    while (i < body.len and written < SNIPPET_CHARS) {
+    while (i < body.len and written < SCAN_CHARS) {
         const ch = body[i];
 
         // Script and style bodies are noise even after tag stripping.
@@ -355,11 +363,76 @@ fn snippet(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
 /// Runs the Gmail search and fetches enough of each hit to rank it.
 ///
 /// Fetching is the slow part -- one round trip per candidate -- which is why
+/// The words Gmail actually matched on, read back out of the query.
+///
+/// Recovered from the query rather than the question because the question is
+/// full of words that are not search terms ("find the email about ..."),
+/// while the OR group is exactly what the server matched.
+pub fn queryTerms(arena: std.mem.Allocator, query: []const u8) ![]const []const u8 {
+    var terms: std.ArrayList([]const u8) = .empty;
+
+    const open = std.mem.indexOfScalar(u8, query, '(');
+    const close = std.mem.lastIndexOfScalar(u8, query, ')');
+    if (open != null and close != null and close.? > open.? + 1) {
+        var parts = std.mem.splitSequence(u8, query[open.? + 1 .. close.?], " OR ");
+        while (parts.next()) |raw| {
+            const term = std.mem.trim(u8, std.mem.trim(u8, raw, " \t"), "\"");
+            if (term.len >= 3) try terms.append(arena, term);
+        }
+        return terms.items;
+    }
+
+    // No group: take the bare words, minus anything operator-shaped.
+    var tokens = std.mem.tokenizeAny(u8, query, " \t");
+    while (tokens.next()) |token| {
+        if (std.mem.indexOfScalar(u8, token, ':') != null) continue;
+        if (token[0] == '-') continue;
+        const term = std.mem.trim(u8, token, "\"()");
+        if (term.len >= 3) try terms.append(arena, term);
+    }
+    return terms.items;
+}
+
+/// Where the first search term appears in `text`.
+fn firstTermAt(text: []const u8, terms: []const []const u8) ?usize {
+    var earliest: ?usize = null;
+    for (terms) |term| {
+        if (std.ascii.indexOfIgnoreCase(text, term)) |at| {
+            if (earliest == null or at < earliest.?) earliest = at;
+        }
+    }
+    return earliest;
+}
+
+/// The part of `text` worth showing the ranker: a window around the first
+/// match, or the opening when nothing matched.
+///
+/// The bug this fixes: Gmail searched the entire body, the ranker was shown
+/// the first 250 characters of it, and mail whose only mention of the term
+/// sat below the greeting was rejected as irrelevant. Asked for the email
+/// about InfluxDB, the ranker was handed seven openings that read "Christian
+/// has accepted this invitation" and correctly said none of them matched.
+/// Showing it the part that matched is the whole point of having matched.
+fn excerpt(text: []const u8, terms: []const []const u8) []const u8 {
+    const head = text[0..@min(text.len, SNIPPET_CHARS)];
+    const at = firstTermAt(text, terms) orelse return head;
+    if (at < SNIPPET_CHARS) return head;
+
+    // Leave a third of the window before the match, so it reads in context
+    // rather than starting mid-sentence on the term itself.
+    var start = at - SNIPPET_CHARS / 3;
+    // Don't start mid-word.
+    while (start > 0 and start < text.len and !std.ascii.isWhitespace(text[start - 1])) start -= 1;
+    const end = @min(text.len, start + SNIPPET_CHARS);
+    return text[start..end];
+}
+
 /// SCAN_LIMIT is bounded and personal mail short-circuits the loop.
 pub fn collect(
     arena: std.mem.Allocator,
     session: *imap.Session,
     query: [:0]const u8,
+    terms: []const []const u8,
 ) Error![]const Candidate {
     var uid_buffer: [SCAN_LIMIT]imap.Envelope = undefined;
     const hits = session.searchGmail(query, &uid_buffer) catch return Error.SearchFailed;
@@ -383,7 +456,10 @@ pub fn collect(
             .from = arena.dupe(u8, envelope.fromSlice()) catch return Error.SearchFailed,
             .subject = arena.dupe(u8, envelope.subjectSlice()) catch return Error.SearchFailed,
             .date = arena.dupe(u8, envelope.dateSlice()) catch return Error.SearchFailed,
-            .snippet = snippet(arena, message.bodySlice()) catch return Error.SearchFailed,
+            .snippet = excerpt(
+                stripTags(arena, message.bodySlice()) catch return Error.SearchFailed,
+                terms,
+            ),
         };
 
         const target = if (isBulk(message.headersSlice())) &bulk else &personal;
@@ -492,10 +568,18 @@ pub fn find(
     question: []const u8,
     days: ?u16,
 ) !Found {
+    // All Mail, not INBOX. Measured on a real 53k-message mailbox: "InfluxDB"
+    // returns 91 hits in INBOX and 111 in All Mail, because archived mail has
+    // left INBOX. `in:anywhere` does not reach it either -- also measured, 91
+    // either way -- since IMAP confines X-GM-RAW to the selected mailbox.
+    // "I know I got that email" is usually about something long since filed.
+    _ = try session.examine(.all_mail);
+
     const query = try buildQuery(io, arena, ollama_url, model, question, days orelse DEFAULT_DAYS);
     const query_z = try arena.dupeZ(u8, query);
 
-    const candidates = try collect(arena, session, query_z);
+    const terms = try queryTerms(arena, query);
+    const candidates = try collect(arena, session, query_z, terms);
     log.info("gmail returned {d} candidate(s)", .{candidates.len});
     if (candidates.len == 0) return .{ .query = query, .matches = &.{} };
 
@@ -505,7 +589,7 @@ pub fn find(
     };
 }
 
-test "snippet turns HTML-only mail into something the ranker can read" {
+test "stripTags turns HTML-only mail into something the ranker can read" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -514,16 +598,16 @@ test "snippet turns HTML-only mail into something the ranker can read" {
         "<!DOCTYPE html><html><head><style>body{color:red}</style></head>" ++
         "<body><p>Pricing   discussion</p><p>Thursday works</p></body></html>";
 
-    const text = try snippet(arena, html);
+    const text = try stripTags(arena, html);
     try std.testing.expectEqualStrings("Pricing discussion Thursday works", text);
 }
 
-test "snippet leaves plain text alone apart from collapsing whitespace" {
+test "stripTags leaves plain text alone apart from collapsing whitespace" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const text = try snippet(arena, "  Hi there,\r\n\r\nThursday works for me.\n");
+    const text = try stripTags(arena, "  Hi there,\r\n\r\nThursday works for me.\n");
     try std.testing.expectEqualStrings("Hi there, Thursday works for me.", text);
 }
 
@@ -606,4 +690,42 @@ test "unquoted multi-word OR terms are quoted, and repeats dropped" {
 
     // Nothing to do without a group.
     try std.testing.expectEqualStrings("invoice", try tidyOrTerms(arena, "invoice"));
+}
+
+test "the excerpt shows where the term matched, not the top of the message" {
+    // The real shape: a calendar-style opening, with the term only appearing
+    // well past the 250 characters the ranker used to be shown.
+    const opening = "Christian has accepted this invitation. Objectives review, Tuesday 11 Aug 2026 2:30pm to 3pm Central European Time Madrid. Join with Google Meet, join by phone, more phone numbers, view all guest info, reply for this event, notification settings. ";
+    const body = opening ++ "Separately, the InfluxDB retention policy needs a decision before Friday.";
+    const terms = [_][]const u8{"InfluxDB"};
+
+    const shown = excerpt(body, &terms);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "InfluxDB") != null);
+
+    // And the old behaviour would not have.
+    try std.testing.expect(std.mem.indexOf(u8, body[0..250], "InfluxDB") == null);
+
+    // A term near the top still reads from the top rather than jumping.
+    const early = "InfluxDB is billing us again. Details below.";
+    try std.testing.expectEqualStrings(early, excerpt(early, &terms));
+
+    // No match anywhere: fall back to the opening rather than nothing.
+    const unrelated = "Nothing to do with databases at all.";
+    try std.testing.expectEqualStrings(unrelated, excerpt(unrelated, &terms));
+}
+
+test "query terms are read back out of the query, not the question" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const terms = try queryTerms(arena, "newer_than:365d (InfluxDB OR \"influx db\") -category:promotions");
+    try std.testing.expectEqual(@as(usize, 2), terms.len);
+    try std.testing.expectEqualStrings("InfluxDB", terms[0]);
+    try std.testing.expectEqualStrings("influx db", terms[1]);
+
+    // Operators and negations are not search terms.
+    const bare = try queryTerms(arena, "newer_than:365d invoice -category:promotions");
+    try std.testing.expectEqual(@as(usize, 1), bare.len);
+    try std.testing.expectEqualStrings("invoice", bare[0]);
 }

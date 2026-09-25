@@ -264,7 +264,9 @@ pub fn main(init: std.process.Init) !void {
     const query = findmail.buildQuery(init.io, arena, "http://127.0.0.1:11434", "qwen2.5", question, 365) catch "";
     std.debug.print("  query: {s}\n", .{query});
 
-    const candidates = findmail.collect(arena, &session, try arena.dupeZ(u8, query)) catch &[_]findmail.Candidate{};
+    _ = session.examine(.all_mail) catch {};
+    const terms = try findmail.queryTerms(arena, query);
+    const candidates = findmail.collect(arena, &session, try arena.dupeZ(u8, query), terms) catch &[_]findmail.Candidate{};
     std.debug.print("  {d} candidate(s); what the ranker is shown of each:\n", .{candidates.len});
     for (candidates, 0..) |candidate, i| {
         const seen = candidate.snippet[0..@min(candidate.snippet.len, 250)];

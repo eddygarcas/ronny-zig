@@ -140,8 +140,40 @@ fn check(code: c_int, comptime err: Error) Error!void {
     }
 }
 
+/// The two mailboxes Ronny reads.
+///
+/// They are not interchangeable, and the difference is measurable: searching
+/// this mailbox for "InfluxDB" returns 91 hits in INBOX and 111 in All Mail,
+/// because anything archived has left INBOX. `in:anywhere` does not help --
+/// measured, 91 either way. X-GM-RAW runs Gmail's own search but IMAP still
+/// confines it to the selected mailbox, so reaching archived mail is a
+/// different SELECT, not a different query.
+///
+/// All Mail is not simply better: it also holds Sent, so "what arrived this
+/// morning" asked there would list the owner's own replies. Content search
+/// wants everything ever received; the arrival-ordered commands want INBOX.
+pub const Mailbox = enum {
+    inbox,
+    /// Everything not deleted or spam -- archived mail included, and Sent.
+    all_mail,
+
+    pub fn imapName(self: Mailbox) [:0]const u8 {
+        return switch (self) {
+            .inbox => "INBOX",
+            .all_mail => "[Gmail]/All Mail",
+        };
+    }
+};
+
 pub const Session = struct {
     imap: *c.mailimap,
+    /// Which mailbox is selected right now.
+    ///
+    /// Tracked because a UID only means anything inside the mailbox it came
+    /// from: fetching a UID found in All Mail after a SELECT of INBOX would
+    /// silently return a different message, or nothing. Callers that hold a
+    /// UID across turns must re-select the mailbox it came from first.
+    selected: ?Mailbox = null,
 
     pub fn connect(host: [:0]const u8, port: u16, user: [:0]const u8, password: [:0]const u8) Error!Session {
         const imap = c.mailimap_new(0, null) orelse return Error.SessionAlloc;
@@ -160,7 +192,16 @@ pub const Session = struct {
     /// Read-only, so the watcher never marks anything as seen -- the same
     /// guarantee the Python version got from `readonly=True`.
     pub fn examineInbox(self: *Session) Error!Selection {
-        try check(c.mailimap_examine(self.imap, "INBOX"), Error.Select);
+        return self.examine(.inbox);
+    }
+
+    /// Selects `which`, read-only. A no-op when it is already selected, so
+    /// callers can state the mailbox they need without costing a round trip.
+    pub fn examine(self: *Session, which: Mailbox) Error!Selection {
+        if (self.selected != which) {
+            try check(c.mailimap_examine(self.imap, which.imapName().ptr), Error.Select);
+            self.selected = which;
+        }
         return .{
             .exists = ronny_selection_exists(self.imap),
             .uid_next = ronny_selection_uidnext(self.imap),
