@@ -9,9 +9,9 @@
 //! separate means either half can be cut over from the Python service on its
 //! own, and a crash in one does not take down the other.
 //!
-//! What they share is on disk: the allowlist file and the paused flag. The
-//! watcher re-reads both each scan, so a change made from chat takes effect
-//! without a restart.
+//! What they share is on disk: the allowlist file, the paused flag and the
+//! settings. The watcher re-reads all three each scan, so a change made from
+//! chat takes effect without a restart.
 //!
 //! Configuration comes from the environment; see .env.example.
 
@@ -32,6 +32,7 @@ const ollama = @import("ollama.zig");
 const findmail = @import("findmail.zig");
 const attachments = @import("attachments.zig");
 const contacts = @import("contacts.zig");
+const settings = @import("settings.zig");
 const interpret = @import("interpret.zig");
 const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
@@ -58,6 +59,12 @@ const Config = struct {
 fn envOptional(init: std.process.Init, name: []const u8) !?[:0]u8 {
     const value = init.environ_map.get(name) orelse return null;
     return try init.arena.allocator().dupeZ(u8, value);
+}
+
+fn envFlag(init: std.process.Init, name: []const u8) bool {
+    const value = init.environ_map.get(name) orelse return false;
+    return std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "yes");
 }
 
 fn envRequired(init: std.process.Init, name: []const u8) ![:0]u8 {
@@ -115,7 +122,11 @@ fn runBot(init: std.process.Init) !void {
     const controller_state_path = (try envOptional(init, "RONNY_CONTROLLER_STATE_FILE")) orelse
         try arena.dupeZ(u8, "data/controller_state.json");
 
+    const settings_path = (try envOptional(init, "RONNY_SETTINGS_FILE")) orelse
+        try arena.dupeZ(u8, "data/settings.json");
+
     var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
+    var settings_store = settings.Store.init(init.io, arena, settings_path);
 
     const cfg: bot_mod.Config = .{
         .io = init.io,
@@ -134,9 +145,12 @@ fn runBot(init: std.process.Init) !void {
         .jev_model = (try envOptional(init, "JEV_MODEL")) orelse "jev-latest",
         .whisper_model_path = try envOptional(init, "WHISPER_MODEL_PATH"),
         .whisper_languages = (try envOptional(init, "WHISPER_LANGUAGES")) orelse "en,es",
+        // Stays in the environment on purpose: a safety property a chat
+        // message can switch off is not one. See settings.zig.
+        .voice_can_confirm_send = envFlag(init, "VOICE_CAN_CONFIRM_SEND"),
     };
 
-    var bot = bot_mod.Bot.init(cfg, &controller);
+    var bot = bot_mod.Bot.init(cfg, &controller, &settings_store);
     defer bot.deinit();
     try bot.run();
 }
@@ -153,6 +167,8 @@ fn runWatcher(init: std.process.Init) !void {
         try arena.dupeZ(u8, "data/state.json");
     const controller_state_path = (try envOptional(init, "RONNY_CONTROLLER_STATE_FILE")) orelse
         try arena.dupeZ(u8, "data/controller_state.json");
+    const settings_path = (try envOptional(init, "RONNY_SETTINGS_FILE")) orelse
+        try arena.dupeZ(u8, "data/settings.json");
 
     const cfg: Config = .{
         .io = init.io,
@@ -164,6 +180,7 @@ fn runWatcher(init: std.process.Init) !void {
     };
 
     var controller = controller_mod.Controller.init(init.io, arena, senders_path, controller_state_path);
+    var settings_store = settings.Store.init(init.io, arena, settings_path);
     var state = state_mod.State.load(init.io, arena, state_path);
 
     log.info("connecting to {s} as {s}", .{ host, user });
@@ -181,11 +198,29 @@ fn runWatcher(init: std.process.Init) !void {
     log.info("resuming from uid {d} (paused: {})", .{ state.lastUid(), controller.paused });
 
     var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
+    var was_quiet = false;
     while (true) {
+        // Quiet hours stop the *scan*, not the notification. The watermark
+        // stays where it is, so nothing is consumed and marked seen, and
+        // everything that arrived overnight is reported in one go when the
+        // window ends. Dropping notifications instead would be the obvious
+        // implementation and would lose mail silently.
+        //
+        // Re-read each time round: the bot is a separate process, and it is
+        // the one that writes this.
+        const quiet = settings_store.reload().isQuietNow();
+        if (quiet != was_quiet) {
+            log.info("quiet hours {s} -- {s}", .{
+                if (quiet) "started" else "ended",
+                if (quiet) "holding notifications until they end" else "reporting anything that arrived",
+            });
+            was_quiet = quiet;
+        }
+
         // Scan before waiting, not after. Anything that arrived while Ronny
         // was down should be reported on connect rather than sitting unseen
         // until the first IDLE wakeup.
-        scanOnce(cfg, &session, &controller, &state, &buffer) catch |err| {
+        if (!quiet) scanOnce(cfg, &session, &controller, &state, &buffer) catch |err| {
             log.err("scan failed: {s}", .{@errorName(err)});
         };
 
@@ -309,6 +344,7 @@ test {
     _ = findmail;
     _ = attachments;
     _ = contacts;
+    _ = settings;
     _ = bot_mod;
     _ = watchdog_mod;
     _ = interpret;

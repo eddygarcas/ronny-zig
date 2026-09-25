@@ -44,6 +44,8 @@ pub const Action = enum {
     compose_mail,
     list_attachments,
     get_attachment,
+    show_settings,
+    change_setting,
     help,
     unknown,
 
@@ -75,6 +77,12 @@ pub const Action = enum {
             // against the real filenames, so there is nothing for a
             // general-purpose extractor to pull out first.
             .get_attachment,
+            .show_settings,
+            // The new value is read out of the owner's own words by
+            // settings.parseChange, so there is nothing for a general-purpose
+            // extractor to pull out first -- and a model must never be the
+            // thing that decides when the mailbox goes silent.
+            .change_setting,
             .help,
             .unknown,
             => true,
@@ -128,12 +136,14 @@ const ACTION_CRITERIA =
     \\  "compose_mail": "Start a NEW email to someone, not a reply to anything. The recipient is named or described. Drafting only; it never sends. Examples: 'email dana about thursday', 'send sam the notes', 'write to support@acme.com asking for a refund'",
     \\  "list_attachments": "Say what files are attached to the email just shown, without sending any of them. Examples: 'does that have attachments?', 'what is attached to it?', 'any files on that one?'",
     \\  "get_attachment": "Send the owner a file attached to the email just shown. Examples: 'send me the invoice', 'download the pdf', 'give me that attachment', 'forward me the spreadsheet from it'",
-    \\  "add_sender": "Add an email address or domain to the watched-sender allowlist.",
+    \\  "add_sender": "Add an email address or domain to the watched-sender allowlist, so that mail arriving from it is notified. The request names the address or the person. Examples: 'add example@example.com to be notified', 'watch acme.com', 'let me know when anna@acme.com writes'",
     \\  "remove_sender": "Remove an email address or domain from the watched-sender allowlist.",
     \\  "list_senders": "Show which senders are currently on the allowlist.",
-    \\  "pause": "Stop sending notifications for now.",
+    \\  "pause": "Stop sending notifications entirely, for now, until told to resume. Not for silencing only certain hours of the day, which is change_setting.",
     \\  "resume": "Start sending notifications again after a pause.",
-    \\  "status": "Report the assistant's own state: active or paused, and how many senders it watches. Not about mail content.",
+    \\  "status": "Report the assistant's own state: active or paused, and how many senders it watches. Not about mail content, and not its configurable settings, which is show_settings.",
+    \\  "show_settings": "Show the assistant's own configuration -- its quiet hours, and how far back mail commands look by default. Examples: 'what are your settings?', 'what are my quiet hours?', 'how far back do you search?'",
+    \\  "change_setting": "Change one of the assistant's own settings: the hours during which it must not notify, or the default number of days the mail commands look back. The request is about the assistant's behaviour, NOT about which senders it watches (add_sender/remove_sender) and NOT about stopping notifications altogether (pause). Examples: 'don't notify me before 8am', 'no notifications between 10pm and 7am', 'turn off quiet hours', 'look back 30 days by default'",
     \\  "help": "Explain what the assistant can do.",
     \\  "unknown": "None of the other options fit, or the request is something this assistant cannot do at all -- forwarding a message on to a third party, deleting or filing mail, calendars, contacts, or anything unrelated to this mailbox."
     \\}
@@ -281,4 +291,23 @@ test "argless actions skip argument extraction" {
     try std.testing.expect(Action.find_mail.isArgless());
     try std.testing.expect(!Action.read_mail.isArgless());
     try std.testing.expect(!Action.draft_reply.isArgless());
+
+    // A settings change must never take its value from the model: the whole
+    // request goes to settings.parseChange instead.
+    try std.testing.expect(Action.show_settings.isArgless());
+    try std.testing.expect(Action.change_setting.isArgless());
+}
+
+test "every action Jev can choose is one the criteria describe" {
+    // The criteria are hand-written JSON, so an action added to the enum and
+    // forgotten there would simply never be picked -- silently, and only in
+    // production.
+    inline for (@typeInfo(Action).@"enum".fields) |field| {
+        const action = @field(Action, field.name);
+        const quoted = "\"" ++ (if (action == .resume_) "resume" else field.name) ++ "\":";
+        if (std.mem.indexOf(u8, ACTION_CRITERIA, quoted) == null) {
+            std.debug.print("action {s} is missing from ACTION_CRITERIA\n", .{field.name});
+            return error.ActionNotDescribed;
+        }
+    }
 }

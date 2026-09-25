@@ -36,6 +36,7 @@ const headers_mod = @import("headers.zig");
 const mailer = @import("mailer.zig");
 const attachments_mod = @import("attachments.zig");
 const contacts_mod = @import("contacts.zig");
+const settings_mod = @import("settings.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -47,6 +48,9 @@ pub const DEFAULT_DAYS = 14;
 /// A compose gathers its pieces across turns; this bounds how long a
 /// half-finished one can capture the next thing the owner says.
 pub const COMPOSE_TTL_SECONDS = 300;
+/// A spoken settings change waits for a yes. Same reasoning as the compose
+/// TTL: an abandoned question must not answer itself later.
+pub const PENDING_SETTING_TTL_SECONDS = 300;
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
@@ -65,7 +69,8 @@ pub const HELP_TEXT =
     \\/add <address-or-domain> - add to the allowlist
     \\/remove <address-or-domain> - remove from the allowlist
     \\/search <address-or-domain> [days] - list recent mail (dates + subjects)
-    \\/recent [days] - what has arrived lately, whoever sent it\n    \\/find <what it was about> - search mail by topic, not sender
+    \\/recent [days] - what has arrived lately, whoever sent it
+    \\/find <what it was about> - search mail by topic, not sender
     \\/read <address-or-domain> [days] - show the latest email's content
     \\/summarize <address-or-domain> [days] - summarize the latest email
     \\/attachments - list the files attached to the last email I showed you
@@ -76,6 +81,11 @@ pub const HELP_TEXT =
     \\/cancel - discard the drafted reply
     \\/pause - stop notifications temporarily
     \\/resume - resume notifications
+    \\/settings - show my settings (quiet hours, default look-back)
+    \\
+    \\Settings change in plain language too: "don't notify me before 8am",
+    \\"no notifications between 10pm and 7am", "look back 30 days by default".
+    \\Spoken out loud, I read the new value back and wait for a typed yes.
     \\
     \\When a reply is drafted, just answer 'yes' to send or 'no' to discard.
     \\I never send email until you say yes.
@@ -183,6 +193,15 @@ const Staged = struct {
     created_ns: i96,
 };
 
+/// A settings change that was *spoken* and is waiting to be confirmed.
+///
+/// Needs no arena: a Change is a couple of integers, and the description
+/// shown back is rebuilt from it rather than stored.
+const PendingSetting = struct {
+    change: settings_mod.Change,
+    created_ns: i96,
+};
+
 const Turn = struct {
     owner: []u8,
     assistant: []u8,
@@ -191,6 +210,8 @@ const Turn = struct {
 pub const Bot = struct {
     cfg: Config,
     controller: *controller_mod.Controller,
+    /// Owned by main so the watcher process can point at the same file.
+    settings: *settings_mod.Store,
     client: telegram.Client,
 
     session: ?imap.Session = null,
@@ -198,6 +219,7 @@ pub const Bot = struct {
     pending: ?Pending = null,
     staged: ?Staged = null,
     composing: ?Composing = null,
+    pending_setting: ?PendingSetting = null,
 
     history: std.ArrayList(Turn) = .empty,
     vocabulary: []const []const u8 = &.{},
@@ -205,10 +227,15 @@ pub const Bot = struct {
     vocabulary_refreshed_ns: i96 = 0,
     whisper_loaded: bool = false,
 
-    pub fn init(cfg: Config, controller: *controller_mod.Controller) Bot {
+    pub fn init(
+        cfg: Config,
+        controller: *controller_mod.Controller,
+        settings_store: *settings_mod.Store,
+    ) Bot {
         return .{
             .cfg = cfg,
             .controller = controller,
+            .settings = settings_store,
             .client = .{
                 .io = cfg.io,
                 .gpa = cfg.gpa,
@@ -427,6 +454,20 @@ pub const Bot = struct {
         return composing;
     }
 
+    /// The staged change, unless it has gone stale.
+    fn freshPendingSetting(self: *Bot) ?settings_mod.Change {
+        const staged = self.pending_setting orelse return null;
+        const age = @divTrunc(
+            std.Io.Clock.now(.boot, self.cfg.io).nanoseconds - staged.created_ns,
+            std.time.ns_per_s,
+        );
+        if (age > PENDING_SETTING_TTL_SECONDS) {
+            self.pending_setting = null;
+            return null;
+        }
+        return staged.change;
+    }
+
     fn discardStaged(self: *Bot) void {
         if (self.staged) |*staged| staged.arena.deinit();
         self.staged = null;
@@ -582,6 +623,7 @@ pub const Bot = struct {
         if (std.mem.eql(u8, command, "/senders")) return self.sendersText(arena);
         if (std.mem.eql(u8, command, "/confirm")) return self.doConfirm(arena);
         if (std.mem.eql(u8, command, "/cancel")) return self.doCancel(arena);
+        if (std.mem.eql(u8, command, "/settings")) return self.settingsText(arena);
         if (std.mem.eql(u8, command, "/pause")) return self.doPause();
         if (std.mem.eql(u8, command, "/resume")) return self.doResume();
 
@@ -660,6 +702,31 @@ pub const Bot = struct {
                 },
                 .unclear => {},
             }
+        } else if (self.freshPendingSetting()) |change| {
+            switch (answer) {
+                .confirm => {
+                    // Same rule as a pending send: a spoken yes does not
+                    // commit anything. The staged change is kept, so the
+                    // owner only has to type the one word.
+                    if (spoken) {
+                        log.info("ignoring a spoken yes on a staged settings change", .{});
+                        return "I don't act on a spoken yes for settings -- type yes to confirm it, or no to leave things as they are.";
+                    }
+                    log.info("owner confirmed the staged settings change with: {s}", .{text});
+                    self.pending_setting = null;
+                    return self.applySetting(arena, change);
+                },
+                // A spoken no is honoured: declining is the safe direction,
+                // and making someone type to *refuse* something is friction
+                // with nothing behind it.
+                .cancel => {
+                    log.info("owner rejected the staged settings change with: {s}", .{text});
+                    self.pending_setting = null;
+                    return "Left your settings as they were.";
+                },
+                // Anything else is a new request, not an answer to this one.
+                .unclear => {},
+            }
         } else if (self.freshComposing() != null and answer == .cancel) {
             self.discardComposing();
             return "Dropped it. Nothing was drafted.";
@@ -712,6 +779,10 @@ pub const Bot = struct {
             .help => HELP_TEXT,
             .status => try self.statusText(arena),
             .list_senders => try self.sendersText(arena),
+            .show_settings => try self.settingsText(arena),
+            // Parsed from the owner's literal words, not from model output --
+            // see settings.parseChange.
+            .change_setting => try self.doChangeSetting(arena, text, spoken),
             .pause => self.doPause(),
             .resume_ => self.doResume(),
             .add_sender => if (understood.target) |target|
@@ -812,6 +883,143 @@ pub const Bot = struct {
             return "I've resumed, but couldn't write it to disk.";
         };
         return "Resumed.";
+    }
+
+    /// Everything the owner can change, plus the two things they cannot.
+    ///
+    /// The read-only pair is shown on purpose: "why didn't my spoken yes send
+    /// that email" is a question this answers, and a setting nobody can see is
+    /// one nobody knows is on.
+    fn settingsText(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const senders = try self.controller.senders();
+        defer self.controller.freeSenders(senders);
+        const current = self.settings.reload();
+
+        var from_buffer: [8]u8 = undefined;
+        var to_buffer: [8]u8 = undefined;
+
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("Watching {d} sender(s)", .{senders.len});
+        try out.writer.print("\nNotifications: {s}", .{
+            if (self.controller.isPaused()) "paused" else "on",
+        });
+        if (current.quietEnabled()) {
+            try out.writer.print("\nQuiet hours: {s}-{s} (I keep watching, and tell you what arrived once they end)", .{
+                settings_mod.formatTime(current.quiet_from, &from_buffer),
+                settings_mod.formatTime(current.quiet_to, &to_buffer),
+            });
+        } else {
+            try out.writer.writeAll("\nQuiet hours: off");
+        }
+        try out.writer.print("\nDefault look-back: {d} days", .{current.default_days});
+        try out.writer.print("\nVoice can confirm send: {s} (set in .env)", .{
+            if (self.cfg.voice_can_confirm_send) "yes" else "no",
+        });
+        try out.writer.print("\nModel: {s} (set in .env)", .{self.cfg.ollama_model});
+        return out.written();
+    }
+
+    fn doChangeSetting(
+        self: *Bot,
+        arena: std.mem.Allocator,
+        text: []const u8,
+        spoken: bool,
+    ) ![]const u8 {
+        const current = self.settings.reload();
+
+        const change = settings_mod.parseChange(text, current) orelse {
+            // Refusing beats guessing here: a wrong quiet window shows up as
+            // no notifications, which is indistinguishable from working.
+            log.info("no settings change found in: {s}", .{text});
+            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\" or \"look back 30 days by default\" -- /settings shows what I have now.";
+        };
+
+        // A typed change is unambiguous and applies immediately. A *spoken*
+        // one waits for a yes, because the one failure typing does not have
+        // is mishearing -- and "before 8am" heard as "before 9am" produces a
+        // quiet window the owner never asked for, whose symptom is silence.
+        // Silence is indistinguishable from everything working, so this is
+        // the kind of mistake nobody notices for a week.
+        //
+        // Confirmation has to be *typed*, the same as a pending send: one
+        // rule across the whole bot -- nothing a voice note says is committed
+        // without a typed yes -- is easier to rely on than a per-feature
+        // judgment about which mistakes are recoverable. Declining still
+        // works by voice, because refusing is the safe direction.
+        if (spoken) {
+            self.pending_setting = .{
+                .change = change,
+                .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+            };
+            return std.fmt.allocPrint(arena, "{s}\n\nType yes to confirm, or say no to leave it.", .{
+                try describeChange(arena, change),
+            });
+        }
+
+        return self.applySetting(arena, change);
+    }
+
+    /// What a change would do, in the owner's terms. Shown before a spoken
+    /// change is applied so a misheard time is caught by reading it back.
+    fn describeChange(arena: std.mem.Allocator, change: settings_mod.Change) ![]const u8 {
+        var from_buffer: [8]u8 = undefined;
+        var to_buffer: [8]u8 = undefined;
+        return switch (change) {
+            .quiet_off => "That turns quiet hours off -- I'd notify you whenever mail arrives.",
+            .quiet_hours => |window| try std.fmt.allocPrint(
+                arena,
+                "That sets quiet hours to {s}-{s}.",
+                .{
+                    settings_mod.formatTime(window.from, &from_buffer),
+                    settings_mod.formatTime(window.to, &to_buffer),
+                },
+            ),
+            .default_days => |days| try std.fmt.allocPrint(
+                arena,
+                "That sets the default look-back to {d} day(s).",
+                .{days},
+            ),
+        };
+    }
+
+    fn applySetting(self: *Bot, arena: std.mem.Allocator, change: settings_mod.Change) ![]const u8 {
+        var current = self.settings.reload();
+
+        switch (change) {
+            .quiet_off => {
+                current.quiet_from = settings_mod.OFF;
+                current.quiet_to = settings_mod.OFF;
+            },
+            .quiet_hours => |window| {
+                current.quiet_from = window.from;
+                current.quiet_to = window.to;
+            },
+            .default_days => |days| current.default_days = days,
+        }
+
+        self.settings.save(current) catch |err| {
+            log.err("could not persist settings: {s}", .{@errorName(err)});
+            return "I understood that, but couldn't write it to disk -- it would be lost on a restart, so I haven't applied it.";
+        };
+
+        var from_buffer: [8]u8 = undefined;
+        var to_buffer: [8]u8 = undefined;
+        return switch (change) {
+            .quiet_off => "Quiet hours off -- I'll notify you whenever mail arrives.",
+            .quiet_hours => try std.fmt.allocPrint(
+                arena,
+                "Quiet hours set: {s}-{s}. Nothing will reach you in that window; whatever arrives is reported once it ends.",
+                .{
+                    settings_mod.formatTime(current.quiet_from, &from_buffer),
+                    settings_mod.formatTime(current.quiet_to, &to_buffer),
+                },
+            ),
+            .default_days => |days| try std.fmt.allocPrint(
+                arena,
+                "Default look-back set to {d} day(s).",
+                .{days},
+            ),
+        };
     }
 
     // ---- mailbox ----
@@ -1081,8 +1289,13 @@ pub const Bot = struct {
         });
     }
 
+    /// Re-read rather than cached: the owner may have changed it this session.
+    fn defaultDays(self: *Bot) u16 {
+        return self.settings.reload().default_days;
+    }
+
     fn doSearch(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
-        const days = days_opt orelse DEFAULT_DAYS;
+        const days = days_opt orelse self.defaultDays();
         const target_z = try arena.dupeZ(u8, target);
         const buffer = try arena.alloc(imap.Envelope, SEARCH_RESULT_LIMIT);
 
@@ -1125,6 +1338,10 @@ pub const Bot = struct {
     /// already answered with "anyone".
     fn doRecentMail(self: *Bot, arena: std.mem.Allocator, days_opt: ?u16) ![]const u8 {
         // IMAP's SINCE has date granularity, so "this morning" is today.
+        // Deliberately not the configurable look-back: "anything new?" means
+        // today, and answering it with a fortnight of mail is not the same
+        // question. The look-back is for "any mail from X", which has to
+        // reach back far enough to find something.
         const days = days_opt orelse 1;
         const buffer = try arena.alloc(imap.Envelope, SEARCH_RESULT_LIMIT);
 
@@ -1242,7 +1459,7 @@ pub const Bot = struct {
     }
 
     fn doRead(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
-        const days = days_opt orelse DEFAULT_DAYS;
+        const days = days_opt orelse self.defaultDays();
         const latest = self.fetchLatest(arena, target, days) catch |err| {
             log.err("fetching the latest mail failed for {s}: {s}", .{ target, @errorName(err) });
             return "Couldn't read the mailbox right now -- try again in a bit.";
@@ -1268,7 +1485,7 @@ pub const Bot = struct {
     }
 
     fn doSummarize(self: *Bot, arena: std.mem.Allocator, target: []const u8, days_opt: ?u16) ![]const u8 {
-        const days = days_opt orelse DEFAULT_DAYS;
+        const days = days_opt orelse self.defaultDays();
         const latest = self.fetchLatest(arena, target, days) catch |err| {
             log.err("fetching the latest mail failed for {s}: {s}", .{ target, @errorName(err) });
             return "Couldn't read the mailbox right now -- try again in a bit.";
@@ -2013,4 +2230,34 @@ test "a target is trimmed to something a mail server can match" {
     try std.testing.expectEqualStrings("Vicente Ferrer", Bot.tidyTarget("Vicente Ferrer"));
     try std.testing.expectEqualStrings("sam@example.com", Bot.tidyTarget("sam@example.com"));
     try std.testing.expectEqualStrings("omarchy.org", Bot.tidyTarget("omarchy.org."));
+}
+
+test "a spoken settings change is read back as the value that would be stored" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // This read-back is the whole guard. Whisper hearing "nine" for "eight"
+    // is invisible in the transcript -- both are plausible sentences -- but
+    // wrong in the parsed window, which is what gets shown here.
+    const heard = settings_mod.parseChange("don't notify me before 8am", .{}).?;
+    const misheard = settings_mod.parseChange("don't notify me before 9am", .{}).?;
+
+    try std.testing.expectEqualStrings(
+        "That sets quiet hours to 22:00-08:00.",
+        try Bot.describeChange(arena, heard),
+    );
+    try std.testing.expectEqualStrings(
+        "That sets quiet hours to 22:00-09:00.",
+        try Bot.describeChange(arena, misheard),
+    );
+
+    try std.testing.expectEqualStrings(
+        "That sets the default look-back to 30 day(s).",
+        try Bot.describeChange(arena, settings_mod.parseChange("look back 30 days", .{}).?),
+    );
+    try std.testing.expectEqualStrings(
+        "That turns quiet hours off -- I'd notify you whenever mail arrives.",
+        try Bot.describeChange(arena, settings_mod.parseChange("turn off quiet hours", .{}).?),
+    );
 }

@@ -52,6 +52,21 @@ pub fn main(init: std.process.Init) !void {
                 // must not become a search for an invented address.
                 .{ .text = "Show me the latest email from Vicente Ferrer.", .want = .read_mail },
                 .{ .text = "any mail from Vicente Ferrer this week?", .want = .search_mail },
+                // Settings, and the neighbours they could plausibly steal
+                // from. "add ... to be notified" reads like a notification
+                // setting and is not one: it is a sender joining the
+                // allowlist.
+                .{ .text = "add example@example.com email account to be notified", .want = .add_sender },
+                .{ .text = "notify me when acme.com writes", .want = .add_sender },
+                .{ .text = "don't notify me before 8am", .want = .change_setting },
+                .{ .text = "no notifications between 10pm and 7am", .want = .change_setting },
+                .{ .text = "turn off quiet hours", .want = .change_setting },
+                .{ .text = "look back 30 days by default", .want = .change_setting },
+                .{ .text = "what are your settings?", .want = .show_settings },
+                .{ .text = "what are my quiet hours?", .want = .show_settings },
+                // Silencing everything indefinitely is still pause, not a
+                // quiet window.
+                .{ .text = "stop notifying me until I say otherwise", .want = .pause },
                 // Still out of scope.
                 .{ .text = "forward that to my accountant", .want = .unknown },
                 .{ .text = "delete all the newsletters", .want = .unknown },

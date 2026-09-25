@@ -23,6 +23,22 @@
 #include <strings.h>
 #include <stddef.h>
 
+/* ---- local time ---- */
+
+/* Minutes since local midnight.
+ *
+ * Not libetpan, but here for the same reason as the rest of this file: Zig's
+ * standard library has no timezone database, so "is it currently quiet
+ * hours?" cannot be answered from std alone. libc already knows, via TZ and
+ * /etc/localtime, and asking it is one line.
+ */
+int ronny_local_minutes(void) {
+    time_t now = time(NULL);
+    struct tm local;
+    if (localtime_r(&now, &local) == NULL) return -1;
+    return local.tm_hour * 60 + local.tm_min;
+}
+
 /* ---- selection info (hidden behind bitfields) ---- */
 
 uint32_t ronny_selection_exists(mailimap *session) {

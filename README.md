@@ -224,29 +224,138 @@ On first run the watcher baselines to the mailbox's current position rather
 than treating every existing message as new — otherwise a large mailbox would
 produce one notification per message.
 
-## Talking to it
+## User guide
 
-Plain language works; the slash commands are the same actions, spelled out.
+Everything Ronny can do is one of the actions below — that list is closed on
+purpose. A chat message is matched against it and nothing else, so a request
+that is not on the list is answered with "I can't do that" rather than with
+the nearest-looking thing. Each action has a slash command; plain language and
+voice notes reach exactly the same ones. A **voice note** reaches every
+action on this page, with two differences where mishearing would cost
+something — noted under *Writing mail* and *Settings*.
 
-| | |
-|---|---|
-| `/status`, `/senders` | what it is doing, who it watches |
-| `/add`, `/remove` | change the allowlist, live |
-| `/search <who> [days]` | recent mail from someone, dates and subjects |
-| `/recent [days]` | what has arrived lately, whoever sent it |
-| `/find <topic>` | search by what a message was *about* |
-| `/read`, `/summarize [who]` | the latest message, in full or summarised — the sender is optional |
-| `/attachments`, `/get <name>` | what is attached; send me one |
-| `/reply <text>` | draft a reply to the last message shown |
-| `/compose <who> <what>` | draft a new email |
-| `/confirm`, `/cancel` | send the draft, or discard it |
-| `/pause`, `/resume` | stop and start notifications |
+### Watching
 
-Send a **voice note** instead of typing and it does the same things. Send a
-**file** and it is held for the next draft.
+| Say | Or type | What happens |
+|---|---|---|
+| "what are you doing?" | `/status` | active or paused, and how many senders are watched |
+| "who are you watching?" | `/senders` | the allowlist, in full |
+| "add anna@acme.com to be notified" | `/add <address-or-domain>` | adds a sender. A bare domain matches everyone at it |
+| "stop watching acme.com" | `/remove <address-or-domain>` | removes a sender. Mail from them is no longer evaluated at all |
+| "stop bugging me for a bit" | `/pause` | no notifications until you resume. Mail is still tracked, not lost |
+| "you can notify me again" | `/resume` | back on |
 
-Nothing is sent until you reply `yes` to a draft you can see — and a *spoken*
-yes will not do it, because a misheard word should not be able to send mail.
+### Reading mail
+
+The sender can be an address, a domain, or just a person's name — Gmail
+matches display names too, so "the latest from Vicente Ferrer" works without
+you knowing their address. `[days]` defaults to the look-back in `/settings`.
+
+| Say | Or type | What happens |
+|---|---|---|
+| "any mail from acme.com this week?" | `/search <who> [days]` | lists several messages from one sender: dates and subjects, no bodies |
+| "what came in this morning?" | `/recent [days]` | lists what arrived lately whoever sent it. Defaults to today |
+| "find the email about the pricing discussion" | `/find <topic>` | searches by what a message was *about*, with no sender named |
+| "show me the last email from anna" | `/read [who] [days]` | the full body of one message. The sender is optional |
+| "summarise it" | `/summarize [who] [days]` | the same message, summarised by the local model |
+
+"it", "that one" and "the same email" refer back to the message just shown,
+rather than fetching something else.
+
+### Attachments
+
+| Say | Or type | What happens |
+|---|---|---|
+| "does that have attachments?" | `/attachments` | lists the files on the message just shown, largest and real files first |
+| "send me the invoice" | `/get <name>` | sends you one of them, picked by matching your words against the real filenames |
+
+Send Ronny **a file** and it is held for the next draft you compose.
+
+### Writing mail
+
+Ronny drafts; you send. There is deliberately **no send action** in the list
+at all, so nothing the models produce can reach the outbox.
+
+| Say | Or type | What happens |
+|---|---|---|
+| "reply saying Wednesday works" | `/reply <text>` | drafts a reply to the message just shown. The recipient comes from its own headers, never from model output |
+| "email dana about thursday" | `/compose <who> <what>` | drafts a new email. Gathers the recipient and the wording over as many turns as it takes |
+| "yes" | `/confirm` | sends the draft you were shown |
+| "no" | `/cancel` | discards it |
+
+Two rules apply to voice when writing mail:
+
+- **A spoken yes will not send anything** unless `VOICE_CAN_CONFIRM_SEND=true`.
+  Typing is unambiguous; a misheard word should not be able to send mail.
+- **A spoken recipient address is not accepted.** A dictated address is still
+  address-*shaped* when it is misheard, so it looks valid and goes to a
+  stranger. Addresses for a new email must be typed, or come from a message
+  Ronny already fetched.
+
+### Settings
+
+| Say | Or type | What happens |
+|---|---|---|
+| "what are your settings?" | `/settings` | quiet hours, default look-back, and the two `.env`-only settings |
+| "don't notify me before 8am" | — | sets quiet hours |
+| "no notifications between 10pm and 7am" | — | sets both ends at once |
+| "turn off quiet hours" | — | back to notifying whenever mail arrives |
+| "look back 30 days by default" | — | changes the default `[days]` for the mail commands |
+
+**Quiet hours hold mail, they do not drop it.** During the window the watcher
+stops scanning, so the read position stays where it is and everything that
+arrived is reported in one go once the window ends. Silently swallowing
+notifications would be the obvious implementation and the wrong one — the
+failure mode of a wrong quiet window is silence, which looks exactly like
+everything working.
+
+The time is read out of your own words by [`settings.zig`](src/settings.zig),
+not by a model. Jev decides *that* you asked for a settings change; what the
+new value is never comes from model output. `8am`, `08:00`, `8 am`, `20:30`
+and `10pm-7am` all parse; anything it cannot read is refused rather than
+guessed at.
+
+**Said out loud, a settings change is read back and waits for a typed yes:**
+
+```
+you › 🎤 "don't notify me before 8am"
+Ronny › I heard: "don't notify me before 8am"
+Ronny › That sets quiet hours to 22:00-08:00.
+
+         Type yes to confirm, or say no to leave it.
+you › yes
+Ronny › Quiet hours set: 22:00-08:00. Nothing will reach you in that
+         window; whatever arrives is reported once it ends.
+```
+
+Mishearing is the one failure typing does not have, and "before 8am" heard as
+"before 9am" is a perfectly plausible sentence — the mistake is invisible in
+the transcript and only visible in the parsed window, which is what gets read
+back. Its symptom would be silence, which is indistinguishable from
+everything working.
+
+The confirmation must be **typed**, the same as sending mail. One rule across
+the whole bot — nothing a voice note says is committed without a typed yes —
+is easier to rely on than a per-feature judgment about which mistakes are
+recoverable. Saying *no* still works out loud, because declining is the safe
+direction. A typed settings change applies straight away, with no
+confirmation step.
+
+Two settings are deliberately **not** changeable from chat, and are shown
+read-only so you can at least see them: `VOICE_CAN_CONFIRM_SEND` and the
+model. A safety property a chat message can switch off is not a safety
+property, and a mistyped model URL would silently disable the spam gate.
+
+### Anything else
+
+| Say | Or type | What happens |
+|---|---|---|
+| "what can you do?" | `/help` | the same list, from the bot |
+| — | `/start` | tells you your chat id, for first-time setup |
+
+Requests outside the list — forwarding mail to someone else, deleting or
+filing it, calendars, contacts — are answered as out of scope. They are not
+quietly turned into the closest available action.
 
 ## Voice on the GPU
 
@@ -326,6 +435,7 @@ and what must not.
 | `src/mailer.zig` | The only code that can send mail. Decision-free by design |
 | `src/headers.zig` | RFC 5322 header reading; where a recipient comes from |
 | `src/spam.zig` | Header checks, then a local judgment call. Fails open |
+| `src/settings.zig` | The knobs, and reading a change out of plain words without a model |
 | `src/watchdog.zig` | Journal tailing, incident detection, diagnosis |
 | `src/shim.c` | libetpan: IMAP, MIME walking, transfer decoding |
 | `src/smtp_shim.c` | libetpan SMTP, STARTTLS |
