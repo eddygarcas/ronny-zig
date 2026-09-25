@@ -38,7 +38,14 @@ pub const DEFAULT_DAYS = 365;
 /// tightly because each candidate costs its own IMAP round trip -- Python
 /// fetched them in one batch, which libetpan does not make easy -- so this is
 /// the difference between a two-second answer and a thirty-second one.
-const SCAN_LIMIT = CANDIDATE_LIMIT * 2;
+/// How many matches are looked at before choosing which to read.
+///
+/// Wider than CANDIDATE_LIMIT because the newest matches are not always the
+/// relevant ones: "InfluxDB" matches 111 messages in this mailbox, and taking
+/// the newest 20 means a thread from two months ago is never considered.
+/// Envelopes arrive in one batched FETCH, so widening this is nearly free --
+/// it is fetching *bodies* that costs, and that stays at CANDIDATE_LIMIT.
+const SCAN_LIMIT = CANDIDATE_LIMIT * 4;
 
 pub const Error = error{SearchFailed};
 
@@ -67,19 +74,22 @@ pub const Found = struct {
 ///
 /// Falls back to the raw question, which Gmail handles acceptably as a bag of
 /// words, when the model is unavailable or unhelpful.
-pub fn buildQuery(
+/// The search terms for a question, in the order the owner would recognise:
+/// their own wording first, invented synonyms last.
+pub fn buildTerms(
     io: std.Io,
     arena: std.mem.Allocator,
     ollama_url: []const u8,
     model: []const u8,
     question: []const u8,
-    days: u16,
-) ![]const u8 {
+) ![]const []const u8 {
     const prompt = try std.fmt.allocPrint(arena,
         \\Convert this request into a Gmail search query.
         \\People rarely word an email the way the request words it, so include likely alternative phrasings joined with OR inside parentheses -- the words that would actually appear in such an email.
         \\Example: a request about someone proposing a meeting time becomes
         \\(calendly OR schedule OR availability OR invitation OR "are you free")
+        \\Put the user's own wording FIRST, before any alternative you add -- the literal phrase they used, then its obvious spelling variants, then looser synonyms last.
+        \\Quote any term of more than one word: "influx db", not influx db.
         \\Drop filler like 'find' or 'the email about'. Do not add from:, newer_than: or category: operators. Reply with the query only.
         \\
         \\Request: {s}
@@ -97,14 +107,10 @@ pub fn buildQuery(
     if (first_line.len == 0) first_line = question;
     first_line = try balanceQuotes(arena, first_line);
     first_line = try stripOperators(arena, first_line);
-    first_line = try trimToTerms(arena, first_line);
-    first_line = try tidyOrTerms(arena, first_line);
 
-    // Filtering promotions Gmail-side is far cheaper than fetching newsletters
-    // and discarding them; isBulk below stays as a backstop for the rest.
-    const query = try std.fmt.allocPrint(arena, "newer_than:{d}d {s} -category:promotions", .{ days, first_line });
-    log.info("gmail query: {s}", .{query});
-    return query;
+    const terms = try cleanTerms(arena, try parseTerms(arena, first_line));
+    if (terms.len == 0) return cleanTerms(arena, try parseTerms(arena, question));
+    return terms;
 }
 
 /// Gmail search operators the model is told not to emit, and does anyway.
@@ -172,7 +178,65 @@ fn stripOperators(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
     return out.writer.buffered();
 }
 
-/// Quotes multi-word OR terms and drops repeats.
+/// Splits whatever the model returned into search terms.
+///
+/// Deliberately indifferent to the shape it used. Every pass below used to
+/// key on a parenthesised group, and the model simply stopped emitting one:
+///
+///   newer_than:365d influx db OR influx db OR influxdb OR time series database
+///
+/// No parentheses, so quoting, de-duplication, exact-match pinning and the
+/// narrow-first ladder all silently did nothing, and the search went out with
+/// `influx db` meaning `influx AND db`. Depending on a model's formatting is
+/// the same mistake as depending on its content. The terms are parsed out,
+/// operated on as a list, and the query is rendered here -- so the only thing
+/// taken from the model is which words to look for.
+fn parseTerms(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var terms: std.ArrayList([]const u8) = .empty;
+
+    // Anything outside a group is still terms; the parens carry no meaning
+    // once the query is re-rendered.
+    var body = std.mem.trim(u8, text, " \t");
+    if (std.mem.indexOfScalar(u8, body, '(')) |open| {
+        if (std.mem.lastIndexOfScalar(u8, body, ')')) |close| {
+            if (close > open + 1) body = body[open + 1 .. close];
+        }
+    }
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < body.len) {
+        // " OR " in any case, and only outside quotes.
+        if (body[i] == '"') {
+            i += 1;
+            while (i < body.len and body[i] != '"') i += 1;
+            i += 1;
+            continue;
+        }
+        if (i + 4 <= body.len and body[i] == ' ' and
+            std.ascii.eqlIgnoreCase(body[i + 1 .. @min(body.len, i + 3)], "or") and
+            i + 3 < body.len and body[i + 3] == ' ')
+        {
+            try appendTerm(arena, &terms, body[start..i]);
+            i += 4;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    try appendTerm(arena, &terms, body[start..]);
+    return terms.items;
+}
+
+fn appendTerm(arena: std.mem.Allocator, terms: *std.ArrayList([]const u8), raw: []const u8) !void {
+    const term = std.mem.trim(u8, raw, " \t()");
+    if (term.len == 0) return;
+    // An operator the model added on its own is not a search term.
+    if (std.mem.indexOfScalar(u8, term, ':') != null) return;
+    try terms.append(arena, term);
+}
+
+/// Quotes multi-word terms, drops repeats, and pins distinctive names.
 ///
 /// Observed live, asked twice for the same thing:
 ///
@@ -180,69 +244,81 @@ fn stripOperators(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
 ///   (InfluxDB OR influxdb)
 ///
 /// The second found the mail. The first found seven unrelated messages --
-/// calendar invitations and wiki notifications -- because a bare `influx db`
-/// is not one term to Gmail, it is `influx AND db`, and a space binds tighter
-/// than OR. So the group stopped meaning "any of these" and started pulling
-/// in mail that contained neither word as written. From the outside that is
-/// indistinguishable from "you have no email about InfluxDB", which is what
-/// the owner was told.
-///
-/// The fourth thing the query prompt has been ignored about, after quoting,
-/// length and injected operators. Same conclusion each time: if it matters,
-/// do not ask the model for it, fix it afterwards.
-fn tidyOrTerms(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
-    const open = std.mem.indexOfScalar(u8, query, '(') orelse return query;
-    const close = std.mem.lastIndexOfScalar(u8, query, ')') orelse return query;
-    if (close <= open + 1) return query;
+/// calendar invitations, wiki notifications -- because a bare `influx db` is
+/// not one term to Gmail, it is `influx AND db`, and a space binds tighter
+/// than OR. The group stopped meaning "any of these". From the outside that
+/// is indistinguishable from "there is no such email", which is what the
+/// owner was told.
+fn cleanTerms(arena: std.mem.Allocator, terms: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
 
-    var terms: std.ArrayList([]const u8) = .empty;
-    var changed = false;
+    for (terms) |raw| {
+        if (out.items.len >= MAX_TERMS) break;
 
-    var parts = std.mem.splitSequence(u8, query[open + 1 .. close], " OR ");
-    while (parts.next()) |raw| {
-        const term = std.mem.trim(u8, raw, " \t");
-        if (term.len == 0) {
-            changed = true;
-            continue;
-        }
+        const bare = std.mem.trim(u8, raw, "\"+");
+        if (bare.len == 0) continue;
 
-        // Compare on the bare words, so "influx db" and influx db are one
-        // term rather than two spellings of it.
-        const bare = std.mem.trim(u8, term, "\"");
-        if (bare.len == 0) {
-            changed = true;
-            continue;
-        }
+        // Gmail search is case-insensitive, so a case variant is not a second
+        // term -- it is the same search run twice.
         var seen = false;
-        for (terms.items) |existing| {
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, existing, "\""), bare)) seen = true;
+        for (out.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, existing, "\"+"), bare)) seen = true;
         }
-        if (seen) {
-            changed = true;
-            continue;
-        }
+        if (seen) continue;
 
-        if (std.mem.indexOfScalar(u8, bare, ' ') != null and term[0] != '"') {
-            try terms.append(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{bare}));
-            changed = true;
+        if (std.mem.indexOfScalar(u8, bare, ' ') != null) {
+            try out.append(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{bare}));
+        } else if (isDistinctive(bare)) {
+            try out.append(arena, try std.fmt.allocPrint(arena, "+{s}", .{bare}));
         } else {
-            try terms.append(arena, term);
+            try out.append(arena, bare);
         }
     }
+    return out.items;
+}
 
-    if (!changed or terms.items.len == 0) return query;
+/// Forces exact matching on distinctive terms.
+///
+/// Gmail stems and expands by default, so a product name matches anything
+/// sharing a root and a search for "Influx" drags in "influence". A leading
+/// `+` turns that off for one term -- documented in Gmail's operator list
+/// alongside AROUND and the brace form of OR.
+///
+/// Applied only to single words carrying an internal capital or a digit --
+/// InfluxDB, S3, RZPT-3989 -- which are names rather than vocabulary. Doing
+/// it to ordinary words would be worse than useless: "invoice" would stop
+/// matching "invoices".
+fn isDistinctive(term: []const u8) bool {
+    // Two is enough: "S3" is a name, and a short one is exactly the kind
+    // that stemming mangles.
+    if (term.len < 2 or term.len > 40) return false;
+    if (std.mem.indexOfScalar(u8, term, ' ') != null) return false;
 
+    for (term[1..]) |ch| {
+        if (std.ascii.isUpper(ch) or std.ascii.isDigit(ch)) return true;
+    }
+    return false;
+}
+
+/// The canonical query. The only thing that came from the model is the words.
+pub fn renderQuery(arena: std.mem.Allocator, terms: []const []const u8, days: u16) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
-    try out.writer.writeAll(query[0 .. open + 1]);
-    for (terms.items, 0..) |term, i| {
+    try out.writer.print("newer_than:{d}d (", .{days});
+    for (terms, 0..) |term, i| {
         if (i > 0) try out.writer.writeAll(" OR ");
         try out.writer.writeAll(term);
     }
-    try out.writer.writeAll(query[close..]);
-
-    log.info("tidied the OR terms to {d}", .{terms.items.len});
+    // Filtering promotions Gmail-side is far cheaper than fetching newsletters
+    // and discarding them; isBulk stays as a backstop for the rest.
+    try out.writer.writeAll(") -category:promotions");
     return out.writer.buffered();
 }
+
+/// Past this the model has stopped generating alternative phrasings and
+/// started generating variations on its own variations: one real run produced
+/// 47 OR terms, over half of them exact duplicates, and broadening a query
+/// that far is the same as not filtering.
+const MAX_TERMS = 8;
 
 /// A Gmail query worth sending. Past this the model has stopped generating
 /// alternative phrasings and started generating variations on its own
@@ -250,29 +326,6 @@ fn tidyOrTerms(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
 /// duplicates, and broadening a query that far is the same as not filtering.
 const MAX_QUERY_CHARS = 400;
 
-/// Cuts an over-long query back at an OR boundary, closing any parenthesis
-/// the cut left open so what goes to Gmail is still a valid query.
-fn trimToTerms(arena: std.mem.Allocator, query: []const u8) ![]const u8 {
-    if (query.len <= MAX_QUERY_CHARS) return query;
-
-    const head = query[0..MAX_QUERY_CHARS];
-    const cut = std.mem.lastIndexOf(u8, head, " OR ") orelse return head;
-    const trimmed = std.mem.trim(u8, head[0..cut], " \t");
-    log.warn("query ran long ({d} chars); cut back to its first terms", .{query.len});
-
-    var open: usize = 0;
-    var close: usize = 0;
-    for (trimmed) |ch| {
-        if (ch == '(') open += 1;
-        if (ch == ')') close += 1;
-    }
-    if (open <= close) return trimmed;
-
-    var out: std.Io.Writer.Allocating = .init(arena);
-    try out.writer.writeAll(trimmed);
-    try out.writer.splatByteAll(')', open - close);
-    return out.writer.buffered();
-}
 
 /// Strips every quote when they don't pair up.
 ///
@@ -441,11 +494,26 @@ pub fn collect(
     var personal: std.ArrayList(Candidate) = .empty;
     var bulk: std.ArrayList(Candidate) = .empty;
 
-    // Newest first: a question about "the email where X said Y" is far more
-    // often recent than ancient.
-    var index = hits.len;
-    while (index > 0 and personal.items.len < CANDIDATE_LIMIT) {
-        index -= 1;
+    // Read the ones whose subject names the thing first, then the rest in
+    // recency order. Subject matching is free -- the envelopes are already
+    // here -- while reading a body costs a round trip, so this decides which
+    // bodies are worth fetching rather than just taking the newest.
+    //
+    // "The email about X" very often says X in its subject line, and before
+    // this a subject-line match two months old lost to twenty newer messages
+    // that merely mentioned the word somewhere.
+    var order: std.ArrayList(usize) = .empty;
+    for ([_]bool{ true, false }) |want_subject_match| {
+        var i = hits.len;
+        while (i > 0) {
+            i -= 1;
+            const matched = firstTermAt(hits[i].subjectSlice(), terms) != null;
+            if (matched == want_subject_match) order.append(arena, i) catch return Error.SearchFailed;
+        }
+    }
+
+    for (order.items) |index| {
+        if (personal.items.len >= CANDIDATE_LIMIT) break;
         const envelope = &hits[index];
 
         var message: imap.Message = undefined;
@@ -575,11 +643,35 @@ pub fn find(
     // "I know I got that email" is usually about something long since filed.
     _ = try session.examine(.all_mail);
 
-    const query = try buildQuery(io, arena, ollama_url, model, question, days orelse DEFAULT_DAYS);
-    const query_z = try arena.dupeZ(u8, query);
+    const window = days orelse DEFAULT_DAYS;
+    const terms_all = try buildTerms(io, arena, ollama_url, model, question);
 
-    const terms = try queryTerms(arena, query);
-    const candidates = try collect(arena, session, query_z, terms);
+    // Narrow first, broad only if narrow came up short.
+    //
+    // The model expands a request into likely phrasings, which is what makes
+    // vague questions work and what ruins precise ones. Asked for mail about
+    // "Influx TV" it produced
+    //   Influx TV OR "influx tv" OR streaming OR "online platform"
+    //   OR "video content" OR "TV show" OR "media platform"
+    // and the candidate list filled with newsletters that mention streaming.
+    // The owner's own words are the best query when they are enough; the
+    // synonyms are a fallback, not a default. Deciding *when* to broaden is a
+    // count, so code does it rather than the prompt.
+    const narrow_terms = terms_all[0..@min(terms_all.len, NARROW_TERMS)];
+
+    var terms = narrow_terms;
+    var query = try renderQuery(arena, terms, window);
+    log.info("gmail query: {s}", .{query});
+    var candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
+
+    if (candidates.len < ENOUGH_CANDIDATES and terms_all.len > narrow_terms.len) {
+        log.info("narrow query found {d}; broadening", .{candidates.len});
+        terms = terms_all;
+        query = try renderQuery(arena, terms, window);
+        log.info("gmail query: {s}", .{query});
+        candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
+    }
+
     log.info("gmail returned {d} candidate(s)", .{candidates.len});
     if (candidates.len == 0) return .{ .query = query, .matches = &.{} };
 
@@ -588,6 +680,16 @@ pub fn find(
         .matches = rank(io, arena, ollama_url, model, question, candidates),
     };
 }
+
+/// Below this a search has not really found anything, so the synonyms are
+/// worth the noise they bring. Above it they only dilute what is already
+/// there.
+pub const ENOUGH_CANDIDATES = 3;
+
+/// How many terms count as "what the owner asked for" before it becomes
+/// paraphrase. Two covers the common pair -- a name and its spacing variant,
+/// "InfluxDB" and "influx db" -- without reaching the invented synonyms.
+pub const NARROW_TERMS = 2;
 
 test "stripTags turns HTML-only mail into something the ranker can read" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -656,41 +758,6 @@ test "search operators the model invents are stripped" {
     try std.testing.expectEqualStrings(plain, try stripOperators(arena, plain));
 }
 
-test "unquoted multi-word OR terms are quoted, and repeats dropped" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // The exact query that returned seven unrelated messages. A bare
-    // `influx db` is `influx AND db` to Gmail, not one term.
-    try std.testing.expectEqualStrings(
-        "(InfluxDB OR \"influx db\")",
-        try tidyOrTerms(arena, "(InfluxDB OR influx db OR \"influx db\" OR influxdb OR \"influx db\" OR influx db)"),
-    );
-
-    // Gmail search is case-insensitive, so a case variant is not a second
-    // term -- it is the same search run twice, and it goes.
-    try std.testing.expectEqualStrings(
-        "(InfluxDB)",
-        try tidyOrTerms(arena, "(InfluxDB OR influxdb)"),
-    );
-
-    // Genuinely different words all survive, in the order given.
-    try std.testing.expectEqualStrings(
-        "(invoice OR receipt OR payment)",
-        try tidyOrTerms(arena, "(invoice OR receipt OR payment)"),
-    );
-
-    // Already-correct phrases are not re-quoted, and the surrounding query
-    // survives untouched.
-    try std.testing.expectEqualStrings(
-        "newer_than:365d (calendly OR \"are you free\") -category:promotions",
-        try tidyOrTerms(arena, "newer_than:365d (calendly OR \"are you free\") -category:promotions"),
-    );
-
-    // Nothing to do without a group.
-    try std.testing.expectEqualStrings("invoice", try tidyOrTerms(arena, "invoice"));
-}
 
 test "the excerpt shows where the term matched, not the top of the message" {
     // The real shape: a calendar-style opening, with the term only appearing
@@ -728,4 +795,66 @@ test "query terms are read back out of the query, not the question" {
     const bare = try queryTerms(arena, "newer_than:365d invoice -category:promotions");
     try std.testing.expectEqual(@as(usize, 1), bare.len);
     try std.testing.expectEqualStrings("invoice", bare[0]);
+}
+
+
+test "terms are parsed whatever shape the model returned them in" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // With parentheses, as the prompt asks for.
+    const grouped = try parseTerms(arena, "(InfluxDB OR \"influx db\" OR influxdb)");
+    try std.testing.expectEqual(@as(usize, 3), grouped.len);
+
+    // Without them, as it actually came back one run -- the case that made
+    // every later pass silently do nothing.
+    const bare = try parseTerms(arena, "influx db OR influxdb OR time series database");
+    try std.testing.expectEqual(@as(usize, 3), bare.len);
+    try std.testing.expectEqualStrings("influx db", bare[0]);
+    try std.testing.expectEqualStrings("time series database", bare[2]);
+
+    // Lowercase "or" is still a separator; quoted text is not split.
+    const mixed = try parseTerms(arena, "\"pricing or budget\" or invoice");
+    try std.testing.expectEqual(@as(usize, 2), mixed.len);
+    try std.testing.expectEqualStrings("\"pricing or budget\"", mixed[0]);
+}
+
+test "cleaning quotes phrases, pins names, and drops repeats" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The exact list behind the search that returned seven unrelated messages.
+    const cleaned = try cleanTerms(arena, try parseTerms(
+        arena,
+        "InfluxDB OR influx db OR \"influx db\" OR influxdb OR \"influx db\" OR influx db",
+    ));
+    try std.testing.expectEqual(@as(usize, 2), cleaned.len);
+    // A name is pinned exact so stemming cannot widen it.
+    try std.testing.expectEqualStrings("+InfluxDB", cleaned[0]);
+    // A multi-word term is quoted, or Gmail reads it as AND.
+    try std.testing.expectEqualStrings("\"influx db\"", cleaned[1]);
+
+    // Ordinary vocabulary must keep stemming: pinning "invoice" would stop it
+    // matching "invoices", which is worse than not pinning at all.
+    const words = try cleanTerms(arena, try parseTerms(arena, "invoice OR receipt"));
+    try std.testing.expectEqualStrings("invoice", words[0]);
+    try std.testing.expectEqualStrings("receipt", words[1]);
+
+    try std.testing.expect(isDistinctive("S3"));
+    try std.testing.expect(isDistinctive("RZPT-3989"));
+    try std.testing.expect(!isDistinctive("Thursday"));
+}
+
+test "the rendered query is canonical whatever the model did" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const terms = try cleanTerms(arena, try parseTerms(arena, "influx db OR influxdb"));
+    try std.testing.expectEqualStrings(
+        "newer_than:365d (\"influx db\" OR influxdb) -category:promotions",
+        try renderQuery(arena, terms, 365),
+    );
 }

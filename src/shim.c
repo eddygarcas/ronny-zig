@@ -630,10 +630,21 @@ static int envelopes_for_uids(mailimap *session, clist *uid_list,
                               ronny_envelope *out, int max_out) {
     if (uid_list == NULL) return 0;
 
-    /* Newest first: a question about mail is far more often about recent mail. */
+    /* Newest first: a question about mail is far more often about recent mail.
+     *
+     * IMAP returns SEARCH results in ascending UID order, so when there are
+     * more matches than fit here the ones to keep are at the END of the list.
+     * Taking the first 512 instead would quietly answer a search for a common
+     * word with the oldest mail in the mailbox, having discarded everything
+     * recent before sorting. */
     uint32_t best[512];
     int n = 0;
+    int total = 0;
+    for (clistiter *it = clist_begin(uid_list); it != NULL; it = clist_next(it)) total++;
+    int skip = total > 512 ? total - 512 : 0;
+    int seen = 0;
     for (clistiter *it = clist_begin(uid_list); it != NULL && n < 512; it = clist_next(it)) {
+        if (seen++ < skip) continue;
         uint32_t *uid = clist_content(it);
         if (uid != NULL) best[n++] = *uid;
     }
