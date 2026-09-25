@@ -285,8 +285,12 @@ pub fn main(init: std.process.Init) !void {
         init.io,
         arena,
         &session,
-        "http://127.0.0.1:11434",
-        "qwen2.5",
+        .{
+            .ollama_url = "http://127.0.0.1:11434",
+            .model = "qwen2.5",
+            .typesafe_api_key = env.get("TYPESAFE_API_KEY") orelse "",
+            .use_typesafe = env.get("TYPESAFE_RANK_MAIL") != null,
+        },
         question,
         365,
     );

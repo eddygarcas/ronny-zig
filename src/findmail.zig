@@ -18,6 +18,7 @@
 const std = @import("std");
 const imap = @import("imap.zig");
 const ollama = @import("ollama.zig");
+const rerank = @import("rerank.zig");
 
 const log = std.log.scoped(.findmail);
 
@@ -225,12 +226,48 @@ fn parseTerms(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
         i += 1;
     }
     try appendTerm(arena, &terms, body[start..]);
+
+    // If quote-aware splitting produced a single term that still reads as a
+    // list, the quoting was malformed and the scan skipped over the
+    // separators. Seen live: the whole answer came back as one term, and the
+    // keyword fallback then chopped it on spaces, producing search terms like
+    // `migration"` and `"influx`. Retry ignoring quotes entirely -- a bag of
+    // words beats one nonsense phrase.
+    if (terms.items.len == 1 and looksLikeList(terms.items[0])) {
+        log.warn("could not split the query on quotes; splitting on OR alone", .{});
+        var flat: std.ArrayList([]const u8) = .empty;
+        var parts = std.mem.splitSequence(u8, terms.items[0], " ");
+        var current: std.ArrayList(u8) = .empty;
+        while (parts.next()) |word| {
+            if (std.ascii.eqlIgnoreCase(word, "OR")) {
+                try appendTerm(arena, &flat, current.items);
+                current = .empty;
+                continue;
+            }
+            if (current.items.len > 0) try current.append(arena, ' ');
+            try current.appendSlice(arena, word);
+        }
+        try appendTerm(arena, &flat, current.items);
+        if (flat.items.len > 1) return flat.items;
+    }
+
     return terms.items;
+}
+
+/// A term that still contains a bare " OR " separator was never really one
+/// term.
+fn looksLikeList(term: []const u8) bool {
+    var parts = std.mem.splitSequence(u8, term, " ");
+    while (parts.next()) |word| {
+        if (std.ascii.eqlIgnoreCase(word, "OR")) return true;
+    }
+    return false;
 }
 
 fn appendTerm(arena: std.mem.Allocator, terms: *std.ArrayList([]const u8), raw: []const u8) !void {
     const term = std.mem.trim(u8, raw, " \t()");
     if (term.len == 0) return;
+    if (std.ascii.eqlIgnoreCase(term, "or")) return;
     // An operator the model added on its own is not a search term.
     if (std.mem.indexOfScalar(u8, term, ':') != null) return;
     try terms.append(arena, term);
@@ -298,6 +335,63 @@ fn isDistinctive(term: []const u8) bool {
         if (std.ascii.isUpper(ch) or std.ascii.isDigit(ch)) return true;
     }
     return false;
+}
+
+/// Words too ordinary to search on their own.
+const STOPWORDS = [_][]const u8{
+    "the",   "and",   "for",   "with",  "from",  "that",  "this",  "about",
+    "email", "mail",  "message", "find", "search", "was",  "were",  "has",
+    "have",  "into",  "our",   "your",  "their", "there", "where", "when",
+    "what",  "which", "would", "could", "should", "been", "being", "some",
+};
+
+fn isStopword(word: []const u8) bool {
+    for (STOPWORDS) |stop| {
+        if (std.ascii.eqlIgnoreCase(word, stop)) return true;
+    }
+    return false;
+}
+
+/// The individual words behind the phrases, as a last resort.
+///
+/// Quoting a multi-word term is right -- unquoted, Gmail reads it as AND --
+/// but it also makes it an exact phrase, and the model likes to answer a
+/// request with phrases rather than words. Asked about "the InfluxDB
+/// migration" it produced only
+///   "influxdb migration" OR "influx db migration" OR "migrating to influxdb"
+/// none of which appears verbatim in any message, so the search returned
+/// nothing at all -- and nothing reads as "you have no such email" when the
+/// thread is sitting right there.
+///
+/// So when phrases find nothing, the phrases are broken into their words and
+/// the distinctive ones are searched instead.
+fn keywordTerms(arena: std.mem.Allocator, terms: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+
+    for (terms) |term| {
+        var words = std.mem.tokenizeAny(u8, term, " \t-");
+        while (words.next()) |raw| {
+            // Strip punctuation from both ends rather than only the term's,
+            // so a quote that survived the split cannot reach the query.
+            const word = std.mem.trim(u8, raw, "\"'+.,;:()[]!?");
+            if (word.len < 3 or isStopword(word)) continue;
+            if (std.ascii.eqlIgnoreCase(word, "or")) continue;
+            if (out.items.len >= MAX_TERMS) break;
+
+            var seen = false;
+            for (out.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, existing, "+"), word)) seen = true;
+            }
+            if (seen) continue;
+
+            if (isDistinctive(word)) {
+                try out.append(arena, try std.fmt.allocPrint(arena, "+{s}", .{word}));
+            } else {
+                try out.append(arena, word);
+            }
+        }
+    }
+    return out.items;
 }
 
 /// The canonical query. The only thing that came from the model is the words.
@@ -548,17 +642,116 @@ const Ranking = struct { matches: []RankedMatch = &.{} };
 
 /// Picks the candidates that actually answer the question.
 ///
+/// Scores every candidate in one request and sorts by the result.
+fn rankWithJev(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    ranker: Ranker,
+    question: []const u8,
+    candidates: []const Candidate,
+) ![]const Match {
+    var items: std.ArrayList([]const u8) = .empty;
+    for (candidates) |candidate| {
+        try items.append(arena, try std.fmt.allocPrint(
+            arena,
+            "From: {s}\nDate: {s}\nSubject: {s}\n\n{s}",
+            .{ candidate.from, candidate.date, candidate.subject, candidate.snippet },
+        ));
+    }
+
+    const scores = try rerank.scores(
+        io,
+        arena,
+        ranker.typesafe_api_key,
+        ranker.jev_model,
+        question,
+        items.items,
+    );
+    defer arena.free(scores);
+
+    const Scored = struct { candidate: Candidate, score: f64 };
+    var scored: std.ArrayList(Scored) = .empty;
+    for (candidates, scores) |candidate, score| {
+        if (score >= rerank.MATCH_THRESHOLD) {
+            try scored.append(arena, .{ .candidate = candidate, .score = score });
+        }
+    }
+
+    std.mem.sort(Scored, scored.items, {}, struct {
+        fn lessThan(_: void, a: Scored, b: Scored) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    var out: std.ArrayList(Match) = .empty;
+    for (scored.items) |item| {
+        if (out.items.len >= RESULT_LIMIT) break;
+        try out.append(arena, .{
+            .candidate = item.candidate,
+            // Jev returns a number, not a sentence. Saying how sure it is
+            // beats inventing a justification it never gave.
+            .why = try std.fmt.allocPrint(arena, "relevance {d:.2}", .{item.score}),
+        });
+    }
+
+    log.info("Jev ranked {d} of {d} candidate(s) above the threshold", .{
+        out.items.len, candidates.len,
+    });
+
+    // Nothing cleared the bar, but a score is a measurement and the best one
+    // is worth naming. "Nothing matched" was the original complaint, and
+    // "here is the closest, and it is weak" is strictly more use than
+    // silence -- the owner can tell in a second whether it is the message
+    // they meant, which is exactly what the number cannot.
+    if (out.items.len == 0) {
+        var best: ?Scored = null;
+        for (candidates, scores) |candidate, score| {
+            if (best == null or score > best.?.score) {
+                best = .{ .candidate = candidate, .score = score };
+            }
+        }
+        if (best) |item| {
+            try out.append(arena, .{
+                .candidate = item.candidate,
+                .why = try std.fmt.allocPrint(
+                    arena,
+                    "closest of {d}, relevance {d:.2} -- probably not the one",
+                    .{ candidates.len, item.score },
+                ),
+            });
+        }
+    }
+    return out.items;
+}
+
 /// Runs locally because it reads message bodies. Falls back to recency when
 /// the model can't be reached -- a recency-ordered answer is still useful,
 /// and it is honest about being unranked because every `why` comes back empty.
+/// How the candidates get ordered.
+///
+/// Ranking is where the local model was weakest, and where a wrong answer is
+/// silent: "no match" reads exactly like "you have no such email". Jev is
+/// better at it, at the cost of sending message excerpts off the machine --
+/// so it is off unless the owner turned it on.
+pub const Ranker = struct {
+    ollama_url: []const u8,
+    model: []const u8,
+    /// Empty disables the TypeSafe path entirely, whatever the flag says.
+    typesafe_api_key: []const u8 = "",
+    jev_model: []const u8 = "jev-latest",
+    /// The owner's explicit decision to let mail excerpts leave the machine.
+    use_typesafe: bool = false,
+};
+
 pub fn rank(
     io: std.Io,
     arena: std.mem.Allocator,
-    ollama_url: []const u8,
-    model: []const u8,
+    ranker: Ranker,
     question: []const u8,
     candidates: []const Candidate,
 ) []const Match {
+    const ollama_url = ranker.ollama_url;
+    const model = ranker.model;
     const byRecency = struct {
         fn call(a: std.mem.Allocator, items: []const Candidate) []const Match {
             var out: std.ArrayList(Match) = .empty;
@@ -570,6 +763,19 @@ pub fn rank(
     }.call;
 
     if (candidates.len <= 1) return byRecency(arena, candidates);
+
+    // Jev first when allowed, local model as the fallback, recency as the
+    // fallback's fallback. Each step down is a worse answer, never a missing
+    // one.
+    if (ranker.use_typesafe and ranker.typesafe_api_key.len > 0 and
+        candidates.len <= rerank.MAX_QUESTIONS)
+    {
+        if (rankWithJev(io, arena, ranker, question, candidates)) |matches| {
+            return matches;
+        } else |err| {
+            log.warn("Jev ranking unavailable ({s}); ranking locally", .{@errorName(err)});
+        }
+    }
 
     var listing: std.Io.Writer.Allocating = .init(arena);
     for (candidates, 0..) |candidate, i| {
@@ -631,11 +837,12 @@ pub fn find(
     io: std.Io,
     arena: std.mem.Allocator,
     session: *imap.Session,
-    ollama_url: []const u8,
-    model: []const u8,
+    ranker: Ranker,
     question: []const u8,
     days: ?u16,
 ) !Found {
+    const ollama_url = ranker.ollama_url;
+    const model = ranker.model;
     // All Mail, not INBOX. Measured on a real 53k-message mailbox: "InfluxDB"
     // returns 91 hits in INBOX and 111 in All Mail, because archived mail has
     // left INBOX. `in:anywhere` does not reach it either -- also measured, 91
@@ -672,13 +879,35 @@ pub fn find(
         candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
     }
 
+    // Still nothing: the terms were all exact phrases that appear nowhere.
+    // Search their words instead. A loose answer the ranker can filter beats
+    // "no such email" about a thread that exists.
+    if (candidates.len == 0) {
+        const words = try keywordTerms(arena, terms_all);
+        if (words.len > 0 and !sameTerms(words, terms)) {
+            log.info("phrases matched nothing; falling back to their keywords", .{});
+            terms = words;
+            query = try renderQuery(arena, terms, window);
+            log.info("gmail query: {s}", .{query});
+            candidates = try collect(arena, session, try arena.dupeZ(u8, query), terms);
+        }
+    }
+
     log.info("gmail returned {d} candidate(s)", .{candidates.len});
     if (candidates.len == 0) return .{ .query = query, .matches = &.{} };
 
     return .{
         .query = query,
-        .matches = rank(io, arena, ollama_url, model, question, candidates),
+        .matches = rank(io, arena, ranker, question, candidates),
     };
+}
+
+fn sameTerms(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
 }
 
 /// Below this a search has not really found anything, so the synonyms are
@@ -857,4 +1086,52 @@ test "the rendered query is canonical whatever the model did" {
         "newer_than:365d (\"influx db\" OR influxdb) -category:promotions",
         try renderQuery(arena, terms, 365),
     );
+}
+
+test "phrases fall back to the words inside them" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The real failure: every term an exact phrase, none of them present
+    // verbatim in any message, so the search returned nothing at all.
+    const phrases = try cleanTerms(arena, try parseTerms(
+        arena,
+        "\"influxdb migration\" OR \"influx db migration\" OR \"migrating to influxdb\"",
+    ));
+    const words = try keywordTerms(arena, phrases);
+
+    // The distinctive word survives. Written lowercase it carries no
+    // internal capital, so it is not pinned -- the heuristic cannot tell
+    // "influxdb" from a normal word, and guessing wrong towards pinning
+    // would stop it stemming for no gain.
+    try std.testing.expectEqualStrings("influxdb", words[0]);
+    // The ordinary one is kept too, unpinned so it can still stem.
+    try std.testing.expectEqualStrings("migration", words[1]);
+    // "to" is too short and "migrating" is a duplicate root, but neither of
+    // those matters as much as not emitting filler.
+    for (words) |word| {
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(word, "the"));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(word, "email"));
+    }
+}
+
+
+test "a query the quote scan cannot split is still broken into terms" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Malformed quoting: an odd quote makes the scanner run past the
+    // separators and return the lot as one term. Live, the keyword fallback
+    // then searched for `migration"` and `"influx`.
+    const terms = try parseTerms(arena, "\"influxdb migration OR \"influx db migration\" OR switch");
+    try std.testing.expect(terms.len > 1);
+
+    // Whatever the shape, no term may carry a stray quote into the query.
+    const words = try keywordTerms(arena, terms);
+    for (words) |word| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, word, '"') == null);
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(word, "or"));
+    }
 }

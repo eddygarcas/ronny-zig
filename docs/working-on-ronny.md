@@ -65,7 +65,8 @@ push: grep the live secrets literally against `git rev-list --all`.
 
 The owner's preference is **not** local-only dogma. A hosted model was adopted
 for intent routing once the boundary was made explicit: only *chat commands*
-leave the machine, never email content, and the spam check stays local for
+leave the machine, and email content only does so when TYPESAFE_RANK_MAIL is
+set (off by default; see src/rerank.zig). The spam check stays local for
 exactly that reason. The real line is **"email content does not leave the
 box"**, not "nothing leaves the box".
 

@@ -1,7 +1,9 @@
 //! The local model.
 //!
 //! Everything that reads the owner's email -- the spam gate, summaries, reply
-//! drafts, search ranking -- runs through here and never leaves the machine.
+//! drafts -- runs through here and never leaves the machine. Search ranking
+//! is the one thing that may go elsewhere, and only on request: see
+//! rerank.zig.
 //! Only the chat command itself goes to a hosted service (see intent.zig).
 //! That boundary is the whole reason a local model is in the stack at all, so
 //! it is worth having one door rather than four.
@@ -46,7 +48,7 @@ pub const Format = enum {
 /// in a message body, which a bilingual mailbox sees constantly. The deeper
 /// fix is honouring each MIME part's charset when decoding, in shim.c;
 /// this is the boundary that stops a bad byte breaking the request at all.
-fn validUtf8(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+pub fn validUtf8(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (std.unicode.utf8ValidateSlice(text)) return text;
 
     var out: std.Io.Writer.Allocating = .init(arena);

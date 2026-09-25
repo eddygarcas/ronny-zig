@@ -30,6 +30,7 @@ const transcribe = @import("transcribe.zig");
 const summarize = @import("summarize.zig");
 const ollama = @import("ollama.zig");
 const findmail = @import("findmail.zig");
+const rerank = @import("rerank.zig");
 const attachments = @import("attachments.zig");
 const contacts = @import("contacts.zig");
 const settings = @import("settings.zig");
@@ -148,6 +149,9 @@ fn runBot(init: std.process.Init) !void {
         // Stays in the environment on purpose: a safety property a chat
         // message can switch off is not one. See settings.zig.
         .voice_can_confirm_send = envFlag(init, "VOICE_CAN_CONFIRM_SEND"),
+        // Off by default: this is the one setting that lets message text
+        // leave the machine. See rerank.zig.
+        .typesafe_rank_mail = envFlag(init, "TYPESAFE_RANK_MAIL"),
     };
 
     var bot = bot_mod.Bot.init(cfg, &controller, &settings_store);
@@ -354,6 +358,7 @@ test {
     _ = summarize;
     _ = ollama;
     _ = findmail;
+    _ = rerank;
     _ = attachments;
     _ = contacts;
     _ = settings;

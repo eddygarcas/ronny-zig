@@ -112,6 +112,12 @@ pub const Config = struct {
     typesafe_api_key: []const u8 = "",
     jev_model: []const u8 = "jev-latest",
 
+    /// Lets Jev rank content-search results, which means message excerpts
+    /// leave the machine. Off unless the owner sets it: everywhere else in
+    /// Ronny, bodies stay on local Ollama and only chat commands go to
+    /// TypeSafe. See rerank.zig.
+    typesafe_rank_mail: bool = false,
+
     /// Voice notes are off unless a whisper model is configured.
     whisper_model_path: ?[:0]const u8 = null,
     /// Languages the owner actually speaks. Auto-detect stays on -- they
@@ -825,6 +831,16 @@ pub const Bot = struct {
 
         if (std.mem.eql(u8, result, understood.reply)) return result;
         return std.fmt.allocPrint(arena, "{s}\n{s}", .{ understood.reply, result });
+    }
+
+    fn ranker(self: *Bot) findmail.Ranker {
+        return .{
+            .ollama_url = self.cfg.ollama_url,
+            .model = self.cfg.ollama_model,
+            .typesafe_api_key = self.cfg.typesafe_api_key,
+            .jev_model = self.cfg.jev_model,
+            .use_typesafe = self.cfg.typesafe_rank_mail,
+        };
     }
 
     // ---- actions ----
@@ -1546,8 +1562,7 @@ pub const Bot = struct {
                     ctx.bot.cfg.io,
                     ctx.arena,
                     session,
-                    ctx.bot.cfg.ollama_url,
-                    ctx.bot.cfg.ollama_model,
+                    ctx.bot.ranker(),
                     ctx.question,
                     null,
                 );

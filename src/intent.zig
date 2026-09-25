@@ -20,8 +20,11 @@
 //! - There is deliberately **no send action**. Drafting is model-reachable;
 //!   sending is not. The only path to sending mail is the owner confirming.
 //!
-//! Only the chat command is sent to TypeSafe -- never email content. The spam
-//! gate and summarisation stay on local Ollama for that reason.
+//! Only the chat command is sent to TypeSafe from *this* module -- never
+//! email content. The spam gate, summarisation and drafting stay on local
+//! Ollama for that reason. The one exception in Ronny is search ranking,
+//! which sends message excerpts to TypeSafe when the owner sets
+//! TYPESAFE_RANK_MAIL; see rerank.zig, and note it is off by default.
 
 const std = @import("std");
 const http = @import("http.zig");

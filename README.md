@@ -52,10 +52,17 @@ recipient comes from that message's real `Reply-To`/`From` headers. A
 hallucinated address is structurally impossible, not merely unlikely. It
 replies to the sender only, never reply-all.
 
-**Email content never leaves the machine.** The spam gate, summaries, reply
-drafts and search ranking all read message bodies, so they all run on local
-Ollama. Only the chat command itself — your words, no mail — goes to a hosted
-model for classification, and even that is optional.
+**Email content stays on the machine by default.** The spam gate, summaries and
+reply drafts all read message bodies, so they all run on local Ollama. Only the
+chat command itself — your words, no mail — goes to a hosted model for
+classification, and even that is optional.
+
+Search ranking is the one exception, and it is opt-in. Setting
+`TYPESAFE_RANK_MAIL=true` sends the matched excerpts to Jev, which is better at
+judging relevance than a 7B local model — and ranking is where a wrong answer
+is invisible, because "no match" reads exactly like "you have no such email".
+It is **off unless you turn it on**: that is a decision about your mailbox, so
+it should not be a default you inherit.
 
 ## How it decides things
 

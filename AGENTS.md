@@ -77,9 +77,14 @@ re-read each scan so chat commands take effect without a restart.
    recipient from the headers of a message already shown; a new email
    selects one from addresses that have really written to this mailbox. The
    model returns an index, never a string.
-3. **Email content never leaves the machine.** Spam checks, summaries, drafts
-   and search ranking all run on local Ollama. Only the chat command itself
-   goes to a hosted model, and that is optional.
+3. **Email content stays on the machine unless the owner says otherwise.**
+   Spam checks, summaries and drafts run on local Ollama, and only the chat
+   command itself goes to a hosted model. The single exception is search
+   ranking: `TYPESAFE_RANK_MAIL=true` sends the matched excerpts to Jev,
+   because ranking is where the local model is weakest and a wrong answer
+   there is silent. It is **off by default** -- turning it on is a decision
+   about somebody's mailbox, so it is theirs to make, not a default to
+   inherit. See `src/rerank.zig`.
 
 ## Configuration
 
