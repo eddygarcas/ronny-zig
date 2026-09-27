@@ -49,6 +49,28 @@ void ronny_today(int *year, int *month, int *day) {
     *day = local.tm_mday;
 }
 
+/* The UTC offset, in minutes, in force at a local wall-clock time.
+ *
+ * The calendar's list call wants a day's boundaries as RFC 3339 and refuses a
+ * timestamp without an offset, and the offset on a March day is not the one
+ * in force today. mktime with tm_isdst = -1 lets libc decide whether DST
+ * applies on that day; tm_gmtoff (GNU) is then the answer. */
+int ronny_utc_offset_minutes(int year, int month, int day, int hour, int minute) {
+    struct tm local;
+    memset(&local, 0, sizeof local);
+    local.tm_year = year - 1900;
+    local.tm_mon = month - 1;
+    local.tm_mday = day;
+    local.tm_hour = hour;
+    local.tm_min = minute;
+    local.tm_isdst = -1;
+    time_t t = mktime(&local);
+    if (t == (time_t)-1) return 0;
+    struct tm resolved;
+    if (localtime_r(&t, &resolved) == NULL) return 0;
+    return (int)(resolved.tm_gmtoff / 60);
+}
+
 int ronny_local_minutes(void) {
     time_t now = time(NULL);
     struct tm local;

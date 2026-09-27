@@ -38,6 +38,9 @@ const attachments_mod = @import("attachments.zig");
 const contacts_mod = @import("contacts.zig");
 const settings_mod = @import("settings.zig");
 const speech_mod = @import("speech.zig");
+const gcal = @import("gcal.zig");
+const appointment = @import("appointment.zig");
+const dates = @import("dates.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -52,6 +55,13 @@ pub const COMPOSE_TTL_SECONDS = 300;
 /// A spoken settings change waits for a yes. Same reasoning as the compose
 /// TTL: an abandoned question must not answer itself later.
 pub const PENDING_SETTING_TTL_SECONDS = 300;
+/// A calendar entry waits for a typed yes for this long. Longer than a
+/// settings change because the owner may be checking the day against
+/// something else first; shorter than a reply because "tomorrow" drifts.
+pub const PENDING_EVENT_TTL_SECONDS = 600;
+/// A calendar login link is good for this long. Google's own code expires
+/// in minutes anyway; this only bounds how long a paste is looked for.
+pub const PENDING_LOGIN_TTL_SECONDS = 900;
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
@@ -80,6 +90,9 @@ pub const HELP_TEXT =
     \\/reply <text> - draft a reply to the last email I showed you
     \\/confirm - send the drafted reply
     \\/cancel - discard the drafted reply
+    \\/event <what, and when> - add an appointment to your calendar (shown first, added on a typed yes)
+    \\/calendar - connect your Google Calendar: I send a link, you paste back where it lands
+    \\/agenda [day] - what's on your calendar that day (today if you don't say)
     \\/pause - stop notifications temporarily
     \\/resume - resume notifications
     \\/settings - show my settings (quiet hours, default look-back, summaries as text or voice)
@@ -90,7 +103,8 @@ pub const HELP_TEXT =
     \\Spoken out loud, I read the new value back and wait for a typed yes.
     \\
     \\When a reply is drafted, just answer 'yes' to send or 'no' to discard.
-    \\I never send email until you say yes.
+    \\I never send email until you say yes. A calendar entry works the same
+    \\way: "dentist tomorrow at 10" shows you the entry, and yes adds it.
 ;
 
 pub const Config = struct {
@@ -133,6 +147,10 @@ pub const Config = struct {
     /// Text-to-speech for summaries, when piper is configured. Null means
     /// the "summaries: voice" setting quietly delivers text.
     speech: ?speech_mod.Config = null,
+
+    /// Google Calendar, when GOOGLE_CLIENT_ID is set. Null means a request
+    /// to add an appointment is answered with how to set it up.
+    calendar: ?gcal.Config = null,
 };
 
 /// A reply that should go out as audio: the caption stays text, the body is
@@ -224,6 +242,38 @@ const PendingSetting = struct {
     created_ns: i96,
 };
 
+/// A calendar entry being assembled, then waiting for a typed yes.
+///
+/// The day and time were read from the owner's words by code and the title
+/// by the local model, and all of it is shown back before anything is
+/// created: a misread "next Thursday" is visible in the preview, and would
+/// be silent on the calendar. Same shape as a pending reply, with a lower
+/// stake -- nothing here reaches a third party, since attendees are never
+/// set -- which is why a spoken no is honoured but a spoken yes still is not.
+/// A calendar login that has been started from chat. The verifier never
+/// leaves this process, so a link Ronny sent is the only one that can be
+/// finished here.
+const PendingLogin = struct {
+    verifier: [64]u8,
+    created_ns: i96,
+};
+
+const PendingEvent = struct {
+    arena: std.heap.ArenaAllocator,
+    title: []const u8,
+    location: []const u8,
+    /// Null until a day has been named; the next message is tried as one.
+    day: ?dates.Day,
+    start: ?i16,
+    end: ?i16,
+    created_ns: i96,
+
+    fn when(self: *const PendingEvent) ?appointment.When {
+        const day = self.day orelse return null;
+        return .{ .day = day, .start = self.start, .end = self.end };
+    }
+};
+
 const Turn = struct {
     owner: []u8,
     assistant: []u8,
@@ -242,6 +292,10 @@ pub const Bot = struct {
     staged: ?Staged = null,
     composing: ?Composing = null,
     pending_setting: ?PendingSetting = null,
+    pending_event: ?PendingEvent = null,
+    pending_login: ?PendingLogin = null,
+    /// Set by the login step so the pasted code is not kept in history.
+    redact_next_record: bool = false,
     /// Side channel from a summarising action to the send in handleText.
     /// Arena-owned by the turn that set it; cleared at the start of each.
     spoken_reply: ?SpokenReply = null,
@@ -276,6 +330,7 @@ pub const Bot = struct {
         if (self.pending) |*pending| pending.arena.deinit();
         if (self.staged) |*staged| staged.arena.deinit();
         if (self.composing) |*composing| composing.arena.deinit();
+        if (self.pending_event) |*event| event.arena.deinit();
         if (self.vocabulary_arena) |*arena| arena.deinit();
         for (self.history.items) |turn| {
             self.cfg.gpa.free(turn.owner);
@@ -498,6 +553,27 @@ pub const Bot = struct {
         self.staged = null;
     }
 
+    fn discardPendingEvent(self: *Bot) void {
+        if (self.pending_event) |*event| event.arena.deinit();
+        self.pending_event = null;
+    }
+
+    /// The calendar entry waiting on the owner, unless it has gone stale.
+    fn freshPendingEvent(self: *Bot) ?*PendingEvent {
+        if (self.pending_event == null) return null;
+        const event = &self.pending_event.?;
+        const age = @divTrunc(
+            std.Io.Clock.now(.boot, self.cfg.io).nanoseconds - event.created_ns,
+            std.time.ns_per_s,
+        );
+        if (age > PENDING_EVENT_TTL_SECONDS) {
+            log.info("pending calendar entry \"{s}\" expired", .{event.title});
+            self.discardPendingEvent();
+            return null;
+        }
+        return event;
+    }
+
     /// The staged file, if there is one and it has not gone stale.
     fn freshStaged(self: *Bot) ?*Staged {
         if (self.staged == null) return null;
@@ -560,6 +636,10 @@ pub const Bot = struct {
             if (self.sendSpoken(arena, voice)) return self.record(text, reply);
         }
         try self.client.sendMessage(reply);
+        if (self.redact_next_record) {
+            self.redact_next_record = false;
+            return self.record("(pasted the calendar login)", reply);
+        }
         try self.record(text, reply);
     }
 
@@ -725,6 +805,12 @@ pub const Bot = struct {
             if (arg.len == 0) return "Usage: /reply <text>  (replies to the last email I showed you)";
             return self.doDraftReply(arena, arg, true);
         }
+        if (std.mem.eql(u8, command, "/event")) {
+            if (arg.len == 0) return "Usage: /event dentist tomorrow at 10  (what, and when)";
+            return self.doCreateEvent(arena, arg);
+        }
+        if (std.mem.eql(u8, command, "/calendar")) return self.doConnectCalendar(arena);
+        if (std.mem.eql(u8, command, "/agenda")) return self.doListEvents(arena, arg);
 
         const parsed = parseSearchArg(arg);
         if (std.mem.eql(u8, command, "/search")) {
@@ -746,6 +832,13 @@ pub const Bot = struct {
     // ---- plain language ----
 
     fn handleNaturalLanguage(self: *Bot, arena: std.mem.Allocator, text: []const u8, spoken: bool) ![]const u8 {
+        // A login link was sent and this is the browser's address pasted
+        // back. Checked first: it is never a yes, a no, or a command, and
+        // must not reach a model.
+        if (self.freshPendingLogin() != null and gcal.looksLikeLogin(text)) {
+            return self.doFinishLogin(arena, text);
+        }
+
         // With a draft pending, a plain yes/no decides it -- and the match is
         // deterministic, so no model ever decides whether to send.
         const answer = decision_mod.decide(text);
@@ -760,6 +853,34 @@ pub const Bot = struct {
                     return self.doCancel(arena);
                 },
                 .unclear => {},
+            }
+        } else if (self.freshPendingEvent()) |event| {
+            if (event.day != null) {
+                switch (answer) {
+                    .confirm => {
+                        // Typed only, as for a settings change: a spoken yes
+                        // commits nothing, and the entry is kept so the
+                        // owner only has to type the one word.
+                        if (spoken) {
+                            log.info("ignoring a spoken yes on a pending calendar entry", .{});
+                            return "I don't act on a spoken yes for the calendar -- type yes to add it, or no to drop it.";
+                        }
+                        log.info("owner confirmed the calendar entry with: {s}", .{text});
+                        return self.doAddEvent(arena);
+                    },
+                    .cancel => {
+                        log.info("owner dropped the calendar entry with: {s}", .{text});
+                        self.discardPendingEvent();
+                        return "Dropped it. Nothing was added to your calendar.";
+                    },
+                    .unclear => {},
+                }
+            } else if (answer == .cancel) {
+                self.discardPendingEvent();
+                return "Dropped it. Nothing was added to your calendar.";
+            } else if (try self.fillEventWhen(arena, text)) |reply| {
+                // The entry was missing its day, and this message named one.
+                return reply;
             }
         } else if (self.freshPendingSetting()) |change| {
             switch (answer) {
@@ -833,6 +954,9 @@ pub const Bot = struct {
                 if (self.pending != null) {
                     return "I'm not sure if that's a yes or a no, so I haven't sent anything. Reply 'yes' to send the draft, or 'no' to discard it.";
                 }
+                if (self.pending_event != null and self.pending_event.?.day != null) {
+                    return "I'm not sure if that's a yes or a no, so I haven't added anything. Reply 'yes' to add it to your calendar, or 'no' to drop it.";
+                }
                 return understood.reply;
             },
             .help => HELP_TEXT,
@@ -877,6 +1001,11 @@ pub const Bot = struct {
             .recent_mail => try self.doRecentMail(arena, understood.days),
             .draft_reply => try self.doDraftReply(arena, understood.message, false),
             .compose_mail => try self.doComposeMail(arena, text, understood.message, spoken),
+            // The whole message is read by code for the day and time; only
+            // the title comes from a model, and only in the owner's words.
+            .create_event => try self.doCreateEvent(arena, text),
+            .connect_calendar => try self.doConnectCalendar(arena),
+            .list_events => try self.doListEvents(arena, text),
         };
 
         if (std.mem.eql(u8, result, understood.reply)) return result;
@@ -999,6 +1128,14 @@ pub const Bot = struct {
                     try out.writer.print(" {s} ({s})", .{ settings_mod.speakerOfVoice(name), @tagName(language) });
                 }
             }
+        }
+        if (self.cfg.calendar) |calendar| {
+            try out.writer.print("\nCalendar: Google, {s}, {s} (set in .env)", .{
+                calendar.calendar_id,
+                if (gcal.isAuthorized(self.cfg.io, arena, calendar)) "connected" else "not connected -- say \"connect my calendar\"",
+            });
+        } else {
+            try out.writer.writeAll("\nCalendar: not set up (GOOGLE_CLIENT_ID in .env)");
         }
         try out.writer.print("\nVoice can confirm send: {s} (set in .env)", .{
             if (self.cfg.voice_can_confirm_send) "yes" else "no",
@@ -2225,6 +2362,240 @@ pub const Bot = struct {
     fn discardPending(self: *Bot) void {
         if (self.pending) |*pending| pending.arena.deinit();
         self.pending = null;
+    }
+
+    // ---- the calendar ----
+
+    const NOT_SET_UP = "Calendar isn't set up -- put GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env and restart me, then say \"connect my calendar\".";
+    const NOT_CONNECTED = "I'm not connected to your calendar yet -- say \"connect my calendar\" and I'll send you the link.";
+
+    fn freshPendingLogin(self: *Bot) ?*PendingLogin {
+        if (self.pending_login == null) return null;
+        const login = &self.pending_login.?;
+        const age = @divTrunc(
+            std.Io.Clock.now(.boot, self.cfg.io).nanoseconds - login.created_ns,
+            std.time.ns_per_s,
+        );
+        if (age > PENDING_LOGIN_TTL_SECONDS) {
+            log.info("calendar login link expired unused", .{});
+            self.pending_login = null;
+            return null;
+        }
+        return login;
+    }
+
+    /// Sends the Google link. The browser cannot come back to this machine
+    /// from a phone -- Google only allows a loopback redirect for a desktop
+    /// client -- so the owner pastes the address it lands on instead.
+    fn doConnectCalendar(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const calendar = self.cfg.calendar orelse return NOT_SET_UP;
+        const login = gcal.beginLogin(self.cfg.io, arena, calendar) catch |err| {
+            log.err("could not start the calendar login: {s}", .{@errorName(err)});
+            return "Couldn't build the login link -- check the journal.";
+        };
+        self.pending_login = .{
+            .verifier = login.verifier,
+            .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+        };
+        log.info("calendar login started; waiting for the pasted address", .{});
+        return std.fmt.allocPrint(
+            arena,
+            "Open this link, signed in as the mailbox owner, and allow the calendar access:\n\n{s}\n\n" ++
+                "The browser will then land on a 127.0.0.1 page that fails to load -- that's expected. " ++
+                "Copy that page's address from the address bar and paste it here, and I'll finish the login.{s}",
+            .{
+                login.url,
+                if (gcal.isAuthorized(self.cfg.io, arena, calendar)) "\n\n(I'm already connected; this replaces that login.)" else "",
+            },
+        );
+    }
+
+    /// One day of the calendar. The day is read from the owner's words;
+    /// none named means today. Nothing here goes near a model.
+    fn doListEvents(self: *Bot, arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const calendar = self.cfg.calendar orelse return NOT_SET_UP;
+        const today = dates.today();
+        const day = if (appointment.findDay(today, text)) |found| found.day else today;
+
+        const entries = gcal.list(self.cfg.io, arena, calendar, day.year, day.month, day.day) catch |err| switch (err) {
+            error.NotAuthorized => return NOT_CONNECTED,
+            error.TokenRevoked => return "Google no longer accepts my calendar login -- say \"connect my calendar\" to log in again.",
+            else => {
+                log.err("could not list the calendar: {s}", .{@errorName(err)});
+                return "Couldn't read your calendar just now -- try again in a moment.";
+            },
+        };
+        const label = try appointment.describe(arena, .{ .day = day });
+        const day_label = label[0 .. std.mem.indexOf(u8, label, ",") orelse label.len];
+        if (entries.len == 0) return std.fmt.allocPrint(arena, "Nothing on your calendar on {s}.", .{day_label});
+
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("{s}:", .{day_label});
+        for (entries) |entry| {
+            try out.writer.writeAll("\n");
+            if (entry.start_minutes) |start| {
+                try out.writer.writeAll(try appointment.clockRange(arena, start, entry.end_minutes));
+            } else {
+                try out.writer.writeAll("all day    ");
+            }
+            try out.writer.print("  {s}", .{entry.title});
+            if (entry.location.len > 0) try out.writer.print(" ({s})", .{entry.location});
+        }
+        log.info("listed {d} calendar entr{s} for {s}", .{ entries.len, if (entries.len == 1) "y" else "ies", day_label });
+        return out.written();
+    }
+
+    fn doFinishLogin(self: *Bot, arena: std.mem.Allocator, pasted: []const u8) ![]const u8 {
+        const calendar = self.cfg.calendar orelse return NOT_SET_UP;
+        const login = self.pending_login.?;
+        self.redact_next_record = true;
+
+        gcal.finishLogin(self.cfg.io, self.cfg.gpa, calendar, &login.verifier, pasted) catch |err| switch (err) {
+            error.NoCode => return "That doesn't carry a login code. Paste the whole address the browser landed on (it starts with http://127.0.0.1), or say \"connect my calendar\" for a fresh link.",
+            error.NoRefreshToken => {
+                self.pending_login = null;
+                return "Google logged me in but only for an hour, with nothing to renew it. Remove Ronny at https://myaccount.google.com/permissions and say \"connect my calendar\" again.";
+            },
+            else => {
+                log.err("calendar login failed: {s}", .{@errorName(err)});
+                return "Google didn't accept that -- codes only work once and expire in minutes. Say \"connect my calendar\" for a fresh link.";
+            },
+        };
+        self.pending_login = null;
+
+        if (self.freshPendingEvent()) |event| {
+            if (event.day != null) {
+                return std.fmt.allocPrint(arena, "Connected to your calendar. \"{s}\" is still waiting -- type yes to add it.", .{event.title});
+            }
+        }
+        return "Connected to your calendar. Try \"dentist tomorrow at 10\".";
+    }
+
+    /// Reads the appointment out of `text`, asks the local model for a
+    /// title, and holds it for a yes. A missing day is asked for; the next
+    /// message is then tried as the answer.
+    fn doCreateEvent(self: *Bot, arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+        if (self.cfg.calendar == null) return NOT_SET_UP;
+
+        const found = try appointment.find(arena, dates.today(), text);
+        const info = try appointment.details(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            text,
+            found.rest,
+        );
+        try self.stageEvent(info.title, info.location, if (found.when) |w| w.day else null, found.start, found.end);
+
+        if (found.when == null) {
+            log.info("calendar entry \"{s}\" has no day yet; asking", .{info.title});
+            return std.fmt.allocPrint(
+                arena,
+                "\"{s}\" -- which day? Tell me the day (and the time if there is one), like \"tomorrow at 3pm\" or \"24 October\".",
+                .{info.title},
+            );
+        }
+        return self.eventPreview(arena);
+    }
+
+    /// Tries `text` as the day (and time) the pending entry was missing.
+    /// Null when it names neither, so the message is handled as a new
+    /// request instead.
+    fn fillEventWhen(self: *Bot, arena: std.mem.Allocator, text: []const u8) !?[]const u8 {
+        const event = &self.pending_event.?;
+        const found = try appointment.find(arena, dates.today(), text);
+        if (found.when) |when| {
+            event.day = when.day;
+            if (when.start != null) {
+                event.start = when.start;
+                event.end = when.end;
+            }
+            log.info("calendar entry \"{s}\" got its day from a follow-up", .{event.title});
+            return try self.eventPreview(arena);
+        }
+        if (found.start) |start| {
+            event.start = start;
+            event.end = found.end;
+            return "Got the time -- and which day?";
+        }
+        return null;
+    }
+
+    /// Holds an entry for approval. Allocations finish before the arena is
+    /// moved into place; see the note on `remember`.
+    fn stageEvent(
+        self: *Bot,
+        title: []const u8,
+        location: []const u8,
+        day: ?dates.Day,
+        start: ?i16,
+        end: ?i16,
+    ) !void {
+        var event_arena: std.heap.ArenaAllocator = .init(self.cfg.gpa);
+        errdefer event_arena.deinit();
+        const alloc = event_arena.allocator();
+        const title_copy = try alloc.dupe(u8, title);
+        const location_copy = try alloc.dupe(u8, location);
+
+        if (self.pending_event) |*previous| previous.arena.deinit();
+        self.pending_event = .{
+            .arena = event_arena,
+            .title = title_copy,
+            .location = location_copy,
+            .day = day,
+            .start = start,
+            .end = end,
+            .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+        };
+    }
+
+    /// Everything that will be sent, in the words the owner is approving.
+    fn eventPreview(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const event = &self.pending_event.?;
+        const when = event.when() orelse return "Which day?";
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("Add to your calendar?\n\n{s}\n{s}", .{ event.title, try appointment.describe(arena, when) });
+        if (event.location.len > 0) try out.writer.print("\n{s}", .{event.location});
+        if (self.cfg.calendar) |calendar| {
+            if (!gcal.isAuthorized(self.cfg.io, arena, calendar)) {
+                try out.writer.writeAll("\n\n" ++ NOT_CONNECTED ++ " The entry will wait.");
+            }
+        }
+        try out.writer.writeAll("\n\nType yes to add it, or no to drop it.");
+        log.info("calendar entry \"{s}\" on {s}; awaiting confirmation", .{ event.title, try appointment.describe(arena, when) });
+        return out.written();
+    }
+
+    fn doAddEvent(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const calendar = self.cfg.calendar orelse return NOT_SET_UP;
+        const event = &self.pending_event.?;
+        const when = event.when() orelse return "Which day?";
+
+        const created = gcal.insert(self.cfg.io, arena, calendar, .{
+            .title = event.title,
+            .location = event.location,
+            .year = when.day.year,
+            .month = when.day.month,
+            .day = when.day.day,
+            .start_minutes = when.start,
+            .end_minutes = when.end orelse 0,
+        }) catch |err| switch (err) {
+            error.NotAuthorized => return NOT_CONNECTED ++ " The entry will wait.",
+            error.TokenRevoked => return "Google no longer accepts my calendar login -- say \"connect my calendar\" to log in again; the entry will wait.",
+            else => {
+                log.err("could not add \"{s}\" to the calendar: {s}", .{ event.title, @errorName(err) });
+                // The entry survives a failed request, so yes can be retried.
+                return "Adding it failed -- the entry is still here, say yes to try again.";
+            },
+        };
+
+        log.info("added \"{s}\" to the calendar as {s}", .{ event.title, created.id });
+        const reply = try std.fmt.allocPrint(arena, "Added to your calendar: {s}, {s}.\n{s}", .{
+            event.title, try appointment.describe(arena, when), created.html_link,
+        });
+        self.discardPendingEvent();
+        return reply;
     }
 
     // ---- voice vocabulary ----

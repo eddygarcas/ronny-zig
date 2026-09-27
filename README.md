@@ -112,6 +112,7 @@ Everything still works; Jev is just better at refusing to guess.
 | **whisper.cpp** | voice notes | optional; skip it and Ronny is text-only |
 | **piper** | summaries read aloud | optional; `pip install piper-tts` in a venv, see [Voice summaries](#voice-summaries) |
 | **Ollama** | everything that reads mail | a local model — see below for which |
+| **A Google OAuth client** | adding appointments to your calendar | optional; see [Calendar](#calendar) |
 | **A Gmail account with 2-Step Verification** | the mailbox | app passwords require it |
 | **A Telegram account** | the control channel | one bot per mailbox, never shared |
 | **systemd** | running it unattended | or run the three commands yourself |
@@ -169,7 +170,7 @@ your typed words are ever sent, never mail.
 ```
 git clone https://github.com/eddygarcas/ronny-zig
 cd ronny-zig
-zig build test                     # 62 tests, no network needed
+zig build test                     # 114 tests, no network needed
 zig build -Doptimize=ReleaseSafe   # -> zig-out/bin/ronny
 ```
 
@@ -231,6 +232,40 @@ journalctl -u ronny-watch -u ronny-bot -f
 On first run the watcher baselines to the mailbox's current position rather
 than treating every existing message as new — otherwise a large mailbox would
 produce one notification per message.
+
+### 9. Google Calendar, if you want appointments (optional)
+
+Ronny can add an appointment to your Google Calendar from chat ("dentist
+tomorrow at 10"). The Gmail app password does not open the Calendar API, so
+this needs an OAuth client of its own, made once:
+
+1. In the Google Cloud console, enable the **Google Calendar API**, then
+   under **Google Auth platform → Clients** create a client of type
+   **Desktop app**. The steps, with screenshots, are the "Set up your
+   environment" part of Google's own
+   [quickstart](https://developers.google.com/workspace/calendar/api/quickstart/python)
+   — ignore the Python that follows.
+2. On the consent screen pick **Internal** if the mailbox is a Workspace
+   account. An **External** screen left in "Testing" issues refresh tokens
+   that [expire after seven days](https://developers.google.com/identity/protocols/oauth2#expiration),
+   and Ronny would need this login again every week.
+3. Put the client id and secret in `.env` as `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`, restart `ronny bot`, and tell it
+   **"connect my calendar"**. It sends you the Google link. Open it, signed
+   in as the mailbox owner, and allow the access. The browser then lands on
+   a `127.0.0.1` page that fails to load -- that is expected, since Google
+   only lets a desktop client redirect to the machine's own loopback and
+   your phone is not that machine. Copy that page's address and paste it
+   into the chat; Ronny swaps it for a refresh token, kept in
+   `data/google_token.json`, and says it is connected.
+
+   The same login from a terminal, on a machine with a browser:
+   `./zig-out/bin/ronny calendar-auth` (add `paste` if the browser is
+   elsewhere).
+
+The only permission asked for is `calendar.events.owned`: events on calendars
+you own, nothing else. The timezone is read from `/etc/localtime`; set
+`CALENDAR_TIMEZONE` if the appointments belong in a different one.
 
 ## What a notification looks like
 
@@ -321,6 +356,59 @@ Two rules apply to voice when writing mail:
   stranger. Addresses for a new email must be typed, or come from a message
   Ronny already fetched.
 
+### Calendar
+
+| Say | Or type | What happens |
+|---|---|---|
+| "connect my calendar" | `/calendar` | sends the Google login link; paste back the address the browser lands on |
+| "dentist tomorrow at 10" | `/event dentist tomorrow at 10` | reads the day, time and length out of your words, shows the entry, and waits |
+| "add a meeting with Dana next thursday at 3pm for 2 hours" | — | a timed entry; the length defaults to an hour |
+| "put Sam's birthday on my calendar on 24 October" | — | no time means an all-day entry |
+| "yes" | — | adds it to your Google Calendar and sends you the link |
+| "no" | — | drops it |
+| "what's on my calendar tomorrow?" | `/agenda tomorrow` | lists that day's entries, in start order; no day means today |
+
+```
+you › apunta una reunión con Vicente el jueves a las 10
+Ronny › Add to your calendar?
+
+         Reunión con Vicente
+         Thu 1 Oct 2026, 10:00-11:00
+
+         Type yes to add it, or no to drop it.
+you › yes
+Ronny › Added to your calendar: Reunión con Vicente, Thu 1 Oct 2026, 10:00-11:00.
+         https://www.google.com/calendar/event?eid=…
+```
+
+The day and time are read by [`appointment.zig`](src/appointment.zig), not by
+a model, for the same reason as quiet hours: "next Thursday" read as this
+Thursday puts the appointment in the wrong week without anyone noticing. Only
+the title comes from the local model, and it is kept only when it is made of
+your own words — otherwise the request itself, minus the scaffolding, is the
+title. English and Spanish both parse: `tomorrow`, `next friday`, `el
+jueves`, `24 October`, `el 24 de octubre`, `at 3pm`, `15:30`, `a las 10 de la
+mañana`, `from 10 to 11`, `de 10 a 11`, `for 2 hours`, `hora y media`.
+
+Leave the day out and Ronny asks for it; the next message is read as the
+answer. The entry is shown in full before anything is created, and the yes
+has to be **typed**, as with a settings change said out loud. There are never
+attendees: an attendee is an invitation email to somebody else, and only the
+reply gate can send mail.
+
+Listing a day reads the same day grammar for *which* day and nothing else:
+"what do I have on thursday", "agenda for today", "qué tengo mañana". The
+entries come straight from Google to the chat; no model sees them. Changing
+or deleting an entry is out of scope.
+
+```
+you › what's on my calendar on thursday?
+Ronny › Thu 1 Oct 2026:
+         all day      Sam's birthday
+         10:00-11:00  Reunión con Vicente (Calle Mayor 1)
+         15:00-17:00  Meeting with Dana
+```
+
 ### Settings
 
 | Say | Or type | What happens |
@@ -387,7 +475,7 @@ property, and a mistyped model URL would silently disable the spam gate.
 | — | `/start` | tells you your chat id, for first-time setup |
 
 Requests outside the list — forwarding mail to someone else, deleting or
-filing it, calendars, contacts — are answered as out of scope. They are not
+filing it, changing a calendar entry, contacts — are answered as out of scope. They are not
 quietly turned into the closest available action.
 
 ## Voice on the GPU
@@ -523,6 +611,8 @@ and what must not.
 | `src/headers.zig` | RFC 5322 header reading; where a recipient comes from |
 | `src/spam.zig` | Header checks, then a local judgment call. Fails open |
 | `src/settings.zig` | The knobs, and reading a change out of plain words without a model |
+| `src/appointment.zig` | Reading a day, time and length out of plain words, for the calendar |
+| `src/gcal.zig` | Google Calendar: the one-time OAuth login and the event insert. Decision-free |
 | `src/speech.zig` | Summaries read aloud: piper, then ffmpeg to Opus, then a voice message |
 | `src/watchdog.zig` | Journal tailing, incident detection, diagnosis |
 | `src/shim.c` | libetpan: IMAP, MIME walking, transfer decoding |

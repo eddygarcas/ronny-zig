@@ -1,7 +1,9 @@
 //! Ronny, in Zig. Two subcommands, deliberately two processes.
 //!
-//!   ronny watch  -- the mailbox watcher (the default)
-//!   ronny bot    -- the Telegram control channel
+//!   ronny watch          -- the mailbox watcher (the default)
+//!   ronny bot            -- the Telegram control channel
+//!   ronny watchdog       -- watches the other two
+//!   ronny calendar-auth  -- the one-time Google Calendar login
 //!
 //! They are split rather than threaded because only one process may call
 //! Telegram's getUpdates for a given token: a second poller gets 409 Conflict
@@ -39,6 +41,8 @@ const speech = @import("speech.zig");
 const interpret = @import("interpret.zig");
 const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
+const gcal = @import("gcal.zig");
+const appointment = @import("appointment.zig");
 
 /// Namespaced so each module's output is identifiable in the journal,
 /// the way the Python version's per-module loggers were.
@@ -122,9 +126,60 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "bot")) return runBot(init);
     if (std.mem.eql(u8, command, "watch")) return runWatcher(init);
     if (std.mem.eql(u8, command, "watchdog")) return runWatchdog(init);
+    if (std.mem.eql(u8, command, "calendar-auth")) {
+        const mode: gcal.AuthMode = if (args.len > 2 and std.mem.eql(u8, args[2], "paste")) .paste else .listen;
+        return runCalendarAuth(init, mode);
+    }
 
-    log.err("unknown command '{s}' -- expected 'watch', 'bot' or 'watchdog'", .{command});
+    log.err("unknown command '{s}' -- expected 'watch', 'bot', 'watchdog' or 'calendar-auth'", .{command});
     return error.UnknownCommand;
+}
+
+/// Run by hand, once, on the machine Ronny lives on. Everything else about
+/// the calendar happens inside `ronny bot`.
+fn runCalendarAuth(init: std.process.Init, mode: gcal.AuthMode) !void {
+    const cfg = (try loadCalendar(init)) orelse {
+        log.err("GOOGLE_CLIENT_ID is not set in .env -- see the README's calendar section", .{});
+        return ConfigError.MissingEnvironmentVariable;
+    };
+    try gcal.authorize(init.io, init.arena.allocator(), cfg, mode);
+}
+
+/// The IANA zone this machine is set to, from the /etc/localtime symlink
+/// (".../zoneinfo/Europe/Madrid"). Google needs the name, not an offset, so
+/// that an appointment in March keeps its clock time across the DST change.
+fn systemTimezone(io: std.Io, arena: std.mem.Allocator) ?[]const u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = std.Io.Dir.readLinkAbsolute(io, "/etc/localtime", &buffer) catch return null;
+    const target = buffer[0..len];
+    const marker = "zoneinfo/";
+    const at = std.mem.indexOf(u8, target, marker) orelse return null;
+    const name = target[at + marker.len ..];
+    if (name.len == 0) return null;
+    return arena.dupe(u8, name) catch null;
+}
+
+/// Google Calendar is optional and switched on by the client id. The rest
+/// default to what a single-owner install looks like.
+fn loadCalendar(init: std.process.Init) !?gcal.Config {
+    const arena = init.arena.allocator();
+    const client_id = (try envOptional(init, "GOOGLE_CLIENT_ID")) orelse return null;
+    const timezone = (try envOptional(init, "CALENDAR_TIMEZONE")) orelse systemTimezone(init.io, arena) orelse {
+        log.err("CALENDAR_TIMEZONE is not set and /etc/localtime does not name a zone", .{});
+        return ConfigError.MissingEnvironmentVariable;
+    };
+    const port_text = (try envOptional(init, "GOOGLE_OAUTH_PORT")) orelse "8765";
+    return .{
+        .client_id = client_id,
+        .client_secret = (try envOptional(init, "GOOGLE_CLIENT_SECRET")) orelse "",
+        .token_path = (try envOptional(init, "GOOGLE_TOKEN_FILE")) orelse try arena.dupeZ(u8, "data/google_token.json"),
+        .calendar_id = (try envOptional(init, "GOOGLE_CALENDAR_ID")) orelse "primary",
+        .timezone = timezone,
+        .auth_port = std.fmt.parseInt(u16, port_text, 10) catch {
+            log.err("GOOGLE_OAUTH_PORT is not a port number: {s}", .{port_text});
+            return ConfigError.MissingEnvironmentVariable;
+        },
+    };
 }
 
 /// Its own process on purpose: a watchdog that dies with the thing it watches
@@ -179,6 +234,7 @@ fn runBot(init: std.process.Init) !void {
         // leave the machine. See rerank.zig.
         .typesafe_rank_mail = envFlag(init, "TYPESAFE_RANK_MAIL"),
         .speech = try loadSpeech(init),
+        .calendar = try loadCalendar(init),
     };
 
     var bot = bot_mod.Bot.init(cfg, &controller, &settings_store);
@@ -441,5 +497,7 @@ test {
     _ = watchdog_mod;
     _ = interpret;
     _ = headers;
+    _ = gcal;
+    _ = appointment;
     _ = mailer;
 }

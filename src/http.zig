@@ -41,11 +41,32 @@ pub fn postJson(
     payload: []const u8,
     extra_headers: []const std.http.Header,
 ) !Response {
-    return send(io, gpa, .POST, url, payload, extra_headers);
+    return send(io, gpa, .POST, url, payload, "application/json", extra_headers);
+}
+
+/// POSTs an already-encoded `application/x-www-form-urlencoded` body. OAuth
+/// token endpoints take this shape and refuse JSON.
+pub fn postForm(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    payload: []const u8,
+    extra_headers: []const std.http.Header,
+) !Response {
+    return send(io, gpa, .POST, url, payload, "application/x-www-form-urlencoded", extra_headers);
 }
 
 pub fn get(io: std.Io, gpa: std.mem.Allocator, url: []const u8) !Response {
-    return send(io, gpa, .GET, url, null, &.{});
+    return send(io, gpa, .GET, url, null, "", &.{});
+}
+
+pub fn getWithHeaders(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+) !Response {
+    return send(io, gpa, .GET, url, null, "", extra_headers);
 }
 
 /// One part of a multipart/form-data body.
@@ -148,6 +169,7 @@ fn send(
     method: std.http.Method,
     url: []const u8,
     payload: ?[]const u8,
+    content_type: []const u8,
     extra_headers: []const std.http.Header,
 ) !Response {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
@@ -160,7 +182,7 @@ fn send(
         .location = .{ .url = url },
         .method = method,
         .payload = payload,
-        .headers = .{ .content_type = if (payload != null) .{ .override = "application/json" } else .default },
+        .headers = .{ .content_type = if (payload != null) .{ .override = content_type } else .default },
         .extra_headers = extra_headers,
         .response_writer = &body.writer,
     }) catch |err| {

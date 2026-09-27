@@ -64,6 +64,8 @@ re-read each scan so chat commands take effect without a restart.
 | `src/contacts.zig` | Who a new email can go to. Selected, never generated |
 | `src/transcribe.zig` | Voice notes, plus the transcript repair pass |
 | `src/speech.zig` | Summaries read aloud: piper, then ffmpeg to Opus. Fails soft to text |
+| `src/appointment.zig` | A calendar entry's day, time and length, read from the owner's words by code; the title from the local model, kept only if made of those words |
+| `src/gcal.zig` | Google Calendar: the OAuth login (from chat, or `ronny calendar-auth`) and the event insert. Decision-free, never sets attendees |
 | `src/watchdog.zig` | Journal tailing, incident classification, diagnosis |
 | `src/ollama.zig` | The one door to the local model |
 | `src/*.c` | libetpan (IMAP/MIME/SMTP) and whisper.cpp boundaries |
@@ -73,7 +75,10 @@ re-read each scan so chat commands take effect without a restart.
 
 1. **Nothing sends mail without an explicit yes.** There is no send action in
    the intent vocabulary, so no misclassification can reach the mailer.
-   Approval is resolved by word matching, never by a model.
+   Approval is resolved by word matching, never by a model. A calendar entry
+   goes through the same shape of gate -- shown in full, added on a typed
+   yes -- and never carries attendees, so nothing on that path can email a
+   third party either.
 2. **No address ever originates from model output.** A reply takes its
    recipient from the headers of a message already shown; a new email
    selects one from addresses that have really written to this mailbox. The
@@ -122,7 +127,10 @@ journalctl -u ronny-watch -u ronny-bot -f
 ```
 
 Deploying is a rebuild plus `sudo systemctl restart ronny-bot ronny-watch`.
-No firewall rule is needed; Ronny only makes outbound connections.
+No firewall rule is needed; Ronny only makes outbound connections. The
+calendar login is started from chat ("connect my calendar") and finished by
+pasting the redirect address back; the pasted code is exchanged with the
+PKCE verifier held in the bot process and is not kept in chat history.
 
 ## Known limitations
 
@@ -133,3 +141,7 @@ No firewall rule is needed; Ronny only makes outbound connections.
   credential — anyone holding it can impersonate the bot.
 - Content search depends on Gmail's `X-GM-RAW` extension and will not work
   against other IMAP providers.
+- The calendar is Google only, through its own OAuth client. Ronny can add
+  an entry and list a day; it cannot change or delete one. A consent screen of
+  type External left in "Testing" issues refresh tokens that die after seven
+  days, which shows up as "Google no longer accepts my calendar login".

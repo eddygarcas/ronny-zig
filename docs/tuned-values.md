@@ -25,6 +25,27 @@ alone and 0.73 with history, and it drops further as a conversation grows. So
 any threshold-based gate gets *worse* the longer someone talks to Ronny. That
 is the real argument against the simple version, not the two misses.
 
+## Calendar — `src/bot.zig`, `src/appointment.zig`
+
+These are defaults chosen on judgment rather than after a failure, recorded
+so a refactor knows they were chosen:
+
+**`PENDING_EVENT_TTL_SECONDS` (600)** sits between the settings TTL and the
+reply TTL. A calendar entry is often checked against something else before
+the yes, so five minutes felt short; "tomorrow" in a preview drifts if it is
+left overnight, so fifteen felt long.
+
+**`DEFAULT_DURATION_MINUTES` (60)** when a start is given and no end. A wrong
+length is the cheapest thing to fix on a calendar, and an hour is what
+calendars themselves default to.
+
+**The title-acceptance rule** in `titleIsFromRequest` — every word of three
+letters or more must appear in the request, and no digits — is the same idea
+as `targetWasWritten` in `src/interpret.zig`: a title the model produced
+rather than extracted is dropped for the owner's own words. Digits are
+refused because the one thing the model reliably leaks into a title is the
+time.
+
 ## Voice — `src/transcribe.zig`
 
 **`PROTECTED`** exists because a wide sender vocabulary made "email" score

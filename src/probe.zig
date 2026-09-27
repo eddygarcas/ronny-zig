@@ -17,6 +17,9 @@ const summarize = @import("summarize.zig");
 const speech = @import("speech.zig");
 const settings = @import("settings.zig");
 const telegram = @import("telegram.zig");
+const gcal = @import("gcal.zig");
+const appointment = @import("appointment.zig");
+const dates = @import("dates.zig");
 
 const VOCAB_ENTRY = 96;
 const VOCAB_MAX = 300;
@@ -134,6 +137,23 @@ pub fn main(init: std.process.Init) !void {
                 // Silencing everything indefinitely is still pause, not a
                 // quiet window.
                 .{ .text = "stop notifying me until I say otherwise", .want = .pause },
+                // Calendar: adding is an action, everything else about it
+                // is still out of scope.
+                .{ .text = "add a meeting with Dana next thursday at 3pm to my calendar", .want = .create_event },
+                .{ .text = "dentist tomorrow at 10", .want = .create_event },
+                .{ .text = "put lunch with Sam on my calendar on Friday", .want = .create_event },
+                .{ .text = "apunta una reunión con Vicente el jueves a las 10", .want = .create_event },
+                .{ .text = "what's on my calendar tomorrow?", .want = .list_events },
+                .{ .text = "my appointments on thursday", .want = .list_events },
+                .{ .text = "what do I have on 24 October?", .want = .list_events },
+                .{ .text = "qué tengo mañana en la agenda", .want = .list_events },
+                .{ .text = "move the dentist to friday", .want = .unknown },
+                .{ .text = "connect my calendar", .want = .connect_calendar },
+                .{ .text = "log in to google calendar", .want = .connect_calendar },
+                .{ .text = "link my calendar to ronny", .want = .connect_calendar },
+                // "email dana about thursday" must stay a compose, not an
+                // appointment, now that both mention a day.
+                .{ .text = "email dana about the meeting on thursday", .want = .compose_mail },
                 // Still out of scope.
                 .{ .text = "forward that to my accountant", .want = .unknown },
                 .{ .text = "delete all the newsletters", .want = .unknown },
@@ -160,6 +180,63 @@ pub fn main(init: std.process.Init) !void {
             }
             std.debug.print("  {d}/{d} correct\n\n", .{ correct, cases.len });
         }
+    }
+
+    // The calendar: the login, and the parse of a few requests against
+    // today's date. PROBE_CALENDAR_INSERT=1 also creates a real entry --
+    // tomorrow at 09:00, titled so it is obvious what to delete.
+    if (env.get("GOOGLE_CLIENT_ID")) |client_id| {
+        std.debug.print("=== calendar ===\n", .{});
+        const calendar: gcal.Config = .{
+            .client_id = client_id,
+            .client_secret = env.get("GOOGLE_CLIENT_SECRET") orelse "",
+            .token_path = env.get("GOOGLE_TOKEN_FILE") orelse "data/google_token.json",
+            .calendar_id = env.get("GOOGLE_CALENDAR_ID") orelse "primary",
+            .timezone = env.get("CALENDAR_TIMEZONE") orelse "Europe/Madrid",
+        };
+        const today = dates.today();
+        for ([_][]const u8{
+            "add a meeting with Dana next thursday at 3pm for 2 hours to my calendar",
+            "dentist tomorrow at 10",
+            "put lunch with Sam on my calendar on Friday",
+            "apunta una reunión con Vicente el jueves a las 10 de la mañana",
+        }) |request| {
+            const found = try appointment.find(arena, today, request);
+            const info = try appointment.details(init.io, arena, env.get("OLLAMA_URL") orelse "http://127.0.0.1:11434", env.get("OLLAMA_MODEL") orelse "qwen2.5", request, found.rest);
+            std.debug.print("  \"{s}\"\n       -> {s} | {s}{s}{s}\n", .{
+                request,
+                info.title,
+                if (found.when) |w| try appointment.describe(arena, w) else "no day",
+                if (info.location.len > 0) " | at " else "",
+                info.location,
+            });
+        }
+        if (gcal.check(init.io, arena, calendar)) {
+            std.debug.print("  login ok: an access token was minted from {s}\n", .{calendar.token_path});
+            const entries = try gcal.list(init.io, arena, calendar, today.year, today.month, today.day);
+            std.debug.print("  today: {d} entr{s}\n", .{ entries.len, if (entries.len == 1) "y" else "ies" });
+            for (entries) |entry| {
+                std.debug.print("    {s}  {s}\n", .{
+                    if (entry.start_minutes) |s| try appointment.clockRange(arena, s, entry.end_minutes) else "all day    ",
+                    entry.title,
+                });
+            }
+        } else |err| {
+            std.debug.print("  login FAILED ({s}); say \"connect my calendar\" to the bot\n", .{@errorName(err)});
+        }
+        if (env.get("PROBE_CALENDAR_INSERT") != null) {
+            const tomorrow = today.shift(1);
+            const created = try gcal.insert(init.io, arena, calendar, .{
+                .title = "Ronny probe (delete me)",
+                .year = tomorrow.year,
+                .month = tomorrow.month,
+                .day = tomorrow.day,
+                .start_minutes = 9 * 60,
+                .end_minutes = 9 * 60 + 30,
+            });
+            std.debug.print("  created {s}\n  {s}\n", .{ created.id, created.html_link });
+        }
+        std.debug.print("\n", .{});
     }
 
     var session = try imap.Session.connect(

@@ -7,6 +7,7 @@ tokens or paths baked into it.
 |---|---|
 | `.env` | credentials, model endpoints, file paths — gitignored, copy from `.env.example` |
 | `config/senders.yaml` | the allowlist: full addresses or bare domains — gitignored like `.env`, copy `config/senders.example.yaml` |
+| `data/google_token.json` | the calendar login, if `GOOGLE_CLIENT_ID` is set — per mailbox, so run `ronny calendar-auth` again for the new one; the OAuth client itself can be shared |
 
 Nothing else needs touching to run a second Ronny against a different account.
 

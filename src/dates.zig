@@ -104,7 +104,7 @@ const MONTHS = [_][]const u8{
 };
 
 /// Enough to match "Sept", "Sep" and "September" from the same entry.
-fn monthAt(text: []const u8) ?struct { month: u8, len: usize } {
+pub fn monthAt(text: []const u8) ?struct { month: u8, len: usize } {
     for (MONTHS, 0..) |name, i| {
         // Longest first: "june" must not match as "jun" and leave an "e".
         var take = name.len;
@@ -120,7 +120,7 @@ fn monthAt(text: []const u8) ?struct { month: u8, len: usize } {
     return null;
 }
 
-fn readNumber(text: []const u8) ?struct { value: u32, len: usize } {
+pub fn readNumber(text: []const u8) ?struct { value: u32, len: usize } {
     var len: usize = 0;
     while (len < text.len and std.ascii.isDigit(text[len]) and len < 4) len += 1;
     if (len == 0) return null;
@@ -128,7 +128,7 @@ fn readNumber(text: []const u8) ?struct { value: u32, len: usize } {
 }
 
 /// Skips "th", "st", "nd", "rd", and the words between a day and its month.
-fn skipFiller(text: []const u8) usize {
+pub fn skipFiller(text: []const u8) usize {
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] == ' ' or text[i] == ',') {
@@ -292,7 +292,7 @@ pub fn find(now: Day, text: []const u8) ?Found {
     return null;
 }
 
-fn makeDay(year: u32, month: u32, day: u32) ?Day {
+pub fn makeDay(year: u32, month: u32, day: u32) ?Day {
     if (month < 1 or month > 12 or day < 1 or day > 31) return null;
     if (year < 1970 or year > 2200) return null;
     return .{ .year = @intCast(year), .month = @intCast(month), .day = @intCast(day) };
@@ -303,7 +303,7 @@ fn mostRecentChecked(now: Day, month: u32, day: u32) ?Day {
     return mostRecent(now, @intCast(month), @intCast(day));
 }
 
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+pub fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0 or needle.len > haystack.len) return null;
     var i: usize = 0;
     while (i + needle.len <= haystack.len) : (i += 1) {
