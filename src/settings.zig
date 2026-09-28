@@ -51,6 +51,17 @@ pub const Settings = struct {
     voice_en: VoiceName = .{},
     voice_es: VoiceName = .{},
 
+    /// Whether a calendar entry that has a link to join gets a reminder
+    /// shortly before it starts. The link is the test, not the entry: a
+    /// dentist's appointment is on the calendar too, and a ping ten minutes
+    /// before it is noise, while ten minutes before a call is when the
+    /// owner needs the link in front of them.
+    meeting_reminders: bool = true,
+
+    /// How long before the start the reminder goes. Kept when reminders
+    /// are switched off, so switching them back on restores the same lead.
+    reminder_minutes: u16 = DEFAULT_REMINDER_MINUTES,
+
     pub fn quietEnabled(self: Settings) bool {
         return self.quiet_from != OFF and self.quiet_to != OFF;
     }
@@ -285,6 +296,10 @@ pub fn formatTime(minutes: i16, buffer: []u8) []const u8 {
 pub const DEFAULT_QUIET_FROM: i16 = 22 * 60;
 pub const DEFAULT_QUIET_TO: i16 = 8 * 60;
 
+pub const DEFAULT_REMINDER_MINUTES: u16 = 10;
+/// A whole day. Past this a "reminder" is a second calendar entry.
+pub const MAX_REMINDER_MINUTES: u16 = 24 * 60;
+
 pub const Change = union(enum) {
     quiet_hours: struct { from: i16, to: i16 },
     quiet_off,
@@ -293,6 +308,11 @@ pub const Change = union(enum) {
     language: Language,
     /// Always a name from the voices on disk; see scanVoice.
     voice: VoiceName,
+    /// Meeting reminders on or off; the lead stays what it was.
+    reminders: bool,
+    /// A new lead, which also switches reminders on: nobody sets a time
+    /// for something they want kept off.
+    reminder_minutes: u16,
 };
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -492,6 +512,69 @@ fn scanVoice(text: []const u8, voices: []const []const u8) ?VoiceName {
     return null;
 }
 
+// ---- meeting reminders ----
+//
+// "remind me 15 minutes before meetings", "avísame 5 minutos antes de las
+// reuniones", "turn off meeting reminders". The number is read as a count
+// of minutes or hours, never as a clock time: "15 minutes before" must not
+// become quiet hours at 15:00, which is what scanTime would make of it, so
+// this runs before the quiet-hours parser.
+
+const REMIND_WORDS = [_][]const u8{ "remind", "reminder", "recuérd", "recuerd", "recordatorio", "avís", "avis" };
+const MEETING_WORDS = [_][]const u8{ "meeting", "meetings", "call", "calls", "reunión", "reunion", "reuniones", "llamada", "cita" };
+const BEFORE_WORDS = [_][]const u8{ "before", "antes", "ahead", "prior", "early" };
+const ON_WORDS = [_][]const u8{ " on", "enable", "start", "resume", "activa", "again", "back", "yes", "please", "sí" };
+
+fn scanReminder(text: []const u8) ?Change {
+    const about_reminding = containsAny(text, &REMIND_WORDS);
+    const about_meetings = containsAny(text, &MEETING_WORDS);
+    // "remind me about the dentist" is an appointment, not a setting: what
+    // makes this one is the word reminder, or a lead before meetings.
+    if (!about_reminding and !(about_meetings and containsAny(text, &BEFORE_WORDS))) return null;
+
+    if (scanLead(text)) |minutes| {
+        if (minutes == 0 or minutes > MAX_REMINDER_MINUTES) return null;
+        return .{ .reminder_minutes = minutes };
+    }
+    if (containsAny(text, &REJECTING) and !containsAny(text, &ON_WORDS)) return .{ .reminders = false };
+    if (about_meetings and containsAny(text, &ON_WORDS)) return .{ .reminders = true };
+    return null;
+}
+
+/// "15 minutes", "15 min", "an hour", "half an hour", "media hora",
+/// "una hora", "2 hours" -> minutes. Digits or the few word forms that
+/// mean one; anything else is not a lead.
+fn scanLead(text: []const u8) ?u16 {
+    if (containsAny(text, &.{ "half an hour", "media hora", "half hour" })) return 30;
+    if (containsAny(text, &.{ "quarter of an hour", "cuarto de hora" })) return 15;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (!std.ascii.isDigit(text[i])) continue;
+        if (i > 0 and (std.ascii.isDigit(text[i - 1]) or text[i - 1] == ':' or text[i - 1] == '.')) continue;
+        var end = i;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        // A clock time is not a lead.
+        if (end < text.len and (text[end] == ':' or text[end] == '.')) {
+            i = end;
+            continue;
+        }
+        const value = std.fmt.parseInt(u16, text[i..end], 10) catch {
+            i = end;
+            continue;
+        };
+        const rest = text[end..];
+        const unit_at = std.mem.indexOfNone(u8, rest, " \t") orelse rest.len;
+        const unit = rest[unit_at..];
+        if (std.ascii.startsWithIgnoreCase(unit, "min")) return value;
+        if (std.ascii.startsWithIgnoreCase(unit, "h") and !std.ascii.startsWithIgnoreCase(unit, "hasta")) {
+            return std.math.mul(u16, value, 60) catch return null;
+        }
+        i = end;
+    }
+    if (containsAny(text, &.{ "an hour", "one hour", "una hora", "1h" })) return 60;
+    return null;
+}
+
 const SPANISH_WORDS = [_][]const u8{ "spanish", "español", "espanol", "castellano", "castilian" };
 const ENGLISH_WORDS = [_][]const u8{ "english", "inglés", "ingles" };
 
@@ -541,6 +624,16 @@ pub fn parseChange(text: []const u8, current: Settings, voices: []const []const 
     // A voice by name first: "use the voice john" says "voice", and read by
     // the delivery parser alone it would merely switch summaries to audio.
     if (scanVoice(text, voices)) |voice| return .{ .voice = voice };
+
+    // Meeting reminders before anything that reads a number: "15 minutes
+    // before meetings" holds a 15 that scanTime would take as three in the
+    // afternoon, and "no meeting reminders" holds a "no" that the quiet
+    // hours check would take as switching those off.
+    if (scanReminder(text)) |change| return change;
+    // A sentence about reminders that did not parse is refused outright:
+    // "remind me 0 minutes before meetings" must not fall through to the
+    // clock parser and become quiet hours from midnight.
+    if (containsAny(text, &REMIND_WORDS)) return null;
 
     // Delivery and language next: neither mentions a time or a day count,
     // and "no more voice summaries" must not be read as quiet hours off
@@ -636,6 +729,69 @@ test "the language is read when one is named, refused when both are" {
     try std.testing.expect(parseChange("spanish or english, whichever", .{}, &.{}) == null);
 }
 
+test "meeting reminders: the lead is read as minutes, never as a clock time" {
+    const cases = [_]struct { text: []const u8, want: u16 }{
+        .{ .text = "remind me 15 minutes before meetings", .want = 15 },
+        .{ .text = "remind me 5 min before a call", .want = 5 },
+        .{ .text = "meeting reminders an hour ahead", .want = 60 },
+        .{ .text = "remind me half an hour before meetings", .want = 30 },
+        .{ .text = "avísame 5 minutos antes de las reuniones", .want = 5 },
+        .{ .text = "recuérdame las reuniones 20 minutos antes", .want = 20 },
+        .{ .text = "reminders 2 hours before meetings", .want = 120 },
+    };
+    for (cases) |case| {
+        const change = parseChange(case.text, .{}, &.{}) orelse {
+            std.debug.print("no change parsed from: {s}\n", .{case.text});
+            return error.TestUnexpectedResult;
+        };
+        if (change != .reminder_minutes or change.reminder_minutes != case.want) {
+            std.debug.print("wrong change for: {s}\n", .{case.text});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Zero and a lead longer than a day are refused rather than saved.
+    try std.testing.expect(parseChange("remind me 0 minutes before meetings", .{}, &.{}) == null);
+    try std.testing.expect(parseChange("remind me 3000 minutes before meetings", .{}, &.{}) == null);
+}
+
+test "meeting reminders switch off and on without touching the lead" {
+    const off = [_][]const u8{
+        "turn off meeting reminders",
+        "stop reminding me about meetings",
+        "no meeting reminders",
+        "don't remind me before meetings",
+        "no me avises antes de las reuniones",
+    };
+    for (off) |text| {
+        const change = parseChange(text, .{}, &.{}) orelse {
+            std.debug.print("no change parsed from: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        };
+        if (change != .reminders or change.reminders) {
+            std.debug.print("wrong change for: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        }
+    }
+    const on = [_][]const u8{
+        "turn meeting reminders on",
+        "remind me before meetings again",
+        "meeting reminders please",
+    };
+    for (on) |text| {
+        const change = parseChange(text, .{}, &.{}) orelse {
+            std.debug.print("no change parsed from: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        };
+        if (change != .reminders or !change.reminders) {
+            std.debug.print("wrong change for: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Neither: quiet hours and the rest still get their turn.
+    try std.testing.expect(parseChange("no notifications before 8am", .{}, &.{}).? == .quiet_hours);
+    try std.testing.expect(parseChange("remind me about the dentist", .{}, &.{}) == null);
+}
+
 test "delivery and language survive a round trip through the store's JSON" {
     var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
@@ -650,6 +806,8 @@ test "delivery and language survive a round trip through the store's JSON" {
     defer old.deinit();
     try std.testing.expect(old.value.summaries == .text);
     try std.testing.expect(old.value.language == .en);
+    try std.testing.expect(old.value.meeting_reminders);
+    try std.testing.expectEqual(DEFAULT_REMINDER_MINUTES, old.value.reminder_minutes);
 }
 
 test "a voice is chosen by name from what is installed, and only from that" {

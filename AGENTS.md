@@ -65,7 +65,8 @@ re-read each scan so chat commands take effect without a restart.
 | `src/transcribe.zig` | Voice notes, plus the transcript repair pass |
 | `src/speech.zig` | Summaries read aloud: piper, then ffmpeg to Opus. Fails soft to text |
 | `src/appointment.zig` | A calendar entry's day, time and length, read from the owner's words by code; the title from the local model, kept only if made of those words |
-| `src/gcal.zig` | Google Calendar: the OAuth login (from chat, or `ronny calendar-auth`) and the event insert. Decision-free, never sets attendees |
+| `src/gcal.zig` | Google Calendar: the OAuth login (from chat, or `ronny calendar-auth`), insert, list, remove. Decision-free, never sets attendees. Also which of an entry's links counts as a place to join |
+| `src/reminders.zig` | Meeting reminders: which entry is due one at a given minute, and what it says. The bot refreshes the day's listing between polls and asks this |
 | `src/watchdog.zig` | Journal tailing, incident classification, diagnosis |
 | `src/ollama.zig` | The one door to the local model |
 | `src/*.c` | libetpan (IMAP/MIME/SMTP) and whisper.cpp boundaries |
@@ -143,6 +144,10 @@ PKCE verifier held in the bot process and is not kept in chat history.
   against other IMAP providers.
 - The calendar is Google only, through its own OAuth client. Ronny can add
   an entry, list a day and remove an entry picked from that list; it cannot
-  move or edit one. A consent screen of
+  move or edit one. A reminder goes before an entry that has a link to join
+  (Meet, a conference add-on, or a known meeting host), never before one
+  that has not; the lead and the switch are chat settings. The listing is
+  refreshed every few minutes, so an entry added closer to its start than
+  that may get its reminder late or not at all. A consent screen of
   type External left in "Testing" issues refresh tokens that die after seven
   days, which shows up as "Google no longer accepts my calendar login".

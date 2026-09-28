@@ -170,7 +170,7 @@ your typed words are ever sent, never mail.
 ```
 git clone https://github.com/eddygarcas/ronny-zig
 cd ronny-zig
-zig build test                     # 114 tests, no network needed
+zig build test                     # 127 tests, no network needed
 zig build -Doptimize=ReleaseSafe   # -> zig-out/bin/ronny
 ```
 
@@ -368,6 +368,7 @@ Two rules apply to voice when writing mail:
 | "no" | — | drops it |
 | "what's on my calendar tomorrow?" | `/agenda tomorrow` | lists that day's entries, in start order; no day means today |
 | "remove today's appointment at 4pm" | `/delete the dentist on thursday` | picks the entry from that day's real list, shows it, and removes it on a typed yes |
+| — | — | before an entry that has a link to join, a reminder with the link, and the agenda if it has one |
 
 ```
 you › apunta una reunión con Vicente el jueves a las 10
@@ -418,11 +419,43 @@ Ronny › Thu 1 Oct 2026:
          15:00-17:00  Meeting with Dana
 ```
 
+**Meeting reminders.** Ronny keeps an eye on the day and, ten minutes before
+an entry that has a link to join, sends the link:
+
+```
+Ronny › In 10 minutes: Weekly sync (15:00-16:00)
+         https://meet.google.com/abc-defg-hij
+
+         Agenda: Review of the Q4 numbers and the hiring plan. Bring the
+         updated forecast; a decision on the two open roles is expected.
+```
+
+Only an entry with a link qualifies -- a Google Meet link, the video link of
+a Zoom or Teams add-on, a link in the location, or a link in the description
+to a known meeting host. The dentist gets no reminder; the point is to have
+the link in front of you when you need it. If the entry has a description,
+its agenda is summarised by the local model and goes with the reminder, as
+text or as a voice message following the summaries setting; a short
+description is sent as it is. The lead and the switch are settings:
+
+| Say | What happens |
+|---|---|
+| "remind me 15 minutes before meetings" | changes the lead, and turns reminders on if they were off |
+| "avísame 5 minutos antes de las reuniones" | the same, in Spanish |
+| "turn off meeting reminders" | no reminders; the lead is kept for when they come back |
+| "meeting reminders on" | back on, with the same lead |
+
+The listing is refreshed every three minutes, so an entry added closer to
+its start than that may be reminded late or not at all, and a reminder is
+never sent after the start: a bot that comes up two minutes into a call
+stays quiet about it. Reminders go during quiet hours too -- those hold
+*mail*, and a meeting you put in your own calendar is not mail.
+
 ### Settings
 
 | Say | Or type | What happens |
 |---|---|---|
-| "what are your settings?" | `/settings` | quiet hours, default look-back, how summaries arrive, and the two `.env`-only settings |
+| "what are your settings?" | `/settings` | quiet hours, default look-back, how summaries arrive, meeting reminders, and the two `.env`-only settings |
 | "don't notify me before 8am" | — | sets quiet hours |
 | "no notifications between 10pm and 7am" | — | sets both ends at once |
 | "turn off quiet hours" | — | back to notifying whenever mail arrives |
@@ -431,6 +464,8 @@ Ronny › Thu 1 Oct 2026:
 | "back to text summaries" | — | and back |
 | "summaries in Spanish" | — | the language summaries are written in, and read in |
 | "use john's voice" | — | which installed voice reads them; `/settings` lists what is installed |
+| "remind me 15 minutes before meetings" | — | the lead for meeting reminders; see [Calendar](#calendar) |
+| "turn off meeting reminders" | — | and off again, keeping the lead |
 
 **Quiet hours hold mail, they do not drop it.** During the window the watcher
 stops scanning, so the read position stays where it is and everything that

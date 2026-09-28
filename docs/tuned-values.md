@@ -46,6 +46,31 @@ rather than extracted is dropped for the owner's own words. Digits are
 refused because the one thing the model reliably leaks into a title is the
 time.
 
+**`REMINDER_REFRESH_SECONDS` (180)** in `src/bot.zig` is how often the day's
+listing is fetched again for meeting reminders. It bounds two things at
+once: how soon after being added an entry can still get its reminder, and
+how many requests a day go to Google for an idle calendar (under 500, against
+a default quota in the millions). Three minutes is short next to a ten-minute
+lead and long next to a poll.
+
+**`DEFAULT_REMINDER_MINUTES` (10)** in `src/settings.zig` is what the owner
+asked for. It is a setting, so the number matters less than the fact that
+switching reminders off keeps it: "turn them back on" restores the lead
+rather than the default.
+
+**`MEETING_HOSTS` in `src/gcal.zig`** is why a link in a description counts
+as a meeting only when it points at Meet, Zoom, Teams and the like. A
+description is full of links -- the agenda document, a ticket, an
+unsubscribe page -- and "has a meeting link" is what decides whether the
+owner gets pinged. A link in the *location* field counts whatever its host,
+because that field is where the place goes.
+
+**A reminder is due from `lead` minutes before the start until the start,
+not after.** A bot that comes up two minutes into a meeting stays quiet
+about it; a reminder for something that has begun is noise, and a late one
+is what makes people switch reminders off. Marked as sent *before* the send,
+so a Telegram failure costs one reminder rather than one per poll.
+
 ## Voice — `src/transcribe.zig`
 
 **`PROTECTED`** exists because a wide sender vocabulary made "email" score

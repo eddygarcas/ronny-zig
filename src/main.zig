@@ -43,6 +43,7 @@ const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
 const gcal = @import("gcal.zig");
 const appointment = @import("appointment.zig");
+const reminders = @import("reminders.zig");
 
 /// Namespaced so each module's output is identifiable in the journal,
 /// the way the Python version's per-module loggers were.
@@ -505,5 +506,6 @@ test {
     _ = headers;
     _ = gcal;
     _ = appointment;
+    _ = reminders;
     _ = mailer;
 }

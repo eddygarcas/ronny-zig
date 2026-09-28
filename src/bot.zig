@@ -41,6 +41,7 @@ const speech_mod = @import("speech.zig");
 const gcal = @import("gcal.zig");
 const appointment = @import("appointment.zig");
 const dates = @import("dates.zig");
+const reminders_mod = @import("reminders.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -64,6 +65,11 @@ pub const PENDING_EVENT_TTL_SECONDS = 600;
 pub const PENDING_LOGIN_TTL_SECONDS = 900;
 /// A removal waits for a typed yes for this long. Same as an addition.
 pub const PENDING_REMOVAL_TTL_SECONDS = 600;
+/// How often the day's listing is fetched again for meeting reminders. An
+/// entry added or moved after the fetch is seen at the next one, so this
+/// bounds how close to its start a new meeting can be and still get its
+/// reminder: closer than this and the reminder may go late or not at all.
+pub const REMINDER_REFRESH_SECONDS = 180;
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
@@ -73,6 +79,8 @@ const VOCAB_DAYS = 180;
 const VOCAB_ENTRY = 96;
 const VOCAB_MAX = 300;
 
+/// Minutes since local midnight; see shim.c.
+extern fn ronny_local_minutes() c_int;
 extern fn ronny_sender_vocabulary(session: *imap.c.mailimap, days: c_int, out: [*]u8, max_out: c_int) c_int;
 
 pub const HELP_TEXT =
@@ -98,11 +106,16 @@ pub const HELP_TEXT =
     \\/delete <which, and when> - remove an entry from your calendar (shown first, removed on a typed yes)
     \\/pause - stop notifications temporarily
     \\/resume - resume notifications
-    \\/settings - show my settings (quiet hours, default look-back, summaries as text or voice)
+    \\/settings - show my settings (quiet hours, default look-back, summaries as text or voice, meeting reminders)
     \\
     \\Settings change in plain language too: "don't notify me before 8am",
     \\"no notifications between 10pm and 7am", "look back 30 days by default",
-    \\"send summaries as voice messages", "summaries in Spanish", "use john's voice".
+    \\"send summaries as voice messages", "summaries in Spanish", "use john's voice",
+    \\"remind me 15 minutes before meetings", "turn off meeting reminders".
+    \\
+    \\Before a calendar entry that has a link to join, I send a reminder with
+    \\the link and, if the entry has a description, a summary of the agenda --
+    \\as text or as a voice message, whichever summaries are set to.
     \\Spoken out loud, I read the new value back and wait for a typed yes.
     \\
     \\When a reply is drafted, just answer 'yes' to send or 'no' to discard.
@@ -294,6 +307,18 @@ const PendingEvent = struct {
     }
 };
 
+/// Today's meetings as the reminder check last saw them. Refreshed from
+/// Google every REMINDER_REFRESH_SECONDS and at midnight; what has been
+/// reminded is carried across a refresh by id.
+const Reminders = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []reminders_mod.Entry,
+    day: dates.Day,
+    refreshed_ns: i96,
+    /// So a listing that keeps failing is logged once, not every refresh.
+    failing: bool = false,
+};
+
 const Turn = struct {
     owner: []u8,
     assistant: []u8,
@@ -315,6 +340,7 @@ pub const Bot = struct {
     pending_event: ?PendingEvent = null,
     pending_login: ?PendingLogin = null,
     pending_removal: ?PendingRemoval = null,
+    reminders: ?Reminders = null,
     /// Set by the login step so the pasted code is not kept in history.
     redact_next_record: bool = false,
     /// Side channel from a summarising action to the send in handleText.
@@ -353,6 +379,7 @@ pub const Bot = struct {
         if (self.composing) |*composing| composing.arena.deinit();
         if (self.pending_event) |*event| event.arena.deinit();
         if (self.pending_removal) |*removal| removal.arena.deinit();
+        if (self.reminders) |*reminders| reminders.arena.deinit();
         if (self.vocabulary_arena) |*arena| arena.deinit();
         for (self.history.items) |turn| {
             self.cfg.gpa.free(turn.owner);
@@ -376,6 +403,10 @@ pub const Bot = struct {
 
         log.info("telegram polling started", .{});
         while (true) {
+            // Between polls rather than on a timer: a poll returns within
+            // POLL_TIMEOUT_SECONDS whether or not anything was said, which
+            // is as close to the minute as a reminder needs to be.
+            self.tickReminders();
             self.pollOnce() catch |err| {
                 log.err("poll failed ({s}); retrying in {d}s", .{ @errorName(err), RETRY_DELAY_SECONDS });
                 // A failing poll is usually the network or a 409 from a second
@@ -386,6 +417,145 @@ pub const Bot = struct {
                 ) catch return err;
             };
         }
+    }
+
+    // ---- meeting reminders ----
+
+    /// Sends the reminder for any meeting that is now within the lead.
+    /// Never an error: a reminder that cannot be sent is logged, and the
+    /// Telegram poll it sits next to must not stop over it.
+    fn tickReminders(self: *Bot) void {
+        const calendar = self.cfg.calendar orelse return;
+        const prefs = self.settings.reload();
+        if (!prefs.meeting_reminders) return;
+        const local = ronny_local_minutes();
+        if (local < 0) return; // no clock, no reminders
+        const now: i32 = local;
+
+        self.refreshReminders(calendar, now);
+        if (self.reminders == null) return;
+        const state = &self.reminders.?;
+
+        const lead: i32 = prefs.reminder_minutes;
+        while (reminders_mod.due(state.entries, now, lead)) |entry| {
+            // Marked before the send: a reminder that fails to send once is
+            // not worth a retry every poll until the meeting starts.
+            entry.reminded = true;
+            self.sendReminder(entry.*, now, prefs) catch |err| {
+                log.err("could not send the reminder for \"{s}\": {s}", .{ entry.title, @errorName(err) });
+            };
+        }
+    }
+
+    /// Fetches the listing again when it is stale or the day has turned.
+    /// The last hour of the day also fetches tomorrow, so a lead that
+    /// crosses midnight has something to find.
+    ///
+    /// One arena, reset and reused: the bot's allocator is the process
+    /// arena, so a fresh one per refresh would pile up a listing's worth of
+    /// memory every few minutes for as long as the bot runs.
+    fn refreshReminders(self: *Bot, calendar: gcal.Config, now: i32) void {
+        const today = dates.today();
+        const clock_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds;
+        if (self.reminders) |state| {
+            const age = @divTrunc(clock_ns - state.refreshed_ns, std.time.ns_per_s);
+            if (age < REMINDER_REFRESH_SECONDS and state.day.order(today) == .eq) return;
+        }
+        if (self.reminders == null) {
+            self.reminders = .{
+                .arena = std.heap.ArenaAllocator.init(self.cfg.gpa),
+                .entries = &.{},
+                .day = today,
+                .refreshed_ns = clock_ns,
+            };
+        }
+        const state = &self.reminders.?;
+        state.refreshed_ns = clock_ns;
+
+        var scratch_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
+        defer scratch_state.deinit();
+        const scratch = scratch_state.allocator();
+
+        // Both days into scratch first: a Google hiccup must not cost the
+        // copy already held, which may carry a reminder due this minute.
+        const today_listing = self.listForReminders(scratch, calendar, today) orelse return self.reminderRefreshFailed();
+        const tomorrow_listing: []const gcal.Listed = if (now >= 23 * 60)
+            self.listForReminders(scratch, calendar, today.shift(1)) orelse return self.reminderRefreshFailed()
+        else
+            &.{};
+
+        // What was reminded today survives the reset; a new day starts clean.
+        const previous: []const reminders_mod.Entry = if (state.day.order(today) == .eq) state.entries else &.{};
+        var kept: std.ArrayList(reminders_mod.Entry) = .empty;
+        for (previous) |entry| {
+            if (!entry.reminded) continue;
+            kept.append(scratch, .{
+                .id = scratch.dupe(u8, entry.id) catch return,
+                .title = "",
+                .link = "",
+                .description = "",
+                .start = entry.start,
+                .end = entry.end,
+                .reminded = true,
+            }) catch return;
+        }
+
+        _ = state.arena.reset(.retain_capacity);
+        state.entries = &.{};
+        state.day = today;
+        const arena = state.arena.allocator();
+        var out: std.ArrayList(reminders_mod.Entry) = .empty;
+        reminders_mod.collect(arena, &out, today_listing, 0, kept.items) catch return;
+        reminders_mod.collect(arena, &out, tomorrow_listing, 1, kept.items) catch return;
+        state.entries = out.items;
+        if (state.failing) log.info("meeting reminders: the listing is back", .{});
+        state.failing = false;
+    }
+
+    fn reminderRefreshFailed(self: *Bot) void {
+        if (self.reminders) |*state| {
+            if (!state.failing) log.warn("meeting reminders: could not refresh the listing; keeping the last one", .{});
+            state.failing = true;
+        }
+    }
+
+    fn listForReminders(self: *Bot, arena: std.mem.Allocator, calendar: gcal.Config, day: dates.Day) ?[]const gcal.Listed {
+        return gcal.list(self.cfg.io, arena, calendar, day.year, day.month, day.day) catch |err| {
+            const quiet = if (self.reminders) |state| state.failing else false;
+            if (!quiet) log.warn("meeting reminders: listing {d:0>4}-{d:0>2}-{d:0>2} failed: {s}", .{ day.year, day.month, day.day, @errorName(err) });
+            return null;
+        };
+    }
+
+    /// The reminder message, with the agenda when the entry has one. The
+    /// agenda follows the summaries setting -- spoken when summaries are,
+    /// with the reminder itself as the caption so the link stays tappable.
+    fn sendReminder(self: *Bot, entry: reminders_mod.Entry, now: i32, prefs: settings_mod.Settings) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const heading = try reminders_mod.text(arena, entry, now);
+        log.info("meeting reminder: \"{s}\" at {d} minutes past midnight, {d} minute(s) ahead", .{ entry.title, entry.start, entry.start - now });
+
+        const agenda = summarize_mod.forAgenda(
+            self.cfg.io,
+            arena,
+            self.cfg.ollama_url,
+            self.cfg.ollama_model,
+            prefs.language,
+            entry.title,
+            entry.description,
+        );
+
+        if (agenda) |body| {
+            if (prefs.summaries == .voice) {
+                const caption = try std.fmt.allocPrint(arena, "{s}\n\nAgenda:", .{heading});
+                if (self.sendSpoken(arena, .{ .caption = caption, .body = body })) return;
+            }
+            return self.client.sendMessage(try std.fmt.allocPrint(arena, "{s}\n\nAgenda: {s}", .{ heading, body }));
+        }
+        return self.client.sendMessage(heading);
     }
 
     fn pollOnce(self: *Bot) !void {
@@ -1197,6 +1367,13 @@ pub const Bot = struct {
         } else {
             try out.writer.writeAll("\nCalendar: not set up (GOOGLE_CLIENT_ID in .env)");
         }
+        if (current.meeting_reminders) {
+            try out.writer.print("\nMeeting reminders: {d} minutes before any entry with a link to join, with its agenda as {s}", .{
+                current.reminder_minutes, current.summaries.label(),
+            });
+        } else {
+            try out.writer.writeAll("\nMeeting reminders: off");
+        }
         try out.writer.print("\nVoice can confirm send: {s} (set in .env)", .{
             if (self.cfg.voice_can_confirm_send) "yes" else "no",
         });
@@ -1217,7 +1394,7 @@ pub const Bot = struct {
             // Refusing beats guessing here: a wrong quiet window shows up as
             // no notifications, which is indistinguishable from working.
             log.info("no settings change found in: {s}", .{text});
-            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\", \"look back 30 days by default\", \"send summaries as voice messages\", \"summaries in Spanish\" or \"use john's voice\" -- /settings shows what I have now, including the voices installed.";
+            return "I didn't catch which setting to change. Try \"don't notify me before 8am\", \"no notifications between 10pm and 7am\", \"turn off quiet hours\", \"look back 30 days by default\", \"send summaries as voice messages\", \"summaries in Spanish\", \"use john's voice\", \"remind me 15 minutes before meetings\" or \"turn off meeting reminders\" -- /settings shows what I have now, including the voices installed.";
         };
 
         // A typed change is unambiguous and applies immediately. A *spoken*
@@ -1282,6 +1459,15 @@ pub const Bot = struct {
                     settings_mod.speakerOfVoice(name.slice()),
                 },
             ),
+            .reminders => |on| if (on)
+                "That turns meeting reminders on."
+            else
+                "That turns meeting reminders off.",
+            .reminder_minutes => |minutes| try std.fmt.allocPrint(
+                arena,
+                "That sets meeting reminders to {d} minute(s) before the start.",
+                .{minutes},
+            ),
         };
     }
 
@@ -1305,6 +1491,11 @@ pub const Bot = struct {
             .voice => |name| switch (settings_mod.languageOfVoice(name.slice()) orelse .en) {
                 .en => current.voice_en = name,
                 .es => current.voice_es = name,
+            },
+            .reminders => |on| current.meeting_reminders = on,
+            .reminder_minutes => |minutes| {
+                current.reminder_minutes = minutes;
+                current.meeting_reminders = true;
             },
         }
 
@@ -1363,7 +1554,23 @@ pub const Bot = struct {
                     "";
                 break :blk try std.fmt.allocPrint(arena, "{s} voice set to {s}.{s}", .{ language.name(), speaker, caveat });
             },
+            .reminders => |on| if (on)
+                try std.fmt.allocPrint(arena, "Meeting reminders on: {d} minute(s) before any calendar entry with a link to join.{s}", .{
+                    current.reminder_minutes, self.reminderCaveat(),
+                })
+            else
+                "Meeting reminders off.",
+            .reminder_minutes => |minutes| try std.fmt.allocPrint(arena, "Meeting reminders {d} minute(s) before the start, for any calendar entry with a link to join.{s}", .{
+                minutes, self.reminderCaveat(),
+            }),
         };
+    }
+
+    /// Why a reminder setting will not do anything yet, if it will not.
+    fn reminderCaveat(self: *Bot) []const u8 {
+        const calendar = self.cfg.calendar orelse return " The calendar isn't set up yet, though -- GOOGLE_CLIENT_ID in .env.";
+        if (!gcal.isAuthorized(self.cfg.io, self.cfg.gpa, calendar)) return " The calendar isn't connected yet, though -- say \"connect my calendar\".";
+        return "";
     }
 
     // ---- mailbox ----

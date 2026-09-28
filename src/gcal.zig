@@ -95,6 +95,12 @@ pub const Listed = struct {
     /// Minutes since local midnight; null for an all-day entry.
     start_minutes: ?i16,
     end_minutes: ?i16,
+    /// Where to join, if this entry has a video link; see `meetingLink`.
+    /// Empty when it has none.
+    link: []const u8 = "",
+    /// The entry's description as plain text -- Google allows HTML in it --
+    /// which is where an agenda lives when there is one. Empty when unset.
+    description: []const u8 = "",
 };
 
 /// The offset in force at a local wall-clock time, from libc. See shim.c.
@@ -414,11 +420,28 @@ const ListedMoment = struct {
     date: ?[]const u8 = null,
 };
 
+// https://developers.google.com/workspace/calendar/api/v3/reference/events
+// "hangoutLink: An absolute link to the Google Hangout associated with this
+// event. Read-only." "description: Description of the event. Can contain
+// HTML." A conference has "zero or one video entry point", whose uri has an
+// http: or https: scheme; phone and sip entry points are not links.
+const EntryPoint = struct {
+    entryPointType: ?[]const u8 = null,
+    uri: ?[]const u8 = null,
+};
+
+const ConferenceData = struct {
+    entryPoints: []const EntryPoint = &.{},
+};
+
 const ListedItem = struct {
     id: ?[]const u8 = null,
     status: ?[]const u8 = null,
     summary: ?[]const u8 = null,
     location: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    hangoutLink: ?[]const u8 = null,
+    conferenceData: ?ConferenceData = null,
     start: ListedMoment = .{},
     end: ListedMoment = .{},
 };
@@ -436,6 +459,166 @@ fn minutesOf(date_time: []const u8) ?i16 {
     const minutes = std.fmt.parseInt(i16, date_time[14..16], 10) catch return null;
     if (hours > 23 or minutes > 59) return null;
     return hours * 60 + minutes;
+}
+
+/// Hosts whose links are, in practice, always a place to join a call. A
+/// description is full of links -- documents, tickets, unsubscribe pages --
+/// so only one of these counts as a meeting link there. The location field
+/// is different: a link put where the *place* goes is the place.
+const MEETING_HOSTS = [_][]const u8{
+    "meet.google.com",
+    "zoom.us",
+    "teams.microsoft.com",
+    "teams.live.com",
+    "webex.com",
+    "whereby.com",
+    "meet.jit.si",
+    "gotomeeting.com",
+    "gotomeet.me",
+    "bluejeans.com",
+};
+
+/// The link to join this entry's call, or empty when it has none.
+///
+/// In order of how reliable each source is: Google's own Meet link, then
+/// the video entry point of an add-on conference (Zoom, Teams and the like
+/// register there), then a link in the location, then a link to a known
+/// meeting host in the description. Never anything else in the description:
+/// "has a meeting link" is what decides whether the owner gets a reminder,
+/// and a link to the agenda document is not a reason to be reminded.
+fn meetingLink(item: ListedItem) []const u8 {
+    if (item.hangoutLink) |link| {
+        if (isHttp(link)) return link;
+    }
+    if (item.conferenceData) |conference| {
+        for (conference.entryPoints) |point| {
+            const kind = point.entryPointType orelse continue;
+            if (!std.mem.eql(u8, kind, "video")) continue;
+            const uri = point.uri orelse continue;
+            if (isHttp(uri)) return uri;
+        }
+    }
+    if (item.location) |location| {
+        if (firstLink(location, false)) |link| return link;
+    }
+    if (item.description) |description| {
+        if (firstLink(description, true)) |link| return link;
+    }
+    return "";
+}
+
+fn isHttp(text: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(text, "https://") or std.ascii.startsWithIgnoreCase(text, "http://");
+}
+
+/// The first http(s) link in `text`, ending at whitespace or at anything
+/// that closes an HTML attribute or a sentence. With `known_only`, only a
+/// link to one of MEETING_HOSTS qualifies and the rest are skipped.
+pub fn firstLink(text: []const u8, known_only: bool) ?[]const u8 {
+    var from: usize = 0;
+    while (from < text.len) {
+        const at = std.ascii.indexOfIgnoreCasePos(text, from, "http") orelse return null;
+        const rest = text[at..];
+        if (!isHttp(rest)) {
+            from = at + 4;
+            continue;
+        }
+        var end: usize = 0;
+        while (end < rest.len) : (end += 1) {
+            const c = rest[end];
+            if (std.ascii.isWhitespace(c) or c == '"' or c == '\'' or c == '<' or c == '>' or c == ')' or c == ']') break;
+        }
+        // A link at the end of a sentence carries the full stop with it.
+        while (end > 0 and (rest[end - 1] == '.' or rest[end - 1] == ',' or rest[end - 1] == ';')) end -= 1;
+        const link = rest[0..end];
+        if (!known_only or isMeetingHost(link)) return link;
+        from = at + end;
+    }
+    return null;
+}
+
+fn isMeetingHost(link: []const u8) bool {
+    const after_scheme = (std.mem.indexOf(u8, link, "://") orelse return false) + 3;
+    var host_end = after_scheme;
+    while (host_end < link.len and link[host_end] != '/' and link[host_end] != ':' and link[host_end] != '?') host_end += 1;
+    const host = link[after_scheme..host_end];
+    for (MEETING_HOSTS) |known| {
+        if (std.ascii.eqlIgnoreCase(host, known)) return true;
+        if (host.len > known.len and host[host.len - known.len - 1] == '.' and
+            std.ascii.eqlIgnoreCase(host[host.len - known.len ..], known)) return true;
+    }
+    return false;
+}
+
+/// A description as text: tags dropped, the ones that break a line kept as
+/// a newline, the common entities decoded, runs of blank lines folded. Good
+/// enough for a summary to read; nothing here is shown verbatim except in
+/// the journal.
+pub fn plainText(arena: std.mem.Allocator, html: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, html, '<') == null and std.mem.indexOfScalar(u8, html, '&') == null) {
+        return std.mem.trim(u8, html, " \t\r\n");
+    }
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var i: usize = 0;
+    while (i < html.len) {
+        const c = html[i];
+        if (c == '<') {
+            const close = std.mem.indexOfScalarPos(u8, html, i, '>') orelse break;
+            const tag = html[i + 1 .. close];
+            var name_end: usize = 0;
+            while (name_end < tag.len and (std.ascii.isAlphanumeric(tag[name_end]) or tag[name_end] == '/')) name_end += 1;
+            const name = tag[0..name_end];
+            if (std.ascii.eqlIgnoreCase(name, "br") or std.ascii.eqlIgnoreCase(name, "br/") or
+                std.ascii.eqlIgnoreCase(name, "/p") or std.ascii.eqlIgnoreCase(name, "/div") or
+                std.ascii.eqlIgnoreCase(name, "/li") or std.ascii.eqlIgnoreCase(name, "/tr") or
+                std.ascii.eqlIgnoreCase(name, "/h1") or std.ascii.eqlIgnoreCase(name, "/h2") or
+                std.ascii.eqlIgnoreCase(name, "/h3"))
+            {
+                try out.writer.writeByte('\n');
+            } else if (std.ascii.eqlIgnoreCase(name, "li")) {
+                try out.writer.writeAll("- ");
+            }
+            i = close + 1;
+            continue;
+        }
+        if (c == '&') {
+            const entities = [_]struct { name: []const u8, text: []const u8 }{
+                .{ .name = "&amp;", .text = "&" },   .{ .name = "&lt;", .text = "<" },
+                .{ .name = "&gt;", .text = ">" },    .{ .name = "&quot;", .text = "\"" },
+                .{ .name = "&#39;", .text = "'" },   .{ .name = "&apos;", .text = "'" },
+                .{ .name = "&nbsp;", .text = " " },  .{ .name = "&#160;", .text = " " },
+            };
+            var matched = false;
+            for (entities) |entity| {
+                if (std.mem.startsWith(u8, html[i..], entity.name)) {
+                    try out.writer.writeAll(entity.text);
+                    i += entity.name.len;
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) continue;
+        }
+        try out.writer.writeByte(c);
+        i += 1;
+    }
+    // Fold the blank-line padding that HTML descriptions carry.
+    var folded: std.Io.Writer.Allocating = .init(arena);
+    var blank_run: usize = 0;
+    var wrote_any = false;
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) {
+            blank_run += 1;
+            continue;
+        }
+        if (wrote_any) try folded.writer.writeAll(if (blank_run > 0) "\n\n" else "\n");
+        blank_run = 0;
+        try folded.writer.writeAll(line);
+        wrote_any = true;
+    }
+    return folded.written();
 }
 
 /// Turns the response body into entries. Split from the request so the
@@ -456,6 +639,8 @@ pub fn parseListing(arena: std.mem.Allocator, body: []const u8, day_text: []cons
             .location = item.location orelse "",
             .start_minutes = null,
             .end_minutes = null,
+            .link = meetingLink(item),
+            .description = try plainText(arena, item.description orelse ""),
         };
         if (item.start.dateTime) |start| {
             entry.start_minutes = minutesOf(start);
@@ -996,6 +1181,40 @@ test "a day's listing is read from the shape Google sends" {
     try std.testing.expectEqualStrings("(no title)", entries[3].title);
     try std.testing.expectEqual(@as(?i16, 15 * 60), entries[3].start_minutes);
     try std.testing.expectEqual(@as(?i16, 24 * 60), entries[3].end_minutes);
+}
+
+test "the meeting link comes from Meet, a conference entry point, the location or a known host" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        \\{"items":[
+        \\ {"id":"a","summary":"Standup","hangoutLink":"https://meet.google.com/abc-defg-hij","description":"<p>Agenda:</p><ul><li>numbers &amp; plans</li><li>hiring</li></ul>","start":{"dateTime":"2026-10-01T09:00:00+02:00"},"end":{"dateTime":"2026-10-01T09:15:00+02:00"}},
+        \\ {"id":"b","summary":"Zoom call","conferenceData":{"entryPoints":[{"entryPointType":"phone","uri":"tel:+34123"},{"entryPointType":"video","uri":"https://us02web.zoom.us/j/123?pwd=x"}]},"start":{"dateTime":"2026-10-01T10:00:00+02:00"},"end":{"dateTime":"2026-10-01T11:00:00+02:00"}},
+        \\ {"id":"c","summary":"Teams","location":"https://teams.microsoft.com/l/meetup-join/xyz","start":{"dateTime":"2026-10-01T12:00:00+02:00"},"end":{"dateTime":"2026-10-01T13:00:00+02:00"}},
+        \\ {"id":"d","summary":"Review","description":"Doc: https://docs.google.com/document/d/1 and join at <a href=\"https://acme.zoom.us/j/999\">Zoom</a>.","start":{"dateTime":"2026-10-01T14:00:00+02:00"},"end":{"dateTime":"2026-10-01T15:00:00+02:00"}},
+        \\ {"id":"e","summary":"Dentist","location":"Calle Mayor 1","description":"Bring the x-rays https://example.com/portal","start":{"dateTime":"2026-10-01T16:00:00+02:00"},"end":{"dateTime":"2026-10-01T17:00:00+02:00"}}
+        \\]}
+    ;
+    const entries = try parseListing(arena, body, "2026-10-01");
+    try std.testing.expectEqual(@as(usize, 5), entries.len);
+    try std.testing.expectEqualStrings("https://meet.google.com/abc-defg-hij", entries[0].link);
+    try std.testing.expectEqualStrings("Agenda:\n- numbers & plans\n- hiring", entries[0].description);
+    try std.testing.expectEqualStrings("https://us02web.zoom.us/j/123?pwd=x", entries[1].link);
+    try std.testing.expectEqualStrings("https://teams.microsoft.com/l/meetup-join/xyz", entries[2].link);
+    try std.testing.expectEqualStrings("https://acme.zoom.us/j/999", entries[3].link);
+    // A portal link in the description is not a meeting.
+    try std.testing.expectEqualStrings("", entries[4].link);
+    try std.testing.expectEqualStrings("Bring the x-rays https://example.com/portal", entries[4].description);
+}
+
+test "a link is cut at what ends it, and a lookalike host is not a meeting host" {
+    try std.testing.expectEqualStrings("https://meet.google.com/x", firstLink("Join https://meet.google.com/x.", false).?);
+    try std.testing.expectEqualStrings("https://zoom.us/j/1", firstLink("(https://zoom.us/j/1)", false).?);
+    try std.testing.expect(firstLink("https://zoom.us.example.com/j/1", true) == null);
+    try std.testing.expect(firstLink("httpsomething http://", true) == null);
+    try std.testing.expect(firstLink("no links here", false) == null);
 }
 
 test "a day boundary carries the offset libc says applies on that day" {

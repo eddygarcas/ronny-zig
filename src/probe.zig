@@ -18,6 +18,9 @@ const speech = @import("speech.zig");
 const settings = @import("settings.zig");
 const telegram = @import("telegram.zig");
 const gcal = @import("gcal.zig");
+const reminders = @import("reminders.zig");
+
+extern fn ronny_local_minutes() c_int;
 const appointment = @import("appointment.zig");
 const dates = @import("dates.zig");
 
@@ -158,6 +161,10 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "delete the dentist on thursday", .want = .remove_event },
                 .{ .text = "take the meeting with Dana off my calendar", .want = .remove_event },
                 .{ .text = "borra la cita de mañana", .want = .remove_event },
+                .{ .text = "remind me 15 minutes before meetings", .want = .change_setting },
+                .{ .text = "turn off meeting reminders", .want = .change_setting },
+                .{ .text = "avísame 5 minutos antes de las reuniones", .want = .change_setting },
+                .{ .text = "do you remind me before meetings?", .want = .show_settings },
                 .{ .text = "connect my calendar", .want = .connect_calendar },
                 .{ .text = "log in to google calendar", .want = .connect_calendar },
                 .{ .text = "link my calendar to ronny", .want = .connect_calendar },
@@ -226,10 +233,26 @@ pub fn main(init: std.process.Init) !void {
             const entries = try gcal.list(init.io, arena, calendar, today.year, today.month, today.day);
             std.debug.print("  today: {d} entr{s}\n", .{ entries.len, if (entries.len == 1) "y" else "ies" });
             for (entries) |entry| {
-                std.debug.print("    {s}  {s}\n", .{
+                std.debug.print("    {s}  {s}{s}{s}{s}\n", .{
                     if (entry.start_minutes) |s| try appointment.clockRange(arena, s, entry.end_minutes) else "all day    ",
                     entry.title,
+                    if (entry.link.len > 0) "  join: " else "",
+                    entry.link,
+                    if (entry.description.len > 0) "  (has a description)" else "",
                 });
+            }
+            // What the reminder check would make of today, with a lead wide
+            // enough to show the next one whatever the time.
+            var watched: std.ArrayList(reminders.Entry) = .empty;
+            try reminders.collect(arena, &watched, entries, 0, &.{});
+            std.debug.print("  {d} of them would get a meeting reminder\n", .{watched.items.len});
+            const local_now: i32 = @intCast(@max(0, ronny_local_minutes()));
+            if (reminders.due(watched.items, local_now, 24 * 60)) |next| {
+                std.debug.print("  next: {s}\n", .{try reminders.text(arena, next.*, local_now)});
+                if (env.get("PROBE_AGENDA") != null) {
+                    const agenda = summarize.forAgenda(init.io, arena, env.get("OLLAMA_URL") orelse "http://127.0.0.1:11434", env.get("OLLAMA_MODEL") orelse "qwen2.5", .en, next.title, next.description);
+                    std.debug.print("  agenda: {s}\n", .{agenda orelse "(none)"});
+                }
             }
         } else |err| {
             std.debug.print("  login FAILED ({s}); say \"connect my calendar\" to the bot\n", .{@errorName(err)});

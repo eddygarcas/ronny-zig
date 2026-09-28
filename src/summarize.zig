@@ -130,6 +130,47 @@ pub fn forNotification(
     };
 }
 
+/// The agenda of a calendar entry, for the reminder that goes before it:
+/// a summary of the description when there is one worth summarising, the
+/// description itself when it is short, nothing when it is empty.
+///
+/// Null rather than an error, like `forNotification`: the reminder is what
+/// matters, and it goes with or without the agenda. Runs on local Ollama;
+/// a description is the owner's calendar, not something to send out.
+///
+/// Caller frees a non-null result.
+pub fn forAgenda(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ollama_url: []const u8,
+    model: []const u8,
+    language: settings.Language,
+    title: []const u8,
+    description: []const u8,
+) ?[]u8 {
+    const trimmed = std.mem.trim(u8, description, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    if (trimmed.len <= SHORT_BODY_CHARS) {
+        return tidy(gpa, trimmed) catch null;
+    }
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prompt = std.fmt.allocPrint(arena,
+        \\Below is the description of a calendar entry titled "{s}". Summarize its agenda in at most 3 short sentences, written in {s}: what the meeting is for and anything the reader should prepare or decide. Ignore joining instructions, links, dial-in numbers and boilerplate. Plain text only, no preamble, no markdown.
+        \\
+        \\{s}
+    , .{ title, language.name(), trimmed[0..@min(trimmed.len, 4000)] }) catch return null;
+
+    return generate(io, gpa, ollama_url, model, prompt) catch |err| {
+        log.warn("no agenda summary for {s}: {s}", .{ title, @errorName(err) });
+        return null;
+    };
+}
+
 pub const Draft = struct {
     subject: []const u8,
     body: []const u8,
