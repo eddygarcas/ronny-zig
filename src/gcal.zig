@@ -85,8 +85,11 @@ pub const Created = struct {
     html_link: []const u8,
 };
 
-/// One entry on a day, as shown to the owner.
+/// One entry on a day, as shown to the owner. The id is what a removal
+/// names, and it only ever comes from here -- a listing Google returned --
+/// never from anything a model produced.
 pub const Listed = struct {
+    id: []const u8,
     title: []const u8,
     location: []const u8,
     /// Minutes since local midnight; null for an all-day entry.
@@ -321,6 +324,10 @@ fn nextDate(arena: std.mem.Allocator, event: Event) ![]const u8 {
 /// The request body, split out so the shape that Google actually receives
 /// is reachable from a test.
 pub fn eventJson(arena: std.mem.Allocator, timezone: []const u8, event: Event) ![]const u8 {
+    // Google reads `"timeZone":""` as no time zone and refuses the event.
+    // main.zig never passes an empty one, but this is the one place the
+    // rule is actually enforced.
+    if (timezone.len == 0 and event.start_minutes != null) return error.MissingTimezone;
     var body: EventBody = .{
         .summary = event.title,
         .location = if (event.location.len > 0) event.location else null,
@@ -358,7 +365,13 @@ pub fn insert(io: std.Io, arena: std.mem.Allocator, cfg: Config, event: Event) E
     encodeComponent(&url.writer, cfg.calendar_id) catch return Error.OutOfMemory;
     url.writer.writeAll("/events") catch return Error.OutOfMemory;
 
-    const body = eventJson(arena, cfg.timezone, event) catch return Error.OutOfMemory;
+    const body = eventJson(arena, cfg.timezone, event) catch |err| {
+        if (err == error.MissingTimezone) {
+            log.err("no time zone configured; set CALENDAR_TIMEZONE or fix /etc/localtime", .{});
+            return Error.RequestFailed;
+        }
+        return Error.OutOfMemory;
+    };
     const auth = std.fmt.allocPrint(arena, "Bearer {s}", .{token}) catch return Error.OutOfMemory;
 
     var response = http.postJson(io, arena, url.written(), body, &.{
@@ -402,6 +415,7 @@ const ListedMoment = struct {
 };
 
 const ListedItem = struct {
+    id: ?[]const u8 = null,
     status: ?[]const u8 = null,
     summary: ?[]const u8 = null,
     location: ?[]const u8 = null,
@@ -437,6 +451,7 @@ pub fn parseListing(arena: std.mem.Allocator, body: []const u8, day_text: []cons
             if (std.mem.eql(u8, status, "cancelled")) continue;
         }
         var entry: Listed = .{
+            .id = item.id orelse "",
             .title = item.summary orelse "(no title)",
             .location = item.location orelse "",
             .start_minutes = null,
@@ -496,6 +511,32 @@ pub fn list(io: std.Io, arena: std.mem.Allocator, cfg: Config, year: u16, month:
         return Error.RequestFailed;
     }
     return parseListing(arena, response.body, day_text) catch Error.BadResponse;
+}
+
+/// Deletes one entry by the id a listing gave it.
+/// https://developers.google.com/workspace/calendar/api/v3/reference/events/delete
+pub fn remove(io: std.Io, arena: std.mem.Allocator, cfg: Config, event_id: []const u8) Error!void {
+    if (event_id.len == 0) return Error.BadResponse;
+    const token = try accessToken(io, arena, cfg);
+
+    var url: std.Io.Writer.Allocating = .init(arena);
+    url.writer.print("{s}/", .{EVENTS_ENDPOINT}) catch return Error.OutOfMemory;
+    encodeComponent(&url.writer, cfg.calendar_id) catch return Error.OutOfMemory;
+    url.writer.writeAll("/events/") catch return Error.OutOfMemory;
+    encodeComponent(&url.writer, event_id) catch return Error.OutOfMemory;
+
+    const auth = std.fmt.allocPrint(arena, "Bearer {s}", .{token}) catch return Error.OutOfMemory;
+    var response = http.delete(io, arena, url.written(), &.{
+        .{ .name = "Authorization", .value = auth },
+    }) catch return Error.RequestFailed;
+    defer response.deinit(arena);
+
+    if (!response.ok()) {
+        log.warn("events.delete returned {d}: {s}", .{
+            @intFromEnum(response.status), response.body[0..@min(response.body.len, 300)],
+        });
+        return Error.RequestFailed;
+    }
 }
 
 // ---- the one-time login ----
@@ -728,11 +769,15 @@ pub fn authorize(io: std.Io, gpa: std.mem.Allocator, cfg: Config, mode: AuthMode
 }
 
 /// Whether a chat message is the owner pasting the login back: the address
-/// the browser landed on, its query string, or the bare code.
+/// the browser landed on, its query string, or the bare code. A refusal is
+/// a paste too -- Google's error page, not the redirect -- and has to be
+/// caught here or it goes to the classifier as a very long unknown.
 pub fn looksLikeLogin(text: []const u8) bool {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (std.mem.indexOf(u8, trimmed, "code=") != null) return true;
     if (std.mem.indexOf(u8, trimmed, "error=") != null) return true;
+    if (std.mem.indexOf(u8, trimmed, "authError=") != null) return true;
+    if (std.mem.indexOf(u8, trimmed, "accounts.google.com/") != null) return true;
     if (std.mem.startsWith(u8, trimmed, "http://127.0.0.1") or std.mem.startsWith(u8, trimmed, "http://localhost")) return true;
     // A bare code, as Google issues them.
     if (std.mem.startsWith(u8, trimmed, "4/") and std.mem.indexOfScalar(u8, trimmed, ' ') == null) return true;
@@ -772,6 +817,91 @@ test "the code is found in a full redirect URL, a query string, or bare" {
     try std.testing.expectEqual(@as(?[]const u8, null), try codeFrom(arena, ""));
 }
 
+fn readVarint(bytes: []const u8, i: *usize) ?usize {
+    var value: usize = 0;
+    var shift: u6 = 0;
+    while (i.* < bytes.len) {
+        const byte = bytes[i.*];
+        i.* += 1;
+        value |= @as(usize, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return value;
+        if (shift >= 56) return null;
+        shift += 7;
+    }
+    return null;
+}
+
+/// Why Google refused, when the owner pasted its error page instead of the
+/// redirect. Null when the paste is not a refusal.
+///
+/// The page is accounts.google.com/signin/oauth/error?authError=<base64>,
+/// and the payload is a protobuf whose first two fields are the error code
+/// and the sentence shown to the user -- read from a real refusal, not from
+/// any documentation, so it is parsed leniently and anything unreadable
+/// falls back to the bare code.
+pub fn refusalFrom(arena: std.mem.Allocator, pasted: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, pasted, " \t\r\n");
+
+    if (std.mem.indexOf(u8, trimmed, "authError=")) |at| {
+        var value = trimmed[at + "authError=".len ..];
+        if (std.mem.indexOfAny(u8, value, "&# ")) |stop| value = value[0..stop];
+        value = std.mem.trimEnd(u8, value, "=");
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const size = decoder.calcSizeForSlice(value) catch return "access_denied";
+        const bytes = try arena.alloc(u8, size);
+        decoder.decode(bytes, value) catch return "access_denied";
+
+        var code: []const u8 = "";
+        var message: []const u8 = "";
+        var i: usize = 0;
+        while (i < bytes.len) {
+            const tag = bytes[i];
+            i += 1;
+            if (tag & 7 != 2) break; // only length-delimited fields are read
+            const len = readVarint(bytes, &i) orelse break;
+            if (i + len > bytes.len) break;
+            const field = bytes[i .. i + len];
+            i += len;
+            switch (tag >> 3) {
+                1 => code = field,
+                2 => message = field,
+                else => break,
+            }
+        }
+        if (code.len == 0) return "access_denied";
+        if (message.len == 0) return code;
+        return try std.fmt.allocPrint(arena, "{s}: {s}", .{ code, message });
+    }
+
+    // The redirect itself can carry a refusal: ?error=access_denied.
+    const query = if (std.mem.indexOfScalar(u8, trimmed, '?')) |q| trimmed[q + 1 ..] else trimmed;
+    if (try queryValue(arena, query, "error")) |problem| return problem;
+    return null;
+}
+
+test "a refusal page is decoded into Google's own words" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The payload a real refusal carried (identifiers replaced), cut after
+    // the message: the fields that follow are not read.
+    const page = "https://accounts.google.com/signin/oauth/error?authError=Cg1hY2Nlc3NfZGVuaWVkElNUaGUgZGV2ZWxvcGVyIGhhc27igJl0IGdpdmVuIHlvdSBhY2Nlc3MgdG8gdGhpcyBhcHAuIEl04oCZcyBjdXJyZW50bHkgYmVpbmcgdGVzdGVkLg";
+    const reason = (try refusalFrom(arena, page)).?;
+    try std.testing.expectEqualStrings(
+        "access_denied: The developer hasn\u{2019}t given you access to this app. It\u{2019}s currently being tested.",
+        reason,
+    );
+    try std.testing.expect(looksLikeLogin(page));
+
+    // A refusal on the redirect itself.
+    try std.testing.expectEqualStrings("access_denied", (try refusalFrom(arena, "http://127.0.0.1:8765/?error=access_denied")).?);
+    // A good paste is not a refusal.
+    try std.testing.expectEqual(@as(?[]const u8, null), try refusalFrom(arena, "http://127.0.0.1:8765/?code=4%2Fabc&scope=x"));
+    // Garbage after authError= still names the code rather than crashing.
+    try std.testing.expectEqualStrings("access_denied", (try refusalFrom(arena, "?authError=!!!")).?);
+}
+
 test "a pasted login is told apart from an ordinary message" {
     try std.testing.expect(looksLikeLogin("http://127.0.0.1:8765/?code=4%2Fabc&scope=x"));
     try std.testing.expect(looksLikeLogin("127.0.0.1:8765/?code=4%2Fabc"));
@@ -792,6 +922,16 @@ test "an event body carries the local clock time with its zone, or a date for al
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // The failure seen live: an empty zone must not reach Google.
+    try std.testing.expectError(error.MissingTimezone, eventJson(arena, "", .{
+        .title = "Free time",
+        .year = 2026,
+        .month = 9,
+        .day = 28,
+        .start_minutes = 16 * 60,
+        .end_minutes = 17 * 60,
+    }));
 
     const timed = try eventJson(arena, "Europe/Madrid", .{
         .title = "Dentist",
@@ -829,7 +969,7 @@ test "a day's listing is read from the shape Google sends" {
 
     const body =
         \\{"kind":"calendar#events","items":[
-        \\ {"status":"confirmed","summary":"Sam's birthday","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"}},
+        \\ {"id":"abc123","status":"confirmed","summary":"Sam's birthday","start":{"date":"2026-10-01"},"end":{"date":"2026-10-02"}},
         \\ {"status":"confirmed","summary":"Reunión con Vicente","location":"Calle Mayor 1","start":{"dateTime":"2026-10-01T10:00:00+02:00","timeZone":"Europe/Madrid"},"end":{"dateTime":"2026-10-01T11:00:00+02:00"}},
         \\ {"status":"cancelled","summary":"Gone","start":{"dateTime":"2026-10-01T12:00:00+02:00"},"end":{"dateTime":"2026-10-01T13:00:00+02:00"}},
         \\ {"status":"confirmed","summary":"Offsite","start":{"dateTime":"2026-09-30T18:00:00+02:00"},"end":{"dateTime":"2026-10-01T12:30:00+02:00"}},
@@ -840,6 +980,7 @@ test "a day's listing is read from the shape Google sends" {
     try std.testing.expectEqual(@as(usize, 4), entries.len);
 
     try std.testing.expectEqualStrings("Sam's birthday", entries[0].title);
+    try std.testing.expectEqualStrings("abc123", entries[0].id);
     try std.testing.expectEqual(@as(?i16, null), entries[0].start_minutes);
 
     try std.testing.expectEqualStrings("Reunión con Vicente", entries[1].title);

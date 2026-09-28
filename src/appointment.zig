@@ -748,6 +748,120 @@ pub fn details(
     return out;
 }
 
+// ---- picking one entry out of a day ----
+
+/// What a removal can be matched against: the day's real entries.
+pub const Candidate = struct {
+    title: []const u8,
+    start: ?i16,
+};
+
+const ORDINALS = [_][]const u8{ "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth" };
+const ORDINALS_ES = [_][]const u8{ "primera", "segunda", "tercera", "cuarta", "quinta", "sexta", "séptima", "octava", "novena", "décima" };
+
+/// "2", "the second one", "number 2", "la segunda": an index into a list
+/// of `count`. Only for a short answer to "which one?", so a number inside
+/// a longer request is not taken as a pick.
+pub fn pickByNumber(text: []const u8, count: usize) ?usize {
+    var words: usize = 0;
+    var it = std.mem.tokenizeAny(u8, text, " \t,.!?");
+    while (it.next()) |_| words += 1;
+    if (words == 0 or words > 4) return null;
+
+    it = std.mem.tokenizeAny(u8, text, " \t,.!?");
+    while (it.next()) |word| {
+        if (std.fmt.parseInt(usize, word, 10)) |n| {
+            if (n >= 1 and n <= count) return n - 1;
+        } else |_| {}
+        for (ORDINALS, 0..) |name, i| {
+            if (std.ascii.eqlIgnoreCase(word, name) and i < count) return i;
+        }
+        for (ORDINALS_ES, 0..) |name, i| {
+            if (std.ascii.eqlIgnoreCase(word, name) and i < count) return i;
+        }
+    }
+    return null;
+}
+
+/// Which of the day's entries the owner means. Deterministic: a time named
+/// in the request narrows to entries starting then; the words of an entry's
+/// title found in the request score it; a single clear winner is picked.
+/// Null means ask -- guessing wrong here deletes the wrong appointment.
+pub fn pick(arena: std.mem.Allocator, candidates: []const Candidate, text: []const u8, start: ?i16) !?usize {
+    if (candidates.len == 0) return null;
+
+    const haystack = try squash(arena, text);
+    var best: ?usize = null;
+    var best_score: usize = 0;
+    var tied = false;
+    var at_time: usize = 0;
+    var last_at_time: usize = 0;
+
+    for (candidates, 0..) |candidate, i| {
+        const matches_time = start != null and candidate.start != null and candidate.start.? == start.?;
+        if (matches_time) {
+            at_time += 1;
+            last_at_time = i;
+        }
+        // Words of the title present in the request.
+        var score: usize = 0;
+        var words = std.mem.tokenizeAny(u8, candidate.title, " \t,.:;-()'\"");
+        while (words.next()) |word| {
+            const needle = try squash(arena, word);
+            if (needle.len < 3) continue;
+            if (std.mem.indexOf(u8, haystack, needle) != null) score += 1;
+        }
+        // A time match on its own outranks nothing; with words it settles
+        // a tie between two entries sharing a word.
+        if (matches_time and score > 0) score += 10;
+        if (score > best_score) {
+            best = i;
+            best_score = score;
+            tied = false;
+        } else if (score == best_score and score > 0) {
+            tied = true;
+        }
+    }
+    if (best != null and !tied) return best;
+    // No words matched, but exactly one entry sits at the named time.
+    if (best_score == 0 and at_time == 1) return last_at_time;
+    // One entry on the day and nothing said against it.
+    if (best_score == 0 and start == null and candidates.len == 1) return 0;
+    return null;
+}
+
+test "an entry is picked by its words, its time, or by being the only one" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const day = [_]Candidate{
+        .{ .title = "Sam's birthday", .start = null },
+        .{ .title = "Free time", .start = 16 * 60 },
+        .{ .title = "Meeting with Dana", .start = 10 * 60 },
+        .{ .title = "Meeting with Sam", .start = 12 * 60 },
+    };
+    // The request that was refused live.
+    try std.testing.expectEqual(@as(?usize, 1), try pick(arena, &day, "Remove today's appointment from 4pm to 5pm, that says free time.", 16 * 60));
+    // Time alone, nothing else said.
+    try std.testing.expectEqual(@as(?usize, 2), try pick(arena, &day, "delete the one at 10", 10 * 60));
+    // Shared word, settled by the time.
+    try std.testing.expectEqual(@as(?usize, 3), try pick(arena, &day, "remove the meeting at 12", 12 * 60));
+    // Shared word, no time: ambiguous, so ask.
+    try std.testing.expectEqual(@as(?usize, null), try pick(arena, &day, "remove the meeting today", null));
+    // Nothing matches: ask.
+    try std.testing.expectEqual(@as(?usize, null), try pick(arena, &day, "remove the dentist", null));
+    // A day with one entry and no clue at all.
+    const one = [_]Candidate{.{ .title = "Dentist", .start = 9 * 60 }};
+    try std.testing.expectEqual(@as(?usize, 0), try pick(arena, &one, "remove tomorrow's appointment", null));
+
+    try std.testing.expectEqual(@as(?usize, 1), pickByNumber("2", 4));
+    try std.testing.expectEqual(@as(?usize, 1), pickByNumber("the second one", 4));
+    try std.testing.expectEqual(@as(?usize, 2), pickByNumber("la tercera", 4));
+    try std.testing.expectEqual(@as(?usize, null), pickByNumber("7", 4));
+    try std.testing.expectEqual(@as(?usize, null), pickByNumber("remove the one at 2 in the afternoon please", 4));
+}
+
 // ---- showing it back ----
 
 const DAY_NAMES = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };

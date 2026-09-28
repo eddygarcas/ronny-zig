@@ -68,8 +68,14 @@ const Config = struct {
     settings: *settings.Store,
 };
 
+/// An empty value counts as unset. `.env.example` lists every key, and a
+/// copied `CALENDAR_TIMEZONE=` with nothing after it reached Google as
+/// `"timeZone":""`, which it refused as missing -- three times, on a real
+/// appointment. Nothing in Ronny means anything by an empty setting, so
+/// treating it as absent is always the right reading.
 fn envOptional(init: std.process.Init, name: []const u8) !?[:0]u8 {
     const value = init.environ_map.get(name) orelse return null;
+    if (value.len == 0) return null;
     return try init.arena.allocator().dupeZ(u8, value);
 }
 

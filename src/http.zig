@@ -60,6 +60,17 @@ pub fn get(io: std.Io, gpa: std.mem.Allocator, url: []const u8) !Response {
     return send(io, gpa, .GET, url, null, "", &.{});
 }
 
+/// DELETE with headers. Google answers a successful delete with an empty
+/// 204, so the body is usually nothing.
+pub fn delete(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+) !Response {
+    return send(io, gpa, .DELETE, url, null, "", extra_headers);
+}
+
 pub fn getWithHeaders(
     io: std.Io,
     gpa: std.mem.Allocator,

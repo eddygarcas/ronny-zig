@@ -367,6 +367,7 @@ Two rules apply to voice when writing mail:
 | "yes" | — | adds it to your Google Calendar and sends you the link |
 | "no" | — | drops it |
 | "what's on my calendar tomorrow?" | `/agenda tomorrow` | lists that day's entries, in start order; no day means today |
+| "remove today's appointment at 4pm" | `/delete the dentist on thursday` | picks the entry from that day's real list, shows it, and removes it on a typed yes |
 
 ```
 you › apunta una reunión con Vicente el jueves a las 10
@@ -398,8 +399,16 @@ reply gate can send mail.
 
 Listing a day reads the same day grammar for *which* day and nothing else:
 "what do I have on thursday", "agenda for today", "qué tengo mañana". The
-entries come straight from Google to the chat; no model sees them. Changing
-or deleting an entry is out of scope.
+entries come straight from Google to the chat; no model sees them.
+
+Removing works the same way round: the day is listed, the entry is picked
+from that list by the words and time in your request, and it is shown back
+before a typed yes deletes it. If the pick is not clear -- two meetings and
+you said "the meeting" -- Ronny numbers the day and asks. The id that gets
+deleted only ever comes from a listing Google returned. Say "remove" or
+"delete"; a short "cancel the dentist" reads as cancelling whatever Ronny is
+waiting on, the same as it always has. Moving or editing an entry is out of
+scope.
 
 ```
 you › what's on my calendar on thursday?
@@ -475,7 +484,7 @@ property, and a mistyped model URL would silently disable the spam gate.
 | — | `/start` | tells you your chat id, for first-time setup |
 
 Requests outside the list — forwarding mail to someone else, deleting or
-filing it, changing a calendar entry, contacts — are answered as out of scope. They are not
+filing it, moving a calendar entry, contacts — are answered as out of scope. They are not
 quietly turned into the closest available action.
 
 ## Voice on the GPU

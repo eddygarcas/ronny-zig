@@ -25,6 +25,12 @@ const VOCAB_ENTRY = 96;
 const VOCAB_MAX = 300;
 extern fn ronny_sender_vocabulary(session: *imap.c.mailimap, days: c_int, out: [*]u8, max_out: c_int) c_int;
 
+/// Same rule as main.zig's envOptional: an empty value is an unset one.
+fn setting(env: anytype, name: []const u8) ?[]const u8 {
+    const value = env.get(name) orelse return null;
+    return if (value.len == 0) null else value;
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const env = init.environ_map;
@@ -148,6 +154,10 @@ pub fn main(init: std.process.Init) !void {
                 .{ .text = "what do I have on 24 October?", .want = .list_events },
                 .{ .text = "qué tengo mañana en la agenda", .want = .list_events },
                 .{ .text = "move the dentist to friday", .want = .unknown },
+                .{ .text = "Remove today's appointment from 4pm to 5pm, that says free time.", .want = .remove_event },
+                .{ .text = "delete the dentist on thursday", .want = .remove_event },
+                .{ .text = "take the meeting with Dana off my calendar", .want = .remove_event },
+                .{ .text = "borra la cita de mañana", .want = .remove_event },
                 .{ .text = "connect my calendar", .want = .connect_calendar },
                 .{ .text = "log in to google calendar", .want = .connect_calendar },
                 .{ .text = "link my calendar to ronny", .want = .connect_calendar },
@@ -189,10 +199,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("=== calendar ===\n", .{});
         const calendar: gcal.Config = .{
             .client_id = client_id,
-            .client_secret = env.get("GOOGLE_CLIENT_SECRET") orelse "",
-            .token_path = env.get("GOOGLE_TOKEN_FILE") orelse "data/google_token.json",
-            .calendar_id = env.get("GOOGLE_CALENDAR_ID") orelse "primary",
-            .timezone = env.get("CALENDAR_TIMEZONE") orelse "Europe/Madrid",
+            .client_secret = setting(env, "GOOGLE_CLIENT_SECRET") orelse "",
+            .token_path = setting(env, "GOOGLE_TOKEN_FILE") orelse "data/google_token.json",
+            .calendar_id = setting(env, "GOOGLE_CALENDAR_ID") orelse "primary",
+            .timezone = setting(env, "CALENDAR_TIMEZONE") orelse "Europe/Madrid",
         };
         const today = dates.today();
         for ([_][]const u8{

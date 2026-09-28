@@ -47,6 +47,7 @@ pub const Action = enum {
     compose_mail,
     create_event,
     list_events,
+    remove_event,
     connect_calendar,
     list_attachments,
     get_attachment,
@@ -97,6 +98,9 @@ pub const Action = enum {
             .create_event,
             // The day is read from the owner's words by appointment.findDay.
             .list_events,
+            // Which entry is chosen by matching the owner's words against
+            // the day's real entries, in appointment.pick.
+            .remove_event,
             .connect_calendar,
             .help,
             .unknown,
@@ -151,6 +155,7 @@ const ACTION_CRITERIA =
     \\  "compose_mail": "Start a NEW email to someone, not a reply to anything. The recipient is named or described. Drafting only; it never sends. Examples: 'email dana about thursday', 'send sam the notes', 'write to support@acme.com asking for a refund'",
     \\  "create_event": "ADD an appointment, meeting or reminder to the owner's own CALENDAR. The request names something to do and, usually, a day or time. Not about email at all. Examples: 'add a meeting with Dana next thursday at 3pm to my calendar', 'dentist tomorrow at 10', 'put lunch with Sam on my calendar on Friday', 'schedule a call with the bank on 24 October at 11', 'apunta una reunión con Vicente el jueves a las 10'",
     \\  "list_events": "SHOW what is on the owner's CALENDAR for one day -- their appointments, meetings or agenda. The request asks to see, not to add. Examples: 'what's on my calendar tomorrow?', 'my appointments on thursday', 'agenda for today', 'what do I have on 24 October?', 'qué tengo mañana en la agenda'",
+    \\  "remove_event": "REMOVE or delete an appointment from the owner's own CALENDAR. The request names a day, a time or a title of the entry to remove. Not about email. Examples: 'remove today's appointment at 4pm', 'delete the dentist on thursday', 'take the meeting with Dana off my calendar', 'borra la cita de mañana'",
     \\  "connect_calendar": "CONNECT, log in to, link or set up the owner's Google Calendar so that appointments can be added. Not a request to add an appointment. Examples: 'connect my calendar', 'log in to google calendar', 'link my calendar', 'set up the calendar'",
     \\  "list_attachments": "Say what files are attached to the email just shown, without sending any of them. Examples: 'does that have attachments?', 'what is attached to it?', 'any files on that one?'",
     \\  "get_attachment": "Send the owner a file attached to the email just shown. Examples: 'send me the invoice', 'download the pdf', 'give me that attachment', 'forward me the spreadsheet from it'",
@@ -163,7 +168,7 @@ const ACTION_CRITERIA =
     \\  "show_settings": "Show the assistant's own configuration -- its quiet hours, how far back mail commands look by default, whether summaries arrive as text or voice, their language, and which voices are installed. Examples: 'what are your settings?', 'what are my quiet hours?', 'how far back do you search?', 'are summaries voice or text?', 'which voices do you have?'",
     \\  "change_setting": "Change one of the assistant's own settings: the hours during which it must not notify, the default number of days the mail commands look back, whether summaries arrive as text or as voice messages, the language summaries are in, or which installed voice reads them (chosen by name). The request is about the assistant's behaviour, NOT about which senders it watches (add_sender/remove_sender), NOT about stopping notifications altogether (pause), and NOT a request to summarize a particular email (summarize_mail). Examples: 'don't notify me before 8am', 'no notifications between 10pm and 7am', 'turn off quiet hours', 'look back 30 days by default', 'send summaries as voice messages', 'answer me by voice', 'back to text summaries', 'summaries in Spanish', 'use john's voice', 'switch to the ryan voice'",
     \\  "help": "List what the assistant itself can DO -- its actions, commands or capabilities. Note 'list of actions' and 'list of commands' are this, not the sender list. Examples: 'what can you do?', 'show me the list of actions', 'which commands do you have?', 'help'",
-    \\  "unknown": "None of the other options fit, or the request is something this assistant cannot do at all -- forwarding a message on to a third party, deleting or filing mail, changing or deleting a calendar entry (adding one is create_event, seeing a day is list_events), contacts, or anything unrelated to this mailbox."
+    \\  "unknown": "None of the other options fit, or the request is something this assistant cannot do at all -- forwarding a message on to a third party, deleting or filing mail, moving or editing a calendar entry (adding one is create_event, seeing a day is list_events, removing one is remove_event), contacts, or anything unrelated to this mailbox."
     \\}
 ;
 

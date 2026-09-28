@@ -62,6 +62,8 @@ pub const PENDING_EVENT_TTL_SECONDS = 600;
 /// A calendar login link is good for this long. Google's own code expires
 /// in minutes anyway; this only bounds how long a paste is looked for.
 pub const PENDING_LOGIN_TTL_SECONDS = 900;
+/// A removal waits for a typed yes for this long. Same as an addition.
+pub const PENDING_REMOVAL_TTL_SECONDS = 600;
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
@@ -93,6 +95,7 @@ pub const HELP_TEXT =
     \\/event <what, and when> - add an appointment to your calendar (shown first, added on a typed yes)
     \\/calendar - connect your Google Calendar: I send a link, you paste back where it lands
     \\/agenda [day] - what's on your calendar that day (today if you don't say)
+    \\/delete <which, and when> - remove an entry from your calendar (shown first, removed on a typed yes)
     \\/pause - stop notifications temporarily
     \\/resume - resume notifications
     \\/settings - show my settings (quiet hours, default look-back, summaries as text or voice)
@@ -258,6 +261,23 @@ const PendingLogin = struct {
     created_ns: i96,
 };
 
+/// A removal being chosen, then waiting for a typed yes.
+///
+/// The entries are the day's real listing from Google, copied here, so the
+/// id that gets deleted can only ever be one Google itself returned. The
+/// choice among them is made by word and time matching, never by a model,
+/// and an unclear choice asks rather than guesses: this is the one calendar
+/// action that destroys something.
+const PendingRemoval = struct {
+    arena: std.heap.ArenaAllocator,
+    day: dates.Day,
+    entries: []const gcal.Listed,
+    /// Null until one entry has been picked; the next message is tried as
+    /// a number or a name.
+    chosen: ?usize,
+    created_ns: i96,
+};
+
 const PendingEvent = struct {
     arena: std.heap.ArenaAllocator,
     title: []const u8,
@@ -294,6 +314,7 @@ pub const Bot = struct {
     pending_setting: ?PendingSetting = null,
     pending_event: ?PendingEvent = null,
     pending_login: ?PendingLogin = null,
+    pending_removal: ?PendingRemoval = null,
     /// Set by the login step so the pasted code is not kept in history.
     redact_next_record: bool = false,
     /// Side channel from a summarising action to the send in handleText.
@@ -331,6 +352,7 @@ pub const Bot = struct {
         if (self.staged) |*staged| staged.arena.deinit();
         if (self.composing) |*composing| composing.arena.deinit();
         if (self.pending_event) |*event| event.arena.deinit();
+        if (self.pending_removal) |*removal| removal.arena.deinit();
         if (self.vocabulary_arena) |*arena| arena.deinit();
         for (self.history.items) |turn| {
             self.cfg.gpa.free(turn.owner);
@@ -618,7 +640,13 @@ pub const Bot = struct {
     fn handleText(self: *Bot, arena: std.mem.Allocator, chat_id: []const u8, text: []const u8, spoken: bool) !void {
         if (!try self.ownerCheck(arena, chat_id, text)) return;
 
-        log.info("owner message: {s}", .{text});
+        // A pasted login carries a one-time code; the journal gets a note,
+        // not the code.
+        if (self.pending_login != null and gcal.looksLikeLogin(text)) {
+            log.info("owner message: (pasted the calendar login)", .{});
+        } else {
+            log.info("owner message: {s}", .{text});
+        }
         // Mailbox fetches and local summarisation take tens of seconds, during
         // which the bot looks dead. Say something first.
         self.client.sendTyping();
@@ -811,6 +839,10 @@ pub const Bot = struct {
         }
         if (std.mem.eql(u8, command, "/calendar")) return self.doConnectCalendar(arena);
         if (std.mem.eql(u8, command, "/agenda")) return self.doListEvents(arena, arg);
+        if (std.mem.eql(u8, command, "/delete")) {
+            if (arg.len == 0) return "Usage: /delete the dentist on thursday  (which entry, and when)";
+            return self.doRemoveEvent(arena, arg);
+        }
 
         const parsed = parseSearchArg(arg);
         if (std.mem.eql(u8, command, "/search")) {
@@ -880,6 +912,30 @@ pub const Bot = struct {
                 return "Dropped it. Nothing was added to your calendar.";
             } else if (try self.fillEventWhen(arena, text)) |reply| {
                 // The entry was missing its day, and this message named one.
+                return reply;
+            }
+        } else if (self.freshPendingRemoval()) |removal| {
+            if (removal.chosen != null) {
+                switch (answer) {
+                    .confirm => {
+                        if (spoken) {
+                            log.info("ignoring a spoken yes on a pending removal", .{});
+                            return "I don't act on a spoken yes for the calendar -- type yes to remove it, or no to keep it.";
+                        }
+                        log.info("owner confirmed the removal with: {s}", .{text});
+                        return self.doRemoveConfirmed(arena);
+                    },
+                    .cancel => {
+                        log.info("owner kept the entry with: {s}", .{text});
+                        self.discardPendingRemoval();
+                        return "Kept it. Nothing was removed.";
+                    },
+                    .unclear => {},
+                }
+            } else if (answer == .cancel) {
+                self.discardPendingRemoval();
+                return "Left your calendar as it is.";
+            } else if (try self.chooseRemoval(arena, text)) |reply| {
                 return reply;
             }
         } else if (self.freshPendingSetting()) |change| {
@@ -957,6 +1013,9 @@ pub const Bot = struct {
                 if (self.pending_event != null and self.pending_event.?.day != null) {
                     return "I'm not sure if that's a yes or a no, so I haven't added anything. Reply 'yes' to add it to your calendar, or 'no' to drop it.";
                 }
+                if (self.pending_removal != null and self.pending_removal.?.chosen != null) {
+                    return "I'm not sure if that's a yes or a no, so I haven't removed anything. Reply 'yes' to remove it, or 'no' to keep it.";
+                }
                 return understood.reply;
             },
             .help => HELP_TEXT,
@@ -1006,6 +1065,7 @@ pub const Bot = struct {
             .create_event => try self.doCreateEvent(arena, text),
             .connect_calendar => try self.doConnectCalendar(arena),
             .list_events => try self.doListEvents(arena, text),
+            .remove_event => try self.doRemoveEvent(arena, text),
         };
 
         if (std.mem.eql(u8, result, understood.reply)) return result;
@@ -2445,10 +2505,162 @@ pub const Bot = struct {
         return out.written();
     }
 
+    fn discardPendingRemoval(self: *Bot) void {
+        if (self.pending_removal) |*removal| removal.arena.deinit();
+        self.pending_removal = null;
+    }
+
+    fn freshPendingRemoval(self: *Bot) ?*PendingRemoval {
+        if (self.pending_removal == null) return null;
+        const removal = &self.pending_removal.?;
+        const age = @divTrunc(
+            std.Io.Clock.now(.boot, self.cfg.io).nanoseconds - removal.created_ns,
+            std.time.ns_per_s,
+        );
+        if (age > PENDING_REMOVAL_TTL_SECONDS) {
+            log.info("pending calendar removal expired", .{});
+            self.discardPendingRemoval();
+            return null;
+        }
+        return removal;
+    }
+
+    /// Lists the day, picks the entry the owner means, and holds it for a
+    /// yes. An unclear pick shows the day numbered and asks.
+    fn doRemoveEvent(self: *Bot, arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const calendar = self.cfg.calendar orelse return NOT_SET_UP;
+        const today = dates.today();
+        const day = if (appointment.findDay(today, text)) |found| found.day else today;
+        const start: ?i16 = if (appointment.findTime(text)) |time| time.start else null;
+
+        const entries = gcal.list(self.cfg.io, arena, calendar, day.year, day.month, day.day) catch |err| switch (err) {
+            error.NotAuthorized => return NOT_CONNECTED,
+            error.TokenRevoked => return "Google no longer accepts my calendar login -- say \"connect my calendar\" to log in again.",
+            else => {
+                log.err("could not list the calendar: {s}", .{@errorName(err)});
+                return "Couldn't read your calendar just now -- try again in a moment.";
+            },
+        };
+        const day_label = try dayLabel(arena, day);
+        if (entries.len == 0) return std.fmt.allocPrint(arena, "Nothing on your calendar on {s}, so nothing to remove.", .{day_label});
+
+        // Copied into their own arena: the removal outlives this turn.
+        var removal_arena: std.heap.ArenaAllocator = .init(self.cfg.gpa);
+        errdefer removal_arena.deinit();
+        const alloc = removal_arena.allocator();
+        const copies = try alloc.alloc(gcal.Listed, entries.len);
+        for (entries, copies) |entry, *copy| {
+            copy.* = .{
+                .id = try alloc.dupe(u8, entry.id),
+                .title = try alloc.dupe(u8, entry.title),
+                .location = try alloc.dupe(u8, entry.location),
+                .start_minutes = entry.start_minutes,
+                .end_minutes = entry.end_minutes,
+            };
+        }
+
+        const candidates = try arena.alloc(appointment.Candidate, entries.len);
+        for (entries, candidates) |entry, *candidate| candidate.* = .{ .title = entry.title, .start = entry.start_minutes };
+        const chosen = try appointment.pick(arena, candidates, text, start);
+
+        self.discardPendingRemoval();
+        self.pending_removal = .{
+            .arena = removal_arena,
+            .day = day,
+            .entries = copies,
+            .chosen = chosen,
+            .created_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds,
+        };
+        if (chosen != null) return self.removalPreview(arena);
+
+        log.info("removal on {s}: {d} entries, none picked; asking", .{ day_label, entries.len });
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("Which one? On {s} there {s}:", .{ day_label, if (entries.len == 1) "is" else "are" });
+        for (entries, 1..) |entry, n| {
+            try out.writer.print("\n{d}. {s}  {s}", .{
+                n,
+                if (entry.start_minutes) |s| try appointment.clockRange(arena, s, entry.end_minutes) else "all day    ",
+                entry.title,
+            });
+        }
+        try out.writer.writeAll("\n\nSay the number or the name, or no to leave it.");
+        return out.written();
+    }
+
+    /// The follow-up to "which one?": a number or a name. Null when the
+    /// message is neither, so it is handled as a new request.
+    fn chooseRemoval(self: *Bot, arena: std.mem.Allocator, text: []const u8) !?[]const u8 {
+        const removal = &self.pending_removal.?;
+        var chosen = appointment.pickByNumber(text, removal.entries.len);
+        if (chosen == null) {
+            const candidates = try arena.alloc(appointment.Candidate, removal.entries.len);
+            for (removal.entries, candidates) |entry, *candidate| candidate.* = .{ .title = entry.title, .start = entry.start_minutes };
+            const start: ?i16 = if (appointment.findTime(text)) |time| time.start else null;
+            chosen = try appointment.pick(arena, candidates, text, start);
+        }
+        removal.chosen = chosen orelse return null;
+        return try self.removalPreview(arena);
+    }
+
+    fn dayLabel(arena: std.mem.Allocator, day: dates.Day) ![]const u8 {
+        const label = try appointment.describe(arena, .{ .day = day });
+        return label[0 .. std.mem.indexOf(u8, label, ",") orelse label.len];
+    }
+
+    fn removalWhen(removal: *const PendingRemoval) appointment.When {
+        const entry = removal.entries[removal.chosen.?];
+        return .{ .day = removal.day, .start = entry.start_minutes, .end = entry.end_minutes };
+    }
+
+    fn removalPreview(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const removal = &self.pending_removal.?;
+        const entry = removal.entries[removal.chosen.?];
+        const when = try appointment.describe(arena, removalWhen(removal));
+        log.info("removal of \"{s}\" on {s}; awaiting confirmation", .{ entry.title, when });
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.print("Remove from your calendar?\n\n{s}\n{s}", .{ entry.title, when });
+        if (entry.location.len > 0) try out.writer.print("\n{s}", .{entry.location});
+        try out.writer.writeAll("\n\nType yes to remove it, or no to keep it.");
+        return out.written();
+    }
+
+    fn doRemoveConfirmed(self: *Bot, arena: std.mem.Allocator) ![]const u8 {
+        const calendar = self.cfg.calendar orelse return NOT_SET_UP;
+        const removal = &self.pending_removal.?;
+        const entry = removal.entries[removal.chosen.?];
+
+        gcal.remove(self.cfg.io, arena, calendar, entry.id) catch |err| switch (err) {
+            error.NotAuthorized => return NOT_CONNECTED,
+            error.TokenRevoked => return "Google no longer accepts my calendar login -- say \"connect my calendar\" to log in again.",
+            else => {
+                log.err("could not remove \"{s}\": {s}", .{ entry.title, @errorName(err) });
+                return "Removing it failed -- it's still on your calendar; say yes to try again.";
+            },
+        };
+        log.info("removed \"{s}\" ({s}) from the calendar", .{ entry.title, entry.id });
+        const reply = try std.fmt.allocPrint(arena, "Removed from your calendar: {s}, {s}.", .{
+            entry.title, try appointment.describe(arena, removalWhen(removal)),
+        });
+        self.discardPendingRemoval();
+        return reply;
+    }
+
     fn doFinishLogin(self: *Bot, arena: std.mem.Allocator, pasted: []const u8) ![]const u8 {
         const calendar = self.cfg.calendar orelse return NOT_SET_UP;
         const login = self.pending_login.?;
         self.redact_next_record = true;
+
+        // Google's error page rather than the redirect: say why, in
+        // Google's words, and what fixes the usual cause.
+        if (try gcal.refusalFrom(arena, pasted)) |reason| {
+            log.warn("google refused the calendar login: {s}", .{reason});
+            self.pending_login = null;
+            const testing_hint = if (std.mem.indexOf(u8, reason, "tested") != null)
+                "\n\nThat means the OAuth client's consent screen is External and still in Testing, and this mailbox isn't on its test-user list. In the Google Cloud console, under Google Auth platform, either add this mailbox as a test user (logins then expire after 7 days while it stays in Testing), or make the project Internal under the Workspace account. Then say \"connect my calendar\" again."
+            else
+                "\n\nSay \"connect my calendar\" for a fresh link when that's sorted.";
+            return std.fmt.allocPrint(arena, "Google refused the login -- {s}{s}", .{ reason, testing_hint });
+        }
 
         gcal.finishLogin(self.cfg.io, self.cfg.gpa, calendar, &login.verifier, pasted) catch |err| switch (err) {
             error.NoCode => return "That doesn't carry a login code. Paste the whole address the browser landed on (it starts with http://127.0.0.1), or say \"connect my calendar\" for a fresh link.",

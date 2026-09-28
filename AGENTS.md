@@ -142,6 +142,7 @@ PKCE verifier held in the bot process and is not kept in chat history.
 - Content search depends on Gmail's `X-GM-RAW` extension and will not work
   against other IMAP providers.
 - The calendar is Google only, through its own OAuth client. Ronny can add
-  an entry and list a day; it cannot change or delete one. A consent screen of
+  an entry, list a day and remove an entry picked from that list; it cannot
+  move or edit one. A consent screen of
   type External left in "Testing" issues refresh tokens that die after seven
   days, which shows up as "Google no longer accepts my calendar login".
