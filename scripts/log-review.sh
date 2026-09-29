@@ -23,7 +23,7 @@ log() { printf '%s %s\n' "$(date +%T)" "$*"; }
 notify() {
     # sendMessage only; never getUpdates, which would steal the bot's updates.
     # The token goes to curl on stdin so it never shows in the process list.
-    local token chat outgoing
+    local token chat outgoing code
     token="$(grep -m1 '^TELEGRAM_BOT_TOKEN=' "$repo/.env" | cut -d= -f2-)"
     chat="$(grep -m1 '^TELEGRAM_OWNER_CHAT_ID=' "$repo/.env" | cut -d= -f2-)"
     if [ -z "$token" ] || [ -z "$chat" ]; then
@@ -34,10 +34,13 @@ notify() {
     # sequence the byte cut may have split, which Telegram would refuse.
     outgoing="$reports/$stamp.send"
     head -c 3900 "$1" | iconv -c -f utf-8 -t utf-8 > "$outgoing"
-    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" |
-        curl -sS --max-time 30 -o /dev/null -w '%{http_code}\n' -K - \
-            --data-urlencode "chat_id=$chat" --data-urlencode "text@$outgoing" |
-        { read -r code; log "telegram answered $code"; }
+    # Logged from this process, not from the end of the pipe: journald
+    # cannot tie a line from a subshell that has already exited to the unit,
+    # so `journalctl --user -u ronny-log-review` did not show it.
+    code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" |
+        curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -K - \
+            --data-urlencode "chat_id=$chat" --data-urlencode "text@$outgoing")"
+    log "telegram answered ${code:-nothing}"
     rm -f "${outgoing:?}"
 }
 
