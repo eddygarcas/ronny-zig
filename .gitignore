@@ -27,6 +27,9 @@ attachments/
 # The UID watermark and the paused flag. Machine-specific, and the watermark
 # quietly reveals mailbox volume.
 data/*.json
+# The daily log review quotes the journal, which holds the owner's own
+# messages and the senders of their mail.
+data/log-reviews/
 
 # --- backups and dumps ---
 # A history rewrite, a migration, or a quick "just in case" leaves these

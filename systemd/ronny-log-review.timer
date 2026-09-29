@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Ronny log review every morning
+
+[Timer]
+# Early, so the report is waiting in the chat at the start of the day, and
+# covers the whole previous one.
+OnCalendar=*-*-* 07:30
+# A morning the machine was off runs at the next boot instead of being lost.
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

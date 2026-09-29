@@ -133,6 +133,15 @@ calendar login is started from chat ("connect my calendar") and finished by
 pasting the redirect address back; the pasted code is exchanged with the
 PKCE verifier held in the bot process and is not kept in chat history.
 
+A daily log review runs as a Claude Code agent
+(`.claude/agents/ronny-log-review.md`, started by `scripts/log-review.sh`
+from the `ronny-log-review` user timer in `systemd/`). It reads the last 24
+hours of the journal, commits the fixes the logs justify on a
+`logreview/<date>` branch in a worktree of its own, pushes that branch when
+the tests pass, and sends its report to the owner on Telegram. It never
+deploys, never touches main, and is told to leave the send gate alone. Run
+it by hand with `scripts/log-review.sh`.
+
 ## Known limitations
 
 - The spam check is a judgment call by a local model, not a guarantee. Treat

@@ -1,0 +1,17 @@
+# User unit, not system: it runs Claude Code on the owner's own login and
+# needs no root. Install with
+#   cp systemd/ronny-log-review.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ronny-log-review.timer
+# and, once, `sudo loginctl enable-linger $USER` so it runs while logged out.
+[Unit]
+Description=Ronny daily log review (Claude Code agent)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Work/ronny-zig
+# claude and zig are mise shims, which the systemd PATH does not include.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/Work/ronny-zig/scripts/log-review.sh
+TimeoutStartSec=55min
+Nice=10
