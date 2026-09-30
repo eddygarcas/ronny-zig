@@ -21,6 +21,12 @@ fi
 sudo systemctl daemon-reload
 sudo systemctl restart ronny-watch ronny-bot ronny-watchdog
 systemctl --user daemon-reload
+# Lingering keeps the user manager running while logged out, which is what
+# lets the log review timer fire at 07:30 with nobody at the machine. Only
+# asked for when it is off, so a routine restart does not repeat it.
+if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+    sudo loginctl enable-linger "$USER"
+fi
 systemctl --user is-enabled --quiet ronny-log-review.timer 2>/dev/null ||
     echo "note: the daily log review timer is not enabled (see systemd/ronny-log-review.service)"
 
