@@ -133,6 +133,10 @@ pub fn isOk(code: c_int) bool {
         code == c.MAILIMAP_NO_ERROR_NON_AUTHENTICATED;
 }
 
+/// Shared with the test in main.zig that keeps it out of the watchdog's
+/// incident list.
+pub const IDLE_START_FAILED = "IDLE did not start (libetpan code {d})";
+
 fn check(code: c_int, comptime err: Error) Error!void {
     if (!isOk(code)) {
         log.err("libetpan returned {d}", .{code});
@@ -270,7 +274,15 @@ pub const Session = struct {
     /// caller rescans either way, since the timeout doubles as the keepalive
     /// and safety net.
     pub fn idleWait(self: *Session, timeout_seconds: u31) Error!bool {
-        try check(c.mailimap_idle(self.imap), Error.Idle);
+        // A warning, not `check`'s error line: this is where a connection
+        // Gmail has dropped first shows up (code 4, MAILIMAP_ERROR_STREAM in
+        // mailimap_types.h), and the watcher reconnects from that. The caller
+        // logs the error when it cannot.
+        const started = c.mailimap_idle(self.imap);
+        if (!isOk(started)) {
+            log.warn(IDLE_START_FAILED, .{started});
+            return Error.Idle;
+        }
         defer _ = c.mailimap_idle_done(self.imap);
 
         const fd = c.mailimap_idle_get_fd(self.imap);

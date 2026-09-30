@@ -52,6 +52,28 @@ const log = std.log.scoped(.ronny);
 const MAX_NEW_PER_SCAN = 256;
 const IDLE_TIMEOUT_SECONDS = 300;
 
+/// Gmail drops a long-lived IDLE connection every few hours. The watcher used
+/// to return on that and let systemd restart it, which on 2026-09-29/30 was
+/// eleven restarts and ten watchdog pages in a day, for a drop that is
+/// routine (docs/working-on-ronny.md). It now reopens the connection itself.
+///
+/// The delay is systemd's RestartSec for this unit: every one of those
+/// restarts reconnected cleanly after it.
+const RECONNECT_DELAY_SECONDS = 15;
+/// A connection that dies sooner than this after opening is not the routine
+/// drop, and is left to fail the old way -- an error line, an exit, systemd
+/// and the watchdog -- so a real fault still reaches the owner and a
+/// reconnect can never repeat faster than once a minute. The shortest-lived
+/// connection in that day's log lasted 2m17s.
+const MIN_ROUTINE_CONNECTION_SECONDS = 60;
+/// Deliberately worded to match none of watchdog.zig's incident needles;
+/// a test in this file holds it to that.
+const RECONNECT_MESSAGE = "mailbox connection lost ({s}); reconnecting in {d}s";
+
+fn dropIsRoutine(opened_at_ns: i96, now_ns: i96) bool {
+    return now_ns - opened_at_ns >= @as(i96, MIN_ROUTINE_CONNECTION_SECONDS) * std.time.ns_per_s;
+}
+
 const ConfigError = error{MissingEnvironmentVariable};
 
 /// Everything the notification pipeline needs, gathered once at startup.
@@ -280,18 +302,10 @@ fn runWatcher(init: std.process.Init) !void {
     if (cfg.speech) |tts| log.info("voice summaries available: piper at {s}", .{tts.bin});
     var state = state_mod.State.load(init.io, arena, state_path);
 
-    log.info("connecting to {s} as {s}", .{ host, user });
-    var session = try imap.Session.connect(host, 993, user, password);
+    const mailbox: Mailbox = .{ .io = init.io, .host = host, .user = user, .password = password };
+    var session = try mailbox.open(&state);
     defer session.deinit();
-
-    const selection = try session.examineInbox();
-    log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
-        selection.exists, selection.uid_next, selection.uid_validity,
-    });
-
-    // Baseline to the mailbox's current UIDNEXT, not zero, so a first run
-    // watches from now instead of replaying 50k messages.
-    try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
+    var opened_at = std.Io.Clock.now(.boot, init.io).nanoseconds;
     log.info("resuming from uid {d} (paused: {})", .{ state.lastUid(), controller.paused });
 
     var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
@@ -317,13 +331,30 @@ fn runWatcher(init: std.process.Init) !void {
         // Scan before waiting, not after. Anything that arrived while Ronny
         // was down should be reported on connect rather than sitting unseen
         // until the first IDLE wakeup.
+        //
+        // A dropped connection shows up here first: IDLE wakes on the closed
+        // socket and the fetch that follows fails. So a failed scan on a
+        // connection that has been up a while reconnects and scans once more,
+        // and only a failure on the fresh connection is reported as an error.
+        // The watermark only moves on success, so nothing is skipped.
         if (!quiet) scanOnce(cfg, &session, &controller, &state, &buffer) catch |err| {
-            log.err("scan failed: {s}", .{@errorName(err)});
+            if (dropIsRoutine(opened_at, std.Io.Clock.now(.boot, init.io).nanoseconds)) {
+                opened_at = try mailbox.reopen(&session, &state, err);
+                scanOnce(cfg, &session, &controller, &state, &buffer) catch |again| {
+                    log.err("scan failed: {s}", .{@errorName(again)});
+                };
+            } else {
+                log.err("scan failed: {s}", .{@errorName(err)});
+            }
         };
 
         const woke = session.idleWait(IDLE_TIMEOUT_SECONDS) catch |err| {
-            log.err("IDLE failed: {s}", .{@errorName(err)});
-            return err;
+            if (!dropIsRoutine(opened_at, std.Io.Clock.now(.boot, init.io).nanoseconds)) {
+                log.err("IDLE failed: {s}", .{@errorName(err)});
+                return err;
+            }
+            opened_at = try mailbox.reopen(&session, &state, err);
+            continue;
         };
 
         // A hang produces no error line, so without this the watchdog has no
@@ -332,6 +363,48 @@ fn runWatcher(init: std.process.Init) !void {
         if (!woke) log.info("{s}, last uid {d}", .{ watchdog_mod.HEARTBEAT_MARKER, state.lastUid() });
     }
 }
+
+/// Where the watcher's connection comes from, at startup and after a drop.
+/// One path for both, so a reconnect resumes exactly where a restart would.
+const Mailbox = struct {
+    io: std.Io,
+    host: [:0]const u8,
+    user: [:0]const u8,
+    password: [:0]const u8,
+
+    fn open(self: Mailbox, state: *state_mod.State) !imap.Session {
+        log.info("connecting to {s} as {s}", .{ self.host, self.user });
+        var session = try imap.Session.connect(self.host, 993, self.user, self.password);
+        errdefer session.deinit();
+
+        const selection = try session.examineInbox();
+        log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
+            selection.exists, selection.uid_next, selection.uid_validity,
+        });
+
+        // Baseline to the mailbox's current UIDNEXT, not zero, so a first run
+        // watches from now instead of replaying 50k messages.
+        try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
+        return session;
+    }
+
+    /// Replaces `session` with a new connection and returns when it opened.
+    /// If the new one cannot be opened the error is returned and the watcher
+    /// exits as it always did; the dead session stays in place for the
+    /// caller's deinit.
+    fn reopen(self: Mailbox, session: *imap.Session, state: *state_mod.State, reason: anyerror) !i96 {
+        log.warn(RECONNECT_MESSAGE, .{ @errorName(reason), RECONNECT_DELAY_SECONDS });
+        try self.io.sleep(.fromNanoseconds(RECONNECT_DELAY_SECONDS * std.time.ns_per_s), .awake);
+        const next = self.open(state) catch |err| {
+            log.err("could not reconnect to the mailbox: {s}", .{@errorName(err)});
+            return err;
+        };
+        session.deinit();
+        session.* = next;
+        log.info("reconnected, resuming from uid {d}", .{state.lastUid()});
+        return std.Io.Clock.now(.boot, self.io).nanoseconds;
+    }
+};
 
 fn scanOnce(
     cfg: Config,
@@ -479,6 +552,28 @@ fn speakAndSend(
         return false;
     };
     return true;
+}
+
+test "a routine connection drop is logged in words the watchdog does not page on" {
+    // Seen 2026-09-29/30: Gmail dropped the watcher's connection eleven
+    // times in a day, each written as "scan failed: Fetch", "libetpan
+    // returned 4", "IDLE failed: Idle", and each one paged the owner. The
+    // reconnect is what Ronny does about it now, so its lines must not.
+    try std.testing.expect(watchdog_mod.classify("warning(ronny): " ++ RECONNECT_MESSAGE) == null);
+    try std.testing.expect(watchdog_mod.classify("warning(imap): " ++ imap.IDLE_START_FAILED) == null);
+    // A drop that is not routine still reaches the owner as before.
+    try std.testing.expect(watchdog_mod.classify("error(ronny): IDLE failed: Idle") != null);
+}
+
+test "only a connection that has been up a while counts as a routine drop" {
+    const s = std.time.ns_per_s;
+    // The shortest-lived connection in that day's log: up 04:32:24, gone
+    // 04:34:41, and reconnecting fine afterwards.
+    try std.testing.expect(dropIsRoutine(0, 137 * s));
+    try std.testing.expect(dropIsRoutine(0, 6 * 3600 * s));
+    // One that dies right after opening is not Gmail's housekeeping, and
+    // reconnecting it in-process would only hide the fault.
+    try std.testing.expect(!dropIsRoutine(0, 20 * s));
 }
 
 test {
