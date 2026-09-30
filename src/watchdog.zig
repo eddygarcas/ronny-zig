@@ -44,6 +44,18 @@ const BURST_QUIET_SECONDS = 60;
 const HEARTBEAT_TIMEOUT_SECONDS = 960;
 const HEARTBEAT_CHECK_SECONDS = 60;
 pub const HEARTBEAT_MARKER = "heartbeat: watching INBOX";
+/// The end of the watcher's scan summary, shared with main.zig the same way.
+/// The heartbeat is only written when IDLE times out, so while mail keeps
+/// arriving less than five minutes apart there is none -- and on 2026-09-29
+/// that reported a watcher that had just logged four scans as "gone silent
+/// for 16 min". A scan proves the loop turned just as well.
+pub const SCAN_MARKER = "matched the allowlist";
+
+/// Lines only the watch loop itself writes, as it goes round.
+fn provesWatchLoop(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, HEARTBEAT_MARKER) != null or
+        std.mem.indexOf(u8, line, SCAN_MARKER) != null;
+}
 
 const RECONNECT_SECONDS = 10;
 
@@ -175,9 +187,9 @@ pub const Watchdog = struct {
     pub fn handle(self: *Watchdog, line: []const u8) void {
         self.remember(line);
 
-        // Any log line proves Ronny is alive, but only a heartbeat proves the
-        // IMAP loop itself is still turning.
-        if (std.mem.indexOf(u8, line, HEARTBEAT_MARKER) != null) {
+        // Any log line proves Ronny is alive, but only a heartbeat or a scan
+        // proves the IMAP loop itself is still turning.
+        if (provesWatchLoop(line)) {
             self.last_heartbeat_ns = self.now();
             return;
         }
@@ -430,6 +442,17 @@ test "informational incidents get a long cooldown" {
 
     const fault = classify("error(ronny): IDLE failed: Idle").?;
     try std.testing.expectEqual(@as(u32, COOLDOWN_SECONDS), fault.cooldown);
+}
+
+test "a scan proves the watch loop is turning, the same as a heartbeat" {
+    // 2026-09-29 15:39: "gone silent for 16 min", while the watcher had
+    // logged four scans in that window. Mail was arriving less than five
+    // minutes apart, so IDLE never timed out and no heartbeat was written.
+    try std.testing.expect(provesWatchLoop("2026-09-29T15:35:45+02:00 host ronny[1]: info(ronny): scanned 1 new message(s), 0 matched the allowlist"));
+    try std.testing.expect(provesWatchLoop("Sep 24 11:07:00 host ronny[1]: info(ronny): " ++ HEARTBEAT_MARKER ++ ", last uid 51234"));
+    // Other lines only prove a process is up, not that the loop is.
+    try std.testing.expect(!provesWatchLoop("info(gcal): refreshed the calendar access token"));
+    try std.testing.expect(!provesWatchLoop("info(ronny): connecting to imap.gmail.com as someone"));
 }
 
 test "the heartbeat marker is matched exactly as the watcher writes it" {

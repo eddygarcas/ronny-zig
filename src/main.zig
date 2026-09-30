@@ -445,7 +445,9 @@ fn scanOnce(
     }
 
     if (fresh == 0) return;
-    log.info("scanned {d} new message(s), {d} matched the allowlist", .{ fresh, matched });
+    // The watchdog counts this line as proof the loop is turning; the marker
+    // is shared rather than written out twice.
+    log.info("scanned {d} new message(s), {d} " ++ watchdog_mod.SCAN_MARKER, .{ fresh, matched });
 }
 
 /// The notification pipeline for one matching message: fetch it, run the

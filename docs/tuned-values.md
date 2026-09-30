@@ -120,6 +120,11 @@ heartbeat, and a timeout wide enough not to fire on one slow cycle.
 with a test asserting they still agree. If they drift, the watchdog reports a
 perfectly healthy Ronny as hung.
 
+**A scan counts as a heartbeat too** (`SCAN_MARKER`). The heartbeat is only
+written when IDLE times out, so a busy mailbox -- mail less than five minutes
+apart for a quarter of an hour -- writes none, and was once reported as
+"gone silent" right after four scans.
+
 ## Mailbox — `src/main.zig`, `src/findmail.zig`
 
 **`if (envelope.uid <= watermark) continue`.** IMAP's `N:*` returns the highest
