@@ -280,21 +280,20 @@ fn runWatcher(init: std.process.Init) !void {
     if (cfg.speech) |tts| log.info("voice summaries available: piper at {s}", .{tts.bin});
     var state = state_mod.State.load(init.io, arena, state_path);
 
-    log.info("connecting to {s} as {s}", .{ host, user });
-    var session = try imap.Session.connect(host, 993, user, password);
-    defer session.deinit();
-
-    const selection = try session.examineInbox();
-    log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
-        selection.exists, selection.uid_next, selection.uid_validity,
-    });
-
-    // Baseline to the mailbox's current UIDNEXT, not zero, so a first run
-    // watches from now instead of replaying 50k messages.
-    try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
+    var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
+    var watch: Watch = .{
+        .cfg = cfg,
+        .host = host,
+        .user = user,
+        .password = password,
+        .session = try openInbox(host, user, password, &state),
+        .controller = &controller,
+        .state = &state,
+        .buffer = &buffer,
+    };
+    defer watch.session.deinit();
     log.info("resuming from uid {d} (paused: {})", .{ state.lastUid(), controller.paused });
 
-    var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
     var was_quiet = false;
     while (true) {
         // Quiet hours stop the *scan*, not the notification. The watermark
@@ -317,20 +316,131 @@ fn runWatcher(init: std.process.Init) !void {
         // Scan before waiting, not after. Anything that arrived while Ronny
         // was down should be reported on connect rather than sitting unseen
         // until the first IDLE wakeup.
-        if (!quiet) scanOnce(cfg, &session, &controller, &state, &buffer) catch |err| {
-            log.err("scan failed: {s}", .{@errorName(err)});
-        };
+        if (!quiet) {
+            const scanned = scanRecovering(&watch) catch |err| {
+                log.err("scan failed, and reconnecting failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            if (scanned.persisted) |err| {
+                log.err("scan failed: {s}", .{@errorName(err)});
+            } else if (scanned.dropped) |err| {
+                log.warn(RECONNECTED_FORMAT, .{ @errorName(err), "a scan" });
+            }
+        }
 
-        const woke = session.idleWait(IDLE_TIMEOUT_SECONDS) catch |err| {
-            log.err("IDLE failed: {s}", .{@errorName(err)});
+        const idled = idleRecovering(&watch, IDLE_TIMEOUT_SECONDS) catch |err| {
+            log.err("IDLE failed, and reconnecting failed: {s}", .{@errorName(err)});
             return err;
         };
+        if (idled.dropped) |err| log.warn(RECONNECTED_FORMAT, .{ @errorName(err), "IDLE" });
+        const woke = idled.woke;
 
         // A hang produces no error line, so without this the watchdog has no
         // way to tell a quiet mailbox from a wedged loop. The marker string is
         // shared with watchdog.zig rather than written out twice.
         if (!woke) log.info("{s}, last uid {d}", .{ watchdog_mod.HEARTBEAT_MARKER, state.lastUid() });
     }
+}
+
+/// Connects, selects INBOX read-only, and reconciles the watermark with it.
+/// Used at startup and again whenever Gmail drops the connection.
+fn openInbox(
+    host: [:0]const u8,
+    user: [:0]const u8,
+    password: [:0]const u8,
+    state: *state_mod.State,
+) !imap.Session {
+    log.info("connecting to {s} as {s}", .{ host, user });
+    var session = try imap.Session.connect(host, 993, user, password);
+    errdefer session.deinit();
+
+    const selection = try session.examineInbox();
+    log.info("INBOX: {d} messages, uidnext {d}, uidvalidity {d}", .{
+        selection.exists, selection.uid_next, selection.uid_validity,
+    });
+
+    // Baseline to the mailbox's current UIDNEXT, not zero, so a first run
+    // watches from now instead of replaying 50k messages. On a reconnect the
+    // uidvalidity is unchanged and the watermark is kept as it is.
+    try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
+    return session;
+}
+
+/// The watcher's mailbox connection, and what it takes to open another.
+const Watch = struct {
+    cfg: Config,
+    host: [:0]const u8,
+    user: [:0]const u8,
+    password: [:0]const u8,
+    session: imap.Session,
+    controller: *controller_mod.Controller,
+    state: *state_mod.State,
+    buffer: []imap.Envelope,
+
+    fn scan(self: *Watch) !void {
+        return scanOnce(self.cfg, &self.session, self.controller, self.state, self.buffer);
+    }
+
+    fn idle(self: *Watch, timeout_seconds: u31) !bool {
+        return self.session.idleWait(timeout_seconds);
+    }
+
+    /// The new session is opened before the old one is freed, so a failed
+    /// reconnect leaves a session that is still safe to deinit on the way out.
+    fn reconnect(self: *Watch) !void {
+        const fresh = try openInbox(self.host, self.user, self.password, self.state);
+        self.session.deinit();
+        self.session = fresh;
+    }
+};
+
+/// Logged when a fresh connection cleared the failure. Deliberately matches
+/// none of the watchdog's incident needles -- see the test below.
+const RECONNECTED_FORMAT = "IMAP connection dropped ({s} during {s}); reconnected";
+
+/// What a failure on the mailbox connection turned out to be.
+///
+/// Gmail drops long-lived IDLE connections every few hours. The watcher used
+/// to exit on that and leave the reconnect to systemd, and the journal for
+/// 2026-09-29/30 shows the cost: eleven exits, each one writing "scan
+/// failed", "libetpan returned 4" and "Main process exited", and each one
+/// paging the owner -- twelve alerts in a day for a connection doing what
+/// Gmail connections do. Nothing was lost, since the watermark survives a
+/// restart; the fault was only in treating routine as an incident.
+///
+/// So a failure is answered with a fresh connection first, and only what
+/// survives one is reported as a fault.
+const Recovery = struct {
+    /// Cleared by a fresh connection: routine, logged as a warning.
+    dropped: ?anyerror = null,
+    /// Still failing on a fresh connection: a real fault, logged as one.
+    persisted: ?anyerror = null,
+};
+
+/// Scans; on failure reconnects once and scans again. Returns an error only
+/// when the reconnect itself fails, which the caller exits on.
+fn scanRecovering(watch: anytype) !Recovery {
+    watch.scan() catch |first| {
+        try watch.reconnect();
+        watch.scan() catch |again| return .{ .dropped = first, .persisted = again };
+        return .{ .dropped = first };
+    };
+    return .{};
+}
+
+const IdleOutcome = struct {
+    woke: bool,
+    dropped: ?anyerror = null,
+};
+
+/// Waits in IDLE; on failure reconnects and reports a wakeup, so the loop
+/// rescans for anything that arrived while the connection was down.
+fn idleRecovering(watch: anytype, timeout_seconds: u31) !IdleOutcome {
+    const woke = watch.idle(timeout_seconds) catch |first| {
+        try watch.reconnect();
+        return .{ .woke = true, .dropped = first };
+    };
+    return .{ .woke = woke };
 }
 
 fn scanOnce(
@@ -479,6 +589,90 @@ fn speakAndSend(
         return false;
     };
     return true;
+}
+
+/// Stands in for the watcher's mailbox connection, failing the way the
+/// journal showed Gmail dropping it.
+const FakeWatch = struct {
+    failing_scans: u8 = 0,
+    failing_idles: u8 = 0,
+    reconnect_fails: bool = false,
+    scans: u8 = 0,
+    reconnects: u8 = 0,
+
+    fn scan(self: *FakeWatch) !void {
+        self.scans += 1;
+        if (self.failing_scans > 0) {
+            self.failing_scans -= 1;
+            return error.Fetch;
+        }
+    }
+
+    fn idle(self: *FakeWatch, _: u31) !bool {
+        if (self.failing_idles > 0) {
+            self.failing_idles -= 1;
+            return error.ConnectionLost;
+        }
+        return false;
+    }
+
+    fn reconnect(self: *FakeWatch) !void {
+        self.reconnects += 1;
+        if (self.reconnect_fails) return error.Connect;
+    }
+};
+
+test "a scan that fails on a dropped connection reconnects and scans again" {
+    // The journal, 2026-09-29/30, eleven times: IDLE woke, the scan failed
+    // with Fetch, IDLE then got libetpan 4 and the watcher exited -- and the
+    // owner was paged for each one.
+    var watch: FakeWatch = .{ .failing_scans = 1 };
+    const outcome = try scanRecovering(&watch);
+    try std.testing.expectEqual(@as(u8, 1), watch.reconnects);
+    try std.testing.expectEqual(@as(u8, 2), watch.scans);
+    try std.testing.expectEqual(@as(?anyerror, error.Fetch), outcome.dropped);
+    try std.testing.expectEqual(@as(?anyerror, null), outcome.persisted);
+}
+
+test "a scan that still fails on a fresh connection is reported as a fault" {
+    var watch: FakeWatch = .{ .failing_scans = 2 };
+    const outcome = try scanRecovering(&watch);
+    try std.testing.expectEqual(@as(u8, 1), watch.reconnects);
+    try std.testing.expectEqual(@as(?anyerror, error.Fetch), outcome.persisted);
+}
+
+test "a healthy scan does not reconnect" {
+    var watch: FakeWatch = .{};
+    const outcome = try scanRecovering(&watch);
+    try std.testing.expectEqual(@as(u8, 0), watch.reconnects);
+    try std.testing.expectEqual(@as(?anyerror, null), outcome.dropped);
+}
+
+test "an IDLE on a dropped connection reconnects and asks for a rescan" {
+    var watch: FakeWatch = .{ .failing_idles = 1 };
+    const outcome = try idleRecovering(&watch, IDLE_TIMEOUT_SECONDS);
+    try std.testing.expectEqual(@as(u8, 1), watch.reconnects);
+    // Mail may have arrived while the connection was down.
+    try std.testing.expect(outcome.woke);
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionLost), outcome.dropped);
+}
+
+test "a reconnect that fails is still an error, so systemd and the watchdog see it" {
+    var scan_watch: FakeWatch = .{ .failing_scans = 1, .reconnect_fails = true };
+    try std.testing.expectError(error.Connect, scanRecovering(&scan_watch));
+    var idle_watch: FakeWatch = .{ .failing_idles = 1, .reconnect_fails = true };
+    try std.testing.expectError(error.Connect, idleRecovering(&idle_watch, IDLE_TIMEOUT_SECONDS));
+}
+
+test "a reconnect is logged as routine, not as an incident" {
+    // If this line ever matched a watchdog needle, every Gmail drop would
+    // page the owner again.
+    const line = "warning(ronny): " ++ std.fmt.comptimePrint(RECONNECTED_FORMAT, .{ "Fetch", "a scan" });
+    try std.testing.expect(watchdog_mod.classify(line) == null);
+    const idle_line = "warning(ronny): " ++ std.fmt.comptimePrint(RECONNECTED_FORMAT, .{ "ConnectionLost", "IDLE" });
+    try std.testing.expect(watchdog_mod.classify(idle_line) == null);
+    // And a reconnect that fails still does.
+    try std.testing.expect(watchdog_mod.classify("error(ronny): scan failed, and reconnecting failed: Connect") != null);
 }
 
 test {

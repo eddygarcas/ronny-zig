@@ -62,6 +62,9 @@ pub const Error = error{
     Select,
     Fetch,
     Idle,
+    /// The server closed the socket. Routine on Gmail, which drops long-lived
+    /// IDLE connections every few hours; the fix is a new connection.
+    ConnectionLost,
     AttachmentTooLarge,
 };
 
@@ -131,6 +134,22 @@ pub fn isOk(code: c_int) bool {
     return code == c.MAILIMAP_NO_ERROR or
         code == c.MAILIMAP_NO_ERROR_AUTHENTICATED or
         code == c.MAILIMAP_NO_ERROR_NON_AUTHENTICATED;
+}
+
+/// MAILIMAP_ERROR_STREAM, which follows the three success codes in
+/// libetpan's `mailimap_types.h` (so 4): the socket is gone, not the command
+/// wrong. Kept apart from `check` because it is logged as routine rather than
+/// as an error -- the watchdog pages the owner on "libetpan returned".
+pub fn connectionLost(code: c_int) bool {
+    return code == c.MAILIMAP_ERROR_STREAM;
+}
+
+test "libetpan's code 4 from the journal is a dropped connection" {
+    // "error(imap): libetpan returned 4", eleven times on 2026-09-29/30, each
+    // right after Gmail closed the IDLE socket.
+    try std.testing.expect(connectionLost(4));
+    try std.testing.expect(!connectionLost(c.MAILIMAP_NO_ERROR));
+    try std.testing.expect(!connectionLost(c.MAILIMAP_ERROR_BAD_STATE));
 }
 
 fn check(code: c_int, comptime err: Error) Error!void {
@@ -270,7 +289,9 @@ pub const Session = struct {
     /// caller rescans either way, since the timeout doubles as the keepalive
     /// and safety net.
     pub fn idleWait(self: *Session, timeout_seconds: u31) Error!bool {
-        try check(c.mailimap_idle(self.imap), Error.Idle);
+        const started = c.mailimap_idle(self.imap);
+        if (connectionLost(started)) return Error.ConnectionLost;
+        try check(started, Error.Idle);
         defer _ = c.mailimap_idle_done(self.imap);
 
         const fd = c.mailimap_idle_get_fd(self.imap);
