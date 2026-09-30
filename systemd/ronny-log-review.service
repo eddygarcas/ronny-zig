@@ -13,5 +13,7 @@ WorkingDirectory=%h/Work/ronny-zig
 # claude and zig are mise shims, which the systemd PATH does not include.
 Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin
 ExecStart=%h/Work/ronny-zig/scripts/log-review.sh
-TimeoutStartSec=55min
+# The agent's 45 minutes, then the tests, a build, the health wait and, at
+# worst, a rollback restart.
+TimeoutStartSec=75min
 Nice=10

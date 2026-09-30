@@ -1,14 +1,29 @@
 #!/bin/bash
 # Restarts every Ronny service and follows their logs.
 #
-#   ./restart.sh           restart what is already built
-#   ./restart.sh --build   rebuild first, which is what a deploy is
+#   ./restart.sh                     restart what is already built
+#   ./restart.sh --build             rebuild first, which is what a deploy is
+#   ./restart.sh --build --no-follow the same, unattended: no password
+#                                    prompt, no log tail. Used by the daily
+#                                    log review; needs systemd/ronny-deploy.sudoers
 #
 # Ctrl-C stops following the logs; the services keep running.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-if [ "${1:-}" = "--build" ]; then
+build=false
+follow=true
+for arg in "$@"; do
+    case "$arg" in
+        --build) build=true ;;
+        --no-follow) follow=false ;;
+        *) echo "unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
+# Unattended, sudo must fail rather than wait for a password nobody types.
+if $follow; then sudo=(sudo); else sudo=(sudo -n); fi
+
+if $build; then
     # Both flags, always: a plain build links a CPU-only whisper. See AGENTS.md.
     zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
 fi
@@ -18,18 +33,21 @@ if ! readelf -d zig-out/bin/ronny | grep -q 'whisper-cuda'; then
 fi
 
 # Unit files may have changed with a pull.
-sudo systemctl daemon-reload
-sudo systemctl restart ronny-watch ronny-bot ronny-watchdog
+"${sudo[@]}" systemctl daemon-reload
+"${sudo[@]}" systemctl restart ronny-watch ronny-bot ronny-watchdog
 systemctl --user daemon-reload
 # Lingering keeps the user manager running while logged out, which is what
 # lets the log review timer fire at 07:30 with nobody at the machine. Only
 # asked for when it is off, so a routine restart does not repeat it.
 if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
-    sudo loginctl enable-linger "$USER"
+    "${sudo[@]}" loginctl enable-linger "$USER" ||
+        echo "note: lingering is off and could not be turned on without a password" >&2
 fi
 systemctl --user is-enabled --quiet ronny-log-review.timer 2>/dev/null ||
     echo "note: the daily log review timer is not enabled (see systemd/ronny-log-review.service)"
 
-systemctl status ronny-watch ronny-bot ronny-watchdog --no-pager --lines=0 | grep -E '●|Active:'
+systemctl status ronny-watch ronny-bot ronny-watchdog --no-pager --lines=0 | grep -E '●|Active:' || true
 
-journalctl -u ronny-watch -u ronny-bot -u ronny-watchdog --user-unit ronny-log-review -f --since "-1min"
+if $follow; then
+    journalctl -u ronny-watch -u ronny-bot -u ronny-watchdog --user-unit ronny-log-review -f --since "-1min"
+fi

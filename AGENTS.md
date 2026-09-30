@@ -137,10 +137,16 @@ A daily log review runs as a Claude Code agent
 (`.claude/agents/ronny-log-review.md`, started by `scripts/log-review.sh`
 from the `ronny-log-review` user timer in `systemd/`). It reads the last 24
 hours of the journal, commits the fixes the logs justify on a
-`logreview/<date>` branch in a worktree of its own, pushes that branch when
-the tests pass, and sends its report to the owner on Telegram. It never
-deploys, never touches main, and is told to leave the send gate alone. Run
-it by hand with `scripts/log-review.sh`.
+`logreview/<date>` branch in a worktree of its own, and pushes that branch
+when the tests pass. It then deploys it: fast-forwards main, runs
+`restart.sh --build --no-follow`, and checks that all three services logged
+their startup line within 90 seconds, rolling main and the binary back if
+not. A branch touching the send gate, `config/`, `systemd/`, `scripts/`,
+`restart.sh` or `.claude/` is pushed but never deployed, and nothing is
+deployed unless the main checkout is a clean main. The unattended restart
+needs `systemd/ronny-deploy.sudoers` installed. The report, with what was
+deployed, goes to the owner on Telegram. Run it by hand with
+`scripts/log-review.sh`.
 
 ## Known limitations
 

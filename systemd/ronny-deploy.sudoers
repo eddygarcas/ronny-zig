@@ -1,0 +1,6 @@
+# Lets the daily log review restart Ronny without a password, and nothing
+# else: these exact commands, as root, for the user that owns the services.
+# Change "duard" if the services run as someone else. Install with
+#   sudo install -m 0440 systemd/ronny-deploy.sudoers /etc/sudoers.d/ronny-deploy
+#   sudo visudo -cf /etc/sudoers.d/ronny-deploy
+duard ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /usr/bin/systemctl restart ronny-watch ronny-bot ronny-watchdog

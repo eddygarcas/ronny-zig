@@ -98,9 +98,18 @@ and calendar.
 ## Committing
 
 You are already on a fresh branch cut from origin/main. Commit each fix on
-it with `git add` and `git commit`; the script that ran you pushes the
-branch afterwards if the tests pass, and the owner merges and deploys. Do
-not push, switch branches, restart services, or use sudo.
+it with `git add` and `git commit`. Do not push, switch branches, restart
+services, or use sudo.
+
+**What you commit goes live without a person reading it first.** The script
+that ran you pushes the branch if the tests pass, merges it into main,
+rebuilds, and restarts Ronny. It rolls back only if a service fails to come
+up; a change that runs but does the wrong thing stays deployed until the
+owner notices. So hold every commit to that bar: if you would not be
+comfortable with it running unreviewed tonight, do not commit it -- put it
+in the report as a suggestion instead. A branch that touches the send gate,
+`config/`, `systemd/`, `scripts/`, `restart.sh` or `.claude/` is never
+deployed automatically, but those are out of bounds for you anyway.
 
 Commit messages follow the repository's style: a subject that says what
 changed for the owner, then a body naming the log evidence (time and the
