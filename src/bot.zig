@@ -42,6 +42,7 @@ const gcal = @import("gcal.zig");
 const appointment = @import("appointment.zig");
 const dates = @import("dates.zig");
 const reminders_mod = @import("reminders.zig");
+const watchdog_mod = @import("watchdog.zig");
 
 const log = std.log.scoped(.bot);
 
@@ -73,6 +74,24 @@ pub const REMINDER_REFRESH_SECONDS = 180;
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
+
+/// Failed polls in a row before the failure is logged as an error, which is
+/// the line the watchdog pages on. On 2026-09-30/10-01 a single poll failed
+/// three times -- a DNS lookup at 08:25 and 10:51, a 429 at 03:11 -- and
+/// each time the next poll, ten seconds later, worked. The watchdog paged
+/// the owner for two of them and tried to for the third. A failure the next
+/// poll clears is the network, which this loop already rides out. Three in
+/// a row is at least half a minute of it: an outage, or a second poller
+/// getting 409, both of which persist and still page.
+const POLL_FAILURES_BEFORE_ERROR = 3;
+/// Deliberately worded to match none of watchdog.zig's incident needles; a
+/// test below holds both lines to that.
+const POLL_RETRY_MESSAGE = "telegram poll did not complete ({s}); retrying in {d}s";
+const POLL_FAILED_MESSAGE = "poll failed ({s}) {d} times in a row; retrying in {d}s";
+
+fn pollFailureIsOutage(consecutive: u32) bool {
+    return consecutive >= POLL_FAILURES_BEFORE_ERROR;
+}
 /// The vocabulary costs an IMAP scan, so it is cached between voice notes.
 const VOCAB_TTL_SECONDS = 6 * 3600;
 const VOCAB_DAYS = 180;
@@ -402,20 +421,28 @@ pub const Bot = struct {
         }
 
         log.info("telegram polling started", .{});
+        var failed_polls: u32 = 0;
         while (true) {
             // Between polls rather than on a timer: a poll returns within
             // POLL_TIMEOUT_SECONDS whether or not anything was said, which
             // is as close to the minute as a reminder needs to be.
             self.tickReminders();
-            self.pollOnce() catch |err| {
-                log.err("poll failed ({s}); retrying in {d}s", .{ @errorName(err), RETRY_DELAY_SECONDS });
+            if (self.pollOnce()) {
+                failed_polls = 0;
+            } else |err| {
+                failed_polls +|= 1;
+                if (pollFailureIsOutage(failed_polls)) {
+                    log.err(POLL_FAILED_MESSAGE, .{ @errorName(err), failed_polls, RETRY_DELAY_SECONDS });
+                } else {
+                    log.warn(POLL_RETRY_MESSAGE, .{ @errorName(err), RETRY_DELAY_SECONDS });
+                }
                 // A failing poll is usually the network or a 409 from a second
                 // poller; backing off keeps it from spinning.
                 self.cfg.io.sleep(
                     .fromNanoseconds(RETRY_DELAY_SECONDS * std.time.ns_per_s),
                     .awake,
                 ) catch return err;
-            };
+            }
         }
     }
 
@@ -3085,6 +3112,24 @@ fn parseSearchArg(arg: []const u8) SearchArg {
     const tail = arg[space + 1 ..];
     const days = std.fmt.parseInt(u16, tail, 10) catch return .{ .target = arg, .days = null };
     return .{ .target = std.mem.trim(u8, arg[0..space], " \t"), .days = days };
+}
+
+test "a poll that fails once is logged in words the watchdog does not page on" {
+    // The shapes seen on 2026-09-30/10-01: a DNS failure and a 429, each
+    // cleared by the next poll ten seconds later, each paged as an incident.
+    try std.testing.expect(watchdog_mod.classify(
+        "error(bot): poll failed (RequestFailed); retrying in 10s",
+    ) != null);
+    try std.testing.expect(watchdog_mod.classify("warning(bot): " ++ POLL_RETRY_MESSAGE) == null);
+    // A failure that persists still uses the line that pages.
+    try std.testing.expect(watchdog_mod.classify("error(bot): " ++ POLL_FAILED_MESSAGE) != null);
+}
+
+test "only consecutive poll failures count as an outage" {
+    try std.testing.expect(!pollFailureIsOutage(1));
+    try std.testing.expect(!pollFailureIsOutage(2));
+    try std.testing.expect(pollFailureIsOutage(3));
+    try std.testing.expect(pollFailureIsOutage(40));
 }
 
 test "parseSearchArg splits off a trailing day count" {
