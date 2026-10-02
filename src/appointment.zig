@@ -658,6 +658,37 @@ pub fn fallbackTitle(arena: std.mem.Allocator, rest: []const u8) ![]const u8 {
     return out;
 }
 
+/// Whether the request asks for someone to be invited: an invite word, or
+/// an address. Ronny never sets attendees (see gcal.zig -- an attendee is
+/// an invitation email to a third party, which is a send), so this only
+/// decides whether the preview *says so*. On 2026-10-01 a request naming a
+/// guest by address was previewed and added without them, silently; the
+/// owner noticed afterwards, and two follow-ups asking for the invite got
+/// "didn't catch" because there is no such action. Read by word matching,
+/// like the date, so the note cannot be talked out of appearing.
+pub fn asksForGuests(text: []const u8) bool {
+    const words = [_][]const u8{
+        "invite",  "invites",  "inviting", "invitation", "guest",     "guests",
+        "attendee", "attendees", "invita", "invitar",    "invitado",  "invitados",
+        "invitada", "invitadas", "invitación", "invitacion",
+    };
+    for (words) |word| {
+        if (findPhrase(text, word) != null) return true;
+    }
+    // An address: word bytes on both sides of an '@' and a dot after it.
+    // A bare "@ 3pm" is a time lead (TIME_LEADS), not a guest.
+    for (text, 0..) |ch, i| {
+        if (ch != '@') continue;
+        if (i == 0 or !isWordByte(text[i - 1])) continue;
+        if (i + 1 >= text.len or !isWordByte(text[i + 1])) continue;
+        var j = i + 1;
+        while (j < text.len and (isWordByte(text[j]) or text[j] == '-' or text[j] == '.')) : (j += 1) {
+            if (text[j] == '.' and j + 1 < text.len and isWordByte(text[j + 1])) return true;
+        }
+    }
+    return false;
+}
+
 pub const Details = struct {
     title: []const u8,
     location: []const u8 = "",
@@ -1060,6 +1091,19 @@ test "the whole request: day, time, length, and what is left for the title" {
     try std.testing.expectEqual(@as(?When, null), no_day.when);
     try std.testing.expectEqual(@as(?i16, 15 * 60), no_day.start);
     try std.testing.expectEqualStrings("Meeting with Dana", try fallbackTitle(arena, no_day.rest));
+}
+
+test "a request to invite someone is noticed, so the preview can say it won't happen" {
+    // The shape logged on 2026-10-01: a create request that named a guest
+    // by address. The entry was added without them and nothing said so.
+    try std.testing.expect(asksForGuests("Create appointment 7th October at 11:30 am, invite dana@example.com and title objectives"));
+    try std.testing.expect(asksForGuests("lunch with Sam friday at 1, add sam@example.org"));
+    try std.testing.expect(asksForGuests("meeting tomorrow at 3 with Dana as a guest"));
+    try std.testing.expect(asksForGuests("reunión el jueves a las 10, invita a Vicente"));
+    // Nothing to invite: a name is not a guest, and "@ 3pm" is a time.
+    try std.testing.expect(!asksForGuests("add a meeting with Dana next thursday at 3pm"));
+    try std.testing.expect(!asksForGuests("dentist tomorrow @ 9:30"));
+    try std.testing.expect(!asksForGuests("For tomorrow, create an appointment from 9pm to 11pm, saying 'busy'."));
 }
 
 test "a title the model made up is rejected, one from the request is kept" {

@@ -318,6 +318,9 @@ const PendingEvent = struct {
     day: ?dates.Day,
     start: ?i16,
     end: ?i16,
+    /// The request asked for a guest, which Ronny never adds; the preview
+    /// says so. See appointment.asksForGuests.
+    asked_for_guests: bool = false,
     created_ns: i96,
 
     fn when(self: *const PendingEvent) ?appointment.When {
@@ -2661,6 +2664,10 @@ pub const Bot = struct {
     // ---- the calendar ----
 
     const NOT_SET_UP = "Calendar isn't set up -- put GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env and restart me, then say \"connect my calendar\".";
+    /// Said in the preview, before the yes, when the request asked for a
+    /// guest: the entry is added for the owner alone, and the owner should
+    /// know that while approving it rather than find out afterwards.
+    const NO_GUESTS = "I don't invite anyone -- this goes on your calendar only. Add guests from Google Calendar once it's there.";
     const NOT_CONNECTED = "I'm not connected to your calendar yet -- say \"connect my calendar\" and I'll send you the link.";
 
     fn freshPendingLogin(self: *Bot) ?*PendingLogin {
@@ -2933,6 +2940,7 @@ pub const Bot = struct {
             found.rest,
         );
         try self.stageEvent(info.title, info.location, if (found.when) |w| w.day else null, found.start, found.end);
+        self.pending_event.?.asked_for_guests = appointment.asksForGuests(text);
 
         if (found.when == null) {
             log.info("calendar entry \"{s}\" has no day yet; asking", .{info.title});
@@ -3003,6 +3011,7 @@ pub const Bot = struct {
         var out: std.Io.Writer.Allocating = .init(arena);
         try out.writer.print("Add to your calendar?\n\n{s}\n{s}", .{ event.title, try appointment.describe(arena, when) });
         if (event.location.len > 0) try out.writer.print("\n{s}", .{event.location});
+        if (event.asked_for_guests) try out.writer.writeAll("\n\n" ++ NO_GUESTS);
         if (self.cfg.calendar) |calendar| {
             if (!gcal.isAuthorized(self.cfg.io, arena, calendar)) {
                 try out.writer.writeAll("\n\n" ++ NOT_CONNECTED ++ " The entry will wait.");
