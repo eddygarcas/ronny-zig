@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const imap = @import("imap.zig");
+const spam = @import("spam.zig");
 const findmail = @import("findmail.zig");
 const headers = @import("headers.zig");
 const mailer = @import("mailer.zig");
@@ -362,6 +363,33 @@ pub fn main(init: std.process.Init) !void {
                 if (body_len == 0) "nothing" else if (body_len <= summarize.SHORT_BODY_CHARS) "verbatim" else "summarised",
                 elapsed_ms,
                 summary,
+            });
+        }
+    }
+
+    // Which Authentication-Results header the spam gate reads, on real mail:
+    // the receiver's own must be the one found. Only the server name and
+    // the result words are printed, not the addresses the header names.
+    std.debug.print("\n=== authentication results (real recent mail) ===\n", .{});
+    {
+        var recent: [10]imap.Envelope = undefined;
+        const found = try session.searchRecent(7, &recent);
+        for (found) |envelope| {
+            var message: imap.Message = undefined;
+            session.fetchMessage(envelope.uid, &message) catch continue;
+            const raw_headers = message.headersSlice();
+            const results = spam.receiverResults(raw_headers) orelse {
+                std.debug.print("  uid {d}: no Authentication-Results\n", .{envelope.uid});
+                continue;
+            };
+            const server = std.mem.trim(u8, results[0 .. std.mem.indexOfScalar(u8, results, ';') orelse results.len], " \t\r\n");
+            std.debug.print("  uid {d}: {s} spf={?s} dkim={?s} dmarc={?s} -> {s}\n", .{
+                envelope.uid,
+                server,
+                spam.methodResult(results, "spf"),
+                spam.methodResult(results, "dkim"),
+                spam.methodResult(results, "dmarc"),
+                spam.headerVerdict(raw_headers) orelse "passes the header checks",
             });
         }
     }
