@@ -159,7 +159,7 @@ pub fn postMultipart(
     var response_body: std.Io.Writer.Allocating = .init(gpa);
     errdefer response_body.deinit();
 
-    const result = client.fetch(.{
+    const result = fetch(&client, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body.writer.buffered(),
@@ -172,6 +172,123 @@ pub fn postMultipart(
     };
 
     return .{ .status = result.status, .body = try response_body.toOwnedSlice() };
+}
+
+/// TCP keepalive timings for every request socket. A peer that vanishes
+/// without closing is given up on after IDLE + INTERVAL * PROBES = 120s.
+///
+/// What broke: on 2026-10-05 the bot logged nothing from 16:54 for fifteen
+/// hours -- no polls, no calendar refreshes, no reminders -- while the process
+/// sat asleep in the kernel's `wait_woken`, a blocking socket read.
+/// `std.http.Client` has no read timeout (the `timeout` in its connect options
+/// is declared and never used), so a connection that dies silently mid-poll
+/// is waited on forever. Linux's own keepalive defaults are 7200s idle, then
+/// 9 probes 75s apart, so it is effectively off.
+///
+/// Why keepalive and not a read timeout: a probe is answered by the peer's
+/// kernel, so a slow but live server -- Ollama thinking for a minute, a
+/// Telegram long poll -- is left alone, and only a dead one is dropped. The
+/// read then fails with ETIMEDOUT, which `std.Io` maps to `error.Timeout`, and
+/// the callers' existing retry paths take it from there. SO_RCVTIMEO would
+/// instead surface as EAGAIN, which `std.Io.Threaded`'s netReadPosix treats
+/// as an errno bug.
+///
+/// Option meanings and defaults from tcp(7) and socket(7):
+/// https://man7.org/linux/man-pages/man7/tcp.7.html
+/// https://man7.org/linux/man-pages/man7/socket.7.html
+/// A request already sent into a dead connection is covered by retransmission
+/// instead (tcp_retries2, "approximately between 13 to 30 minutes" per tcp(7)),
+/// which already ends in ETIMEDOUT; keepalive is for the idle wait after it.
+const KEEPALIVE_IDLE_SECONDS: i32 = 60;
+const KEEPALIVE_INTERVAL_SECONDS: i32 = 10;
+const KEEPALIVE_PROBES: i32 = 6;
+
+fn keepDeadPeersFromHanging(fd: std.posix.socket_t) !void {
+    const posix = std.posix;
+    const on: i32 = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on));
+    try posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, std.mem.asBytes(&KEEPALIVE_IDLE_SECONDS));
+    try posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&KEEPALIVE_INTERVAL_SECONDS));
+    try posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, std.mem.asBytes(&KEEPALIVE_PROBES));
+}
+
+/// `std.http.Client.fetch` from Zig 0.16 (lib/std/http/Client.zig), step for
+/// step, with one addition: keepalive on the socket once `request` has
+/// connected. `fetch` gives no way to reach the connection, and connecting
+/// by hand first would skip the CA bundle load that `request` does before it
+/// connects. Every call here makes a fresh Client, so every request gets a
+/// fresh socket and the setting is never missed through pooling. A redirect
+/// to another host would open a connection without it -- no worse than
+/// before, and none of the services Ronny calls redirects.
+fn fetch(client: *std.http.Client, options: std.http.Client.FetchOptions) std.http.Client.FetchError!std.http.Client.FetchResult {
+    const uri = switch (options.location) {
+        .url => |u| try std.Uri.parse(u),
+        .uri => |u| u,
+    };
+    const method: std.http.Method = options.method orelse
+        if (options.payload != null) .POST else .GET;
+
+    const redirect_behavior: std.http.Client.Request.RedirectBehavior = options.redirect_behavior orelse
+        if (options.payload == null) @enumFromInt(3) else .unhandled;
+
+    var req = try client.request(method, uri, .{
+        .redirect_behavior = redirect_behavior,
+        .headers = options.headers,
+        .extra_headers = options.extra_headers,
+        .privileged_headers = options.privileged_headers,
+        .keep_alive = options.keep_alive,
+    });
+    defer req.deinit();
+
+    // The one line that is not upstream. Best effort: a socket without
+    // keepalive is what every request had before, so it is not worth failing
+    // the request over.
+    keepDeadPeersFromHanging(req.connection.?.stream_reader.stream.socket.handle) catch |err| {
+        log.warn("could not enable keepalive on a request socket: {s}", .{@errorName(err)});
+    };
+
+    if (options.payload) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(payload);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    const redirect_buffer: []u8 = if (redirect_behavior == .unhandled) &.{} else options.redirect_buffer orelse
+        try client.allocator.alloc(u8, 8 * 1024);
+    defer if (options.redirect_buffer == null) client.allocator.free(redirect_buffer);
+
+    var response = try req.receiveHead(redirect_buffer);
+
+    const response_writer = options.response_writer orelse {
+        const reader = response.reader(&.{});
+        _ = reader.discardRemaining() catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+        };
+        return .{ .status = response.head.status };
+    };
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => options.decompress_buffer orelse try client.allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => options.decompress_buffer orelse try client.allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (options.decompress_buffer == null) client.allocator.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
+    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+
+    return .{ .status = response.head.status };
 }
 
 fn send(
@@ -189,7 +306,7 @@ fn send(
     var body: std.Io.Writer.Allocating = .init(gpa);
     errdefer body.deinit();
 
-    const result = client.fetch(.{
+    const result = fetch(&client, .{
         .location = .{ .url = url },
         .method = method,
         .payload = payload,
@@ -227,6 +344,37 @@ test "redact strips a telegram bot token from a url" {
         "http://127.0.0.1:11434/api/generate",
         redact("http://127.0.0.1:11434/api/generate"),
     );
+}
+
+test "a request socket notices a dead peer within minutes, not never" {
+    // The bot sat in a read for 15 hours (2026-10-05 16:54 onward, process
+    // asleep in wait_woken) because nothing on its sockets could time out.
+    // This checks the socket really carries the settings, read back from the
+    // kernel rather than trusted from the setsockopt calls.
+    const linux = std.os.linux;
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+    try std.testing.expect(linux.errno(rc) == .SUCCESS);
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    try keepDeadPeersFromHanging(fd);
+
+    const Expect = struct { level: i32, name: u32, want: i32 };
+    for ([_]Expect{
+        .{ .level = linux.SOL.SOCKET, .name = linux.SO.KEEPALIVE, .want = 1 },
+        .{ .level = linux.IPPROTO.TCP, .name = linux.TCP.KEEPIDLE, .want = KEEPALIVE_IDLE_SECONDS },
+        .{ .level = linux.IPPROTO.TCP, .name = linux.TCP.KEEPINTVL, .want = KEEPALIVE_INTERVAL_SECONDS },
+        .{ .level = linux.IPPROTO.TCP, .name = linux.TCP.KEEPCNT, .want = KEEPALIVE_PROBES },
+    }) |e| {
+        var value: i32 = 0;
+        var len: linux.socklen_t = @sizeOf(i32);
+        const got = linux.getsockopt(fd, e.level, e.name, @ptrCast(&value), &len);
+        try std.testing.expect(linux.errno(got) == .SUCCESS);
+        try std.testing.expectEqual(e.want, value);
+    }
+
+    // The whole point: a vanished peer is given up on in a few minutes.
+    try std.testing.expect(KEEPALIVE_IDLE_SECONDS + KEEPALIVE_INTERVAL_SECONDS * KEEPALIVE_PROBES <= 180);
 }
 
 test "multipart body framing" {
