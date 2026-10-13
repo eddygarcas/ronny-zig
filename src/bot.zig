@@ -1216,7 +1216,7 @@ pub const Bot = struct {
                 if (self.pending_removal != null and self.pending_removal.?.chosen != null) {
                     return "I'm not sure if that's a yes or a no, so I haven't removed anything. Reply 'yes' to remove it, or 'no' to keep it.";
                 }
-                return understood.reply;
+                return unknownReply(text);
             },
             .help => HELP_TEXT,
             .status => try self.statusText(arena),
@@ -3132,6 +3132,28 @@ test "a poll that fails once is logged in words the watchdog does not page on" {
     try std.testing.expect(watchdog_mod.classify("warning(bot): " ++ POLL_RETRY_MESSAGE) == null);
     // A failure that persists still uses the line that pages.
     try std.testing.expect(watchdog_mod.classify("error(bot): " ++ POLL_FAILED_MESSAGE) != null);
+}
+
+/// What a request Ronny did not recognise is answered with. Fixed text,
+/// never `understood.reply`: when Jev resolves to unknown, interpret skips
+/// the argument call (unknown is argless) and the reply is its default,
+/// "Got it." On 2026-10-12 that was the whole answer to three messages --
+/// including two asking to reschedule a meeting -- so the owner was told
+/// they had been understood while nothing happened. A model's own sentence
+/// for an unknown is no better: it describes an understanding that, by
+/// definition, was not reached.
+fn unknownReply(text: []const u8) []const u8 {
+    _ = text;
+    return "I didn't catch what you'd like me to do, so I haven't done anything. Try rewording it -- /help lists what I can do.";
+}
+
+test "a request that was not understood is not answered as if it were" {
+    // 2026-10-12: three messages Jev resolved to unknown were each answered
+    // "Got it." -- interpret's default acknowledgement -- and nothing else.
+    const reply = unknownReply("Are you up?");
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Got it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "didn't catch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "/help") != null);
 }
 
 test "only consecutive poll failures count as an outage" {
