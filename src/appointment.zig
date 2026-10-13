@@ -689,6 +689,32 @@ pub fn asksForGuests(text: []const u8) bool {
     return false;
 }
 
+/// Whether the request asks to move an entry to another day or time, which
+/// Ronny cannot do (gcal.zig adds, lists and removes; it never edits). On
+/// 2026-10-12, while "which one?" was open for a removal, "the tech
+/// meeting, move it to tomorrow" was name-matched as the pick and the owner
+/// was offered that meeting's *deletion*; the typed-yes gate held, and two
+/// rewordings then got no useful answer. Read by word matching, like the
+/// date. "reschedule" and "postpone" only ever mean this; "move" also
+/// moves mail, so it counts only next to a day or time read by findDay or
+/// findTime.
+pub fn asksToMove(now: Day, text: []const u8) bool {
+    const always = [_][]const u8{
+        "reschedule", "rescheduling", "rescheduled", "postpone", "postponing",
+        "postponed",  "reprogramar",  "reprograma",  "reprogramo", "aplazar",
+        "aplaza",     "posponer",     "pospón",      "pospon",
+    };
+    for (always) |word| {
+        if (findPhrase(text, word) != null) return true;
+    }
+    const move = [_][]const u8{ "move", "moving", "mover", "mueve", "muévela", "muevela", "muévelo", "muevelo" };
+    for (move) |word| {
+        if (findPhrase(text, word) == null) continue;
+        return findDay(now, text) != null or findTime(text) != null;
+    }
+    return false;
+}
+
 pub const Details = struct {
     title: []const u8,
     location: []const u8 = "",
@@ -1104,6 +1130,20 @@ test "a request to invite someone is noticed, so the preview can say it won't ha
     try std.testing.expect(!asksForGuests("add a meeting with Dana next thursday at 3pm"));
     try std.testing.expect(!asksForGuests("dentist tomorrow @ 9:30"));
     try std.testing.expect(!asksForGuests("For tomorrow, create an appointment from 9pm to 11pm, saying 'busy'."));
+}
+
+test "a request to move an entry is noticed, so it is not read as a removal" {
+    // The three shapes logged on 2026-10-12.
+    try std.testing.expect(asksToMove(NOW, "Actually, the tech meeting, move it to tomorrow at the same time."));
+    try std.testing.expect(asksToMove(NOW, "Reschedule the tech meeting that we have today at 12 and move it to tomorrow same time."));
+    try std.testing.expect(asksToMove(NOW, "Reschedule the tech meeting alignment till tomorrow at the same time."));
+    try std.testing.expect(asksToMove(NOW, "aplaza la reunión al jueves"));
+    try std.testing.expect(asksToMove(NOW, "postpone the dentist"));
+    // "move" alone is not about the calendar until it names a day or time.
+    try std.testing.expect(!asksToMove(NOW, "move that email to the archive"));
+    try std.testing.expect(!asksToMove(NOW, "remove the dentist on thursday"));
+    try std.testing.expect(!asksToMove(NOW, "the tech meeting"));
+    try std.testing.expect(!asksToMove(NOW, "2"));
 }
 
 test "a title the model made up is rejected, one from the request is kept" {

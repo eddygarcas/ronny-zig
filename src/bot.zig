@@ -1216,7 +1216,7 @@ pub const Bot = struct {
                 if (self.pending_removal != null and self.pending_removal.?.chosen != null) {
                     return "I'm not sure if that's a yes or a no, so I haven't removed anything. Reply 'yes' to remove it, or 'no' to keep it.";
                 }
-                return unknownReply(text);
+                return unknownReply(dates.today(), text);
             },
             .help => HELP_TEXT,
             .status => try self.statusText(arena),
@@ -1265,7 +1265,12 @@ pub const Bot = struct {
             .create_event => try self.doCreateEvent(arena, text),
             .connect_calendar => try self.doConnectCalendar(arena),
             .list_events => try self.doListEvents(arena, text),
-            .remove_event => try self.doRemoveEvent(arena, text),
+            // A move names an entry and a day, which is enough for the
+            // removal picker to offer the wrong thing: deletion.
+            .remove_event => if (appointment.asksToMove(dates.today(), text))
+                CANNOT_MOVE
+            else
+                try self.doRemoveEvent(arena, text),
         };
 
         if (std.mem.eql(u8, result, understood.reply)) return result;
@@ -2831,6 +2836,11 @@ pub const Bot = struct {
     /// The follow-up to "which one?": a number or a name. Null when the
     /// message is neither, so it is handled as a new request.
     fn chooseRemoval(self: *Bot, arena: std.mem.Allocator, text: []const u8) !?[]const u8 {
+        // "the tech meeting, move it to tomorrow" names an entry, and on
+        // 2026-10-12 was taken as the pick: the owner asked to move a
+        // meeting and was offered its deletion. A move is not a pick, so
+        // it goes on as a new request (see appointment.asksToMove).
+        if (appointment.asksToMove(dates.today(), text)) return null;
         const removal = &self.pending_removal.?;
         var chosen = appointment.pickByNumber(text, removal.entries.len);
         if (chosen == null) {
@@ -3134,6 +3144,9 @@ test "a poll that fails once is logged in words the watchdog does not page on" {
     try std.testing.expect(watchdog_mod.classify("error(bot): " ++ POLL_FAILED_MESSAGE) != null);
 }
 
+const CANNOT_MOVE = "I can't move or reschedule a calendar entry -- I can only add, list and remove them, so nothing has changed. " ++
+    "To move one, remove it (\"delete the dentist today\") and then add it again at the new time.";
+
 /// What a request Ronny did not recognise is answered with. Fixed text,
 /// never `understood.reply`: when Jev resolves to unknown, interpret skips
 /// the argument call (unknown is argless) and the reply is its default,
@@ -3142,18 +3155,29 @@ test "a poll that fails once is logged in words the watchdog does not page on" {
 /// they had been understood while nothing happened. A model's own sentence
 /// for an unknown is no better: it describes an understanding that, by
 /// definition, was not reached.
-fn unknownReply(text: []const u8) []const u8 {
-    _ = text;
+///
+/// A request to move a calendar entry gets its own answer: it is something
+/// the owner plainly meant and Ronny cannot do, and "reword it" only
+/// invites the rewordings logged that morning. Pointing at remove-then-add
+/// keeps both steps behind their own typed yes.
+fn unknownReply(today: dates.Day, text: []const u8) []const u8 {
+    if (appointment.asksToMove(today, text)) return CANNOT_MOVE;
     return "I didn't catch what you'd like me to do, so I haven't done anything. Try rewording it -- /help lists what I can do.";
 }
 
 test "a request that was not understood is not answered as if it were" {
     // 2026-10-12: three messages Jev resolved to unknown were each answered
     // "Got it." -- interpret's default acknowledgement -- and nothing else.
-    const reply = unknownReply("Are you up?");
+    const today: dates.Day = .{ .year = 2026, .month = 10, .day = 12 };
+    const reply = unknownReply(today, "Are you up?");
     try std.testing.expect(std.mem.indexOf(u8, reply, "Got it") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "didn't catch") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "/help") != null);
+
+    // The two reschedule requests from the same morning: say it can't be
+    // done, and what can.
+    const move = unknownReply(today, "Reschedule the tech meeting alignment till tomorrow at the same time.");
+    try std.testing.expect(std.mem.indexOf(u8, move, "can't move") != null);
 }
 
 test "only consecutive poll failures count as an outage" {
