@@ -43,6 +43,16 @@ const BURST_QUIET_SECONDS = 60;
 /// produces no error line, so nothing else here would ever notice it.
 const HEARTBEAT_TIMEOUT_SECONDS = 960;
 const HEARTBEAT_CHECK_SECONDS = 60;
+/// Silence is measured while the machine is awake, not across a suspend.
+/// `.boot` is CLOCK_BOOTTIME, which "includes any time that the system is
+/// suspended"; `.awake` is CLOCK_MONOTONIC, which "does not count time that
+/// the system is suspended" (clock_gettime(2),
+/// https://man7.org/linux/man-pages/man2/clock_gettime.2.html; the mapping
+/// is in std.Io.Clock). On 2026-10-14 the host slept from 23:27 to 07:12
+/// and the watchdog woke up to "gone silent for 466 min" -- a watcher that
+/// was frozen with it, not hung, and heartbeated four minutes later.
+/// Cooldowns stay on `.boot`: a night asleep rightly counts towards those.
+const HEARTBEAT_CLOCK: std.Io.Clock = .awake;
 pub const HEARTBEAT_MARKER = "heartbeat: watching INBOX";
 /// The end of the watcher's scan summary, shared with main.zig the same way.
 /// The heartbeat is only written when IDLE times out, so while mail keeps
@@ -152,7 +162,7 @@ pub const Watchdog = struct {
                 .token = cfg.telegram_token,
                 .owner_chat_id = cfg.telegram_owner_chat_id,
             },
-            .last_heartbeat_ns = std.Io.Clock.now(.boot, cfg.io).nanoseconds,
+            .last_heartbeat_ns = std.Io.Clock.now(HEARTBEAT_CLOCK, cfg.io).nanoseconds,
         };
     }
 
@@ -162,6 +172,11 @@ pub const Watchdog = struct {
 
     fn now(self: *Watchdog) i96 {
         return std.Io.Clock.now(.boot, self.cfg.io).nanoseconds;
+    }
+
+    /// Only for `last_heartbeat_ns`; see HEARTBEAT_CLOCK.
+    fn awakeNow(self: *Watchdog) i96 {
+        return std.Io.Clock.now(HEARTBEAT_CLOCK, self.cfg.io).nanoseconds;
     }
 
     fn remember(self: *Watchdog, line: []const u8) void {
@@ -190,7 +205,7 @@ pub const Watchdog = struct {
         // Any log line proves Ronny is alive, but only a heartbeat or a scan
         // proves the IMAP loop itself is still turning.
         if (provesWatchLoop(line)) {
-            self.last_heartbeat_ns = self.now();
+            self.last_heartbeat_ns = self.awakeNow();
             return;
         }
 
@@ -284,7 +299,7 @@ pub const Watchdog = struct {
     /// working without crashing -- a stuck socket, a wedged loop -- would
     /// produce no error and no alert. This runs on its own clock instead.
     fn checkHeartbeat(self: *Watchdog) void {
-        const quiet_seconds = @divTrunc(self.now() - self.last_heartbeat_ns, std.time.ns_per_s);
+        const quiet_seconds = @divTrunc(self.awakeNow() - self.last_heartbeat_ns, std.time.ns_per_s);
         if (quiet_seconds < HEARTBEAT_TIMEOUT_SECONDS) return;
 
         var arena_state: std.heap.ArenaAllocator = .init(self.cfg.gpa);
@@ -315,7 +330,7 @@ pub const Watchdog = struct {
 
         // Reset, so it reports again only after another full window rather
         // than on every check while it stays down.
-        self.last_heartbeat_ns = self.now();
+        self.last_heartbeat_ns = self.awakeNow();
     }
 
     fn unitIsActive(self: *Watchdog, unit: []const u8) bool {
@@ -453,6 +468,15 @@ test "a scan proves the watch loop is turning, the same as a heartbeat" {
     // Other lines only prove a process is up, not that the loop is.
     try std.testing.expect(!provesWatchLoop("info(gcal): refreshed the calendar access token"));
     try std.testing.expect(!provesWatchLoop("info(ronny): connecting to imap.gmail.com as someone"));
+}
+
+test "a night of suspend is not silence" {
+    // 2026-10-14 07:12: "gone silent for 466 min", sent the moment the host
+    // woke from a suspend that began at 23:27, 44 seconds after Ronny
+    // started. The watcher had been frozen along with everything else, and
+    // logged its heartbeat four minutes after waking. Silence has to be
+    // measured on a clock that stops while the machine sleeps.
+    try std.testing.expectEqual(std.Io.Clock.awake, HEARTBEAT_CLOCK);
 }
 
 test "the heartbeat marker is matched exactly as the watcher writes it" {
