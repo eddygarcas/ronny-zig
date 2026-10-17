@@ -92,6 +92,46 @@ const POLL_FAILED_MESSAGE = "poll failed ({s}) {d} times in a row; retrying in {
 fn pollFailureIsOutage(consecutive: u32) bool {
     return consecutive >= POLL_FAILURES_BEFORE_ERROR;
 }
+
+/// How long one turn of the bot loop may take before the process is ended
+/// and systemd starts a fresh one.
+///
+/// What broke: the boot at 21:09 on 2026-10-14 came up without a network
+/// ("NetworkUnreachable" on the first poll), the retry ten seconds later
+/// reached api.telegram.org, and the bot then logged nothing for ~58 hours --
+/// no polls, no "the listing is back", no 09:50 meeting reminder on 10-15 or
+/// 10-16. It was asleep in wait_woken on its only socket, ESTABLISHED to
+/// Telegram with empty queues and no keepalive timer. The keepalive in
+/// http.zig cannot reach that case: `std.http.Client.request` connects *and
+/// runs the TLS handshake* (connectTcpOptions -> Connection.Tls.create ->
+/// tls.Client.init, Zig 0.16 lib/std/http/Client.zig) before it returns,
+/// and both of those are private, so keepalive goes on only after a
+/// handshake that, here, never finished. Keepalive would also not help a
+/// server that is up but silent, and nothing else in the loop has a timeout.
+///
+/// So the loop arms alarm(2) at the top of every turn. "alarm() arranges for
+/// a SIGALRM signal to be delivered to the calling process in seconds
+/// seconds ... any previously set alarm() is canceled", and alarms "are not
+/// inherited by children created via fork(2)", so piper and ffmpeg are
+/// untouched (https://man7.org/linux/man-pages/man2/alarm.2.html). SIGALRM's
+/// default action is Term (https://man7.org/linux/man-pages/man7/signal.7.html),
+/// which ends a process even inside a blocking read; nothing in Ronny or
+/// std.Io.Threaded (which handles only SIGIO and SIGPIPE) installs a handler.
+/// The unit's Restart=on-failure restarts a service "terminated by a signal"
+/// other than SIGHUP, SIGINT, SIGTERM and SIGPIPE
+/// (https://man7.org/linux/man-pages/man5/systemd.service.5.html), and
+/// systemd's "Main process exited, code=killed, status=14/ALRM" is a line
+/// the watchdog already pages on, so the owner hears that it happened.
+///
+/// Fifteen minutes is far past a normal turn -- a 30s long poll plus at most
+/// a few model calls -- and turns a hang of hours or days into one restart.
+/// Cost of a false trip: a pending draft or calendar entry is forgotten and
+/// has to be asked for again. Nothing is sent by a restart.
+const STALL_GUARD_SECONDS: c_uint = 15 * 60;
+
+fn armStallGuard(seconds: c_uint) void {
+    _ = std.c.alarm(seconds);
+}
 /// The vocabulary costs an IMAP scan, so it is cached between voice notes.
 const VOCAB_TTL_SECONDS = 6 * 3600;
 const VOCAB_DAYS = 180;
@@ -426,6 +466,9 @@ pub const Bot = struct {
         log.info("telegram polling started", .{});
         var failed_polls: u32 = 0;
         while (true) {
+            // Re-armed every turn, so only a single turn that never returns
+            // trips it. See STALL_GUARD_SECONDS.
+            armStallGuard(STALL_GUARD_SECONDS);
             // Between polls rather than on a timer: a poll returns within
             // POLL_TIMEOUT_SECONDS whether or not anything was said, which
             // is as close to the minute as a reminder needs to be.
@@ -3178,6 +3221,53 @@ test "a request that was not understood is not answered as if it were" {
     // done, and what can.
     const move = unknownReply(today, "Reschedule the tech meeting alignment till tomorrow at the same time.");
     try std.testing.expect(std.mem.indexOf(u8, move, "can't move") != null);
+}
+
+test "a turn of the loop that never returns ends the process instead of hanging it" {
+    // 2026-10-14 21:09:55 to 2026-10-17: the bot sat ~58 hours in wait_woken
+    // on an established connection to api.telegram.org that never answered,
+    // logging nothing and missing two days of meeting reminders. Reproduced
+    // here as a read on a socket nobody will ever write to, in a child
+    // process so the guard's signal ends the child, not the test runner.
+    const linux = std.os.linux;
+    var pair: [2]i32 = undefined;
+    try std.testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair)) == .SUCCESS);
+    defer _ = linux.close(pair[0]);
+    defer _ = linux.close(pair[1]);
+
+    const forked = linux.fork();
+    try std.testing.expect(linux.errno(forked) == .SUCCESS);
+    if (forked == 0) {
+        // Child: raw syscalls only. alarm is async-signal-safe (signal-safety(7)).
+        armStallGuard(1);
+        var byte: [1]u8 = undefined;
+        _ = linux.read(pair[0], &byte, 1); // blocks: pair[1] is never written
+        linux.exit_group(0); // reached only if the guard did nothing
+    }
+    const child: linux.pid_t = @intCast(forked);
+
+    // Give the guard five times its budget, then stop waiting: a broken
+    // guard must fail this test, not hang the whole suite.
+    var status: u32 = 0;
+    var waited_ms: u32 = 0;
+    while (true) {
+        const got = linux.waitpid(child, &status, linux.W.NOHANG);
+        if (got == forked) break;
+        if (waited_ms >= 5000) {
+            _ = linux.kill(child, .KILL);
+            _ = linux.waitpid(child, &status, 0);
+            return error.StillBlockedAfterTheGuard;
+        }
+        const tick: linux.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&tick, null);
+        waited_ms += 50;
+    }
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(linux.SIG.ALRM, linux.W.TERMSIG(status));
+
+    // Generous against a slow turn (a model call, a long voice note), and
+    // short against the 15h and 58h hangs seen so far.
+    try std.testing.expect(STALL_GUARD_SECONDS > 5 * 60 and STALL_GUARD_SECONDS <= 30 * 60);
 }
 
 test "only consecutive poll failures count as an outage" {
