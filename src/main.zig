@@ -70,6 +70,18 @@ const MIN_ROUTINE_CONNECTION_SECONDS = 60;
 /// a test in this file holds it to that.
 const RECONNECT_MESSAGE = "mailbox connection lost ({s}); reconnecting in {d}s";
 
+/// How many times the watcher waits for the mail host to resolve before its
+/// first connection, RECONNECT_DELAY_SECONDS apart. At boot the unit can start
+/// before DNS works; between 2026-10-10 and 10-20 that was five crashes, each
+/// a page, each followed by systemd reconnecting cleanly 15s later. A minute
+/// covers every one of them; after it the connection is tried anyway and
+/// fails the old way, so a real outage still reaches the owner.
+const STARTUP_NETWORK_WAITS = 4;
+/// Worded, like RECONNECT_MESSAGE, to match no incident needle.
+const NETWORK_WAIT_MESSAGE = "{s} does not resolve yet, likely the network still coming up; waiting {d}s";
+
+extern fn ronny_host_resolves(host: [*:0]const u8) c_int;
+
 fn dropIsRoutine(opened_at_ns: i96, now_ns: i96) bool {
     return now_ns - opened_at_ns >= @as(i96, MIN_ROUTINE_CONNECTION_SECONDS) * std.time.ns_per_s;
 }
@@ -303,6 +315,7 @@ fn runWatcher(init: std.process.Init) !void {
     var state = state_mod.State.load(init.io, arena, state_path);
 
     const mailbox: Mailbox = .{ .io = init.io, .host = host, .user = user, .password = password };
+    try mailbox.awaitNetwork();
     var session = try mailbox.open(&state);
     defer session.deinit();
     var opened_at = std.Io.Clock.now(.boot, init.io).nanoseconds;
@@ -386,6 +399,17 @@ const Mailbox = struct {
         // watches from now instead of replaying 50k messages.
         try state.syncUidValidity(selection.uid_validity, selection.uid_next -| 1);
         return session;
+    }
+
+    /// Waits, quietly, until the host resolves or STARTUP_NETWORK_WAITS run
+    /// out. Only before the first connection: a drop later on is the
+    /// reconnect's business, with its own rules.
+    fn awaitNetwork(self: Mailbox) !void {
+        var waits: u32 = 0;
+        while (ronny_host_resolves(self.host.ptr) == 0 and waits < STARTUP_NETWORK_WAITS) : (waits += 1) {
+            log.warn(NETWORK_WAIT_MESSAGE, .{ self.host, RECONNECT_DELAY_SECONDS });
+            try self.io.sleep(.fromNanoseconds(RECONNECT_DELAY_SECONDS * std.time.ns_per_s), .awake);
+        }
     }
 
     /// Replaces `session` with a new connection and returns when it opened.
@@ -562,6 +586,7 @@ test "a routine connection drop is logged in words the watchdog does not page on
     // returned 4", "IDLE failed: Idle", and each one paged the owner. The
     // reconnect is what Ronny does about it now, so its lines must not.
     try std.testing.expect(watchdog_mod.classify("warning(ronny): " ++ RECONNECT_MESSAGE) == null);
+    try std.testing.expect(watchdog_mod.classify("warning(ronny): " ++ NETWORK_WAIT_MESSAGE) == null);
     try std.testing.expect(watchdog_mod.classify("warning(imap): " ++ imap.IDLE_START_FAILED) == null);
     // A drop that is not routine still reaches the owner as before.
     try std.testing.expect(watchdog_mod.classify("error(ronny): IDLE failed: Idle") != null);
@@ -605,4 +630,10 @@ test {
     _ = appointment;
     _ = reminders;
     _ = mailer;
+}
+
+test "the startup network check resolves a name the machine knows, and not one nobody can" {
+    try std.testing.expect(ronny_host_resolves("localhost") != 0);
+    // .invalid is reserved never to resolve (RFC 2606 section 2).
+    try std.testing.expect(ronny_host_resolves("ronny.invalid") == 0);
 }

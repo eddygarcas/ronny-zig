@@ -139,6 +139,15 @@ replaying the whole mailbox.
 unreachable, rather than silently dropping real mail. Losing mail is a worse
 failure than one extra notification.
 
+**`STARTUP_NETWORK_WAITS = 4`, 15s apart, before the first connection.**
+Omarchy masks `NetworkManager-wait-online`, so `network-online.target` is
+reached before DNS works and the unit's `After=` does not hold. Between
+2026-10-10 and 10-20 the watcher crashed at boot five times on that, each a
+watchdog page, each followed by a clean connection when systemd restarted it
+15s later. The wait is a minute, quietly, and only while the host does not
+resolve; after it the connection is tried anyway and fails as it always did,
+so a real outage still pages.
+
 **Only matched mail is fully fetched**; scanning stays on envelopes. This is
 what stops a 50k-message mailbox pulling 50k bodies.
 

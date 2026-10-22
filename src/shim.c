@@ -22,6 +22,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stddef.h>
+#include <netdb.h>
 
 /* ---- local time ---- */
 
@@ -76,6 +77,20 @@ int ronny_local_minutes(void) {
     struct tm local;
     if (localtime_r(&now, &local) == NULL) return -1;
     return local.tm_hour * 60 + local.tm_min;
+}
+
+/* Whether `host` resolves yet, by the same lookup libetpan's connect does.
+ * The watcher asks before its first connection: Omarchy masks
+ * NetworkManager-wait-online, so network-online.target is reached before
+ * DNS works and a unit ordered after it can still start too early. */
+int ronny_host_resolves(const char *host) {
+    struct addrinfo hints;
+    struct addrinfo *found = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(host, NULL, &hints, &found);
+    if (found != NULL) freeaddrinfo(found);
+    return rc == 0;
 }
 
 /* ---- selection info (hidden behind bitfields) ---- */
