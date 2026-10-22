@@ -148,6 +148,15 @@ watchdog page, each followed by a clean connection when systemd restarted it
 resolve; after it the connection is tried anyway and fails as it always did,
 so a real outage still pages.
 
+**`MAX_QUICK_RECONNECTS = 1`.** A connection that dies within
+`MIN_ROUTINE_CONNECTION_SECONDS` (60s) of opening is not Gmail's routine
+drop, and used to exit and page at once. On 2026-10-21 a reconnect lasted
+48s and paged, and systemd's restart 15s later held; about twice a week.
+One young death in a row is now reconnected in-process; a second still
+exits and pages, so a connection that cannot stay up reaches the owner
+within about two and a half minutes. A connection that outlives the minute clears the
+count.
+
 **Only matched mail is fully fetched**; scanning stays on envelopes. This is
 what stops a 50k-message mailbox pulling 50k bodies.
 

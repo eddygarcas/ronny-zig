@@ -61,9 +61,9 @@ const IDLE_TIMEOUT_SECONDS = 300;
 /// restarts reconnected cleanly after it.
 const RECONNECT_DELAY_SECONDS = 15;
 /// A connection that dies sooner than this after opening is not the routine
-/// drop, and is left to fail the old way -- an error line, an exit, systemd
-/// and the watchdog -- so a real fault still reaches the owner and a
-/// reconnect can never repeat faster than once a minute. The shortest-lived
+/// drop. Past MAX_QUICK_RECONNECTS in a row it is left to fail the old way --
+/// an error line, an exit, systemd and the watchdog -- so a real fault still
+/// reaches the owner. The shortest-lived
 /// connection in that day's log lasted 2m17s.
 const MIN_ROUTINE_CONNECTION_SECONDS = 60;
 /// Deliberately worded to match none of watchdog.zig's incident needles;
@@ -85,6 +85,34 @@ extern fn ronny_host_resolves(host: [*:0]const u8) c_int;
 fn dropIsRoutine(opened_at_ns: i96, now_ns: i96) bool {
     return now_ns - opened_at_ns >= @as(i96, MIN_ROUTINE_CONNECTION_SECONDS) * std.time.ns_per_s;
 }
+
+/// How many connections in a row may die young and still be reconnected
+/// in-process. On 2026-10-21 Gmail dropped a connection, the reconnect
+/// lasted 48s, and the watcher exited and paged; systemd's restart 15s later
+/// then held. That was about twice in a week, each time a glitch that one
+/// more try got past. A second young death in a row still fails the old way,
+/// so a connection that cannot stay up still reaches the owner within about
+/// two and a half minutes, and reconnects stay at most one per 15s.
+const MAX_QUICK_RECONNECTS = 1;
+
+/// Whether a lost connection is reopened in-process or left to fail, exit
+/// and page. A connection that lived past MIN_ROUTINE_CONNECTION_SECONDS is
+/// Gmail's housekeeping and always reopened, which also clears the count.
+const DropPolicy = struct {
+    quick_reconnects: u32 = 0,
+
+    fn reconnects(self: *DropPolicy, opened_at_ns: i96, now_ns: i96) bool {
+        if (dropIsRoutine(opened_at_ns, now_ns)) {
+            self.quick_reconnects = 0;
+            return true;
+        }
+        if (self.quick_reconnects < MAX_QUICK_RECONNECTS) {
+            self.quick_reconnects += 1;
+            return true;
+        }
+        return false;
+    }
+};
 
 const ConfigError = error{MissingEnvironmentVariable};
 
@@ -323,6 +351,7 @@ fn runWatcher(init: std.process.Init) !void {
 
     var buffer: [MAX_NEW_PER_SCAN]imap.Envelope = undefined;
     var was_quiet = false;
+    var drops: DropPolicy = .{};
     while (true) {
         // Quiet hours stop the *scan*, not the notification. The watermark
         // stays where it is, so nothing is consumed and marked seen, and
@@ -347,11 +376,12 @@ fn runWatcher(init: std.process.Init) !void {
         //
         // A dropped connection shows up here first: IDLE wakes on the closed
         // socket and the fetch that follows fails. So a failed scan on a
-        // connection that has been up a while reconnects and scans once more,
-        // and only a failure on the fresh connection is reported as an error.
+        // connection that has been up a while, or the first one in a row to
+        // die young, reconnects and scans once more; only a failure on the
+        // fresh connection is reported as an error (DropPolicy).
         // The watermark only moves on success, so nothing is skipped.
         if (!quiet) scanOnce(cfg, &session, &controller, &state, &buffer) catch |err| {
-            if (dropIsRoutine(opened_at, std.Io.Clock.now(.boot, init.io).nanoseconds)) {
+            if (drops.reconnects(opened_at, std.Io.Clock.now(.boot, init.io).nanoseconds)) {
                 opened_at = try mailbox.reopen(&session, &state, err);
                 scanOnce(cfg, &session, &controller, &state, &buffer) catch |again| {
                     log.err("scan failed: {s}", .{@errorName(again)});
@@ -362,7 +392,7 @@ fn runWatcher(init: std.process.Init) !void {
         };
 
         const woke = session.idleWait(IDLE_TIMEOUT_SECONDS) catch |err| {
-            if (!dropIsRoutine(opened_at, std.Io.Clock.now(.boot, init.io).nanoseconds)) {
+            if (!drops.reconnects(opened_at, std.Io.Clock.now(.boot, init.io).nanoseconds)) {
                 log.err("IDLE failed: {s}", .{@errorName(err)});
                 return err;
             }
@@ -601,6 +631,24 @@ test "only a connection that has been up a while counts as a routine drop" {
     // One that dies right after opening is not Gmail's housekeeping, and
     // reconnecting it in-process would only hide the fault.
     try std.testing.expect(!dropIsRoutine(0, 20 * s));
+}
+
+test "one young connection death in a row is reconnected, a second is not" {
+    const s = std.time.ns_per_s;
+    var drops: DropPolicy = .{};
+    // 2026-10-21: a routine drop, then the new connection died after 48s.
+    try std.testing.expect(drops.reconnects(0, 6 * 3600 * s));
+    try std.testing.expect(drops.reconnects(0, 48 * s));
+    // Dying young again straight after is a connection that cannot stay up.
+    try std.testing.expect(!drops.reconnects(0, 20 * s));
+
+    // A connection that lasts clears the count, so a later glitch gets its
+    // own spare reconnect.
+    drops = .{};
+    try std.testing.expect(drops.reconnects(0, 48 * s));
+    try std.testing.expect(drops.reconnects(0, 3600 * s));
+    try std.testing.expect(drops.reconnects(0, 30 * s));
+    try std.testing.expect(!drops.reconnects(0, 30 * s));
 }
 
 test {
