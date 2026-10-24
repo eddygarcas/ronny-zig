@@ -698,6 +698,37 @@ pub fn asksForGuests(text: []const u8) bool {
 /// date. "reschedule" and "postpone" only ever mean this; "move" also
 /// moves mail, so it counts only next to a day or time read by findDay or
 /// findTime.
+/// Whether the request asks to accept or decline an invitation, which Ronny
+/// cannot do: gcal.zig adds, lists and removes the owner's own entries and
+/// never touches attendees, and answering an invitation is a reply to its
+/// organiser. On 2026-10-23 three requests to accept one -- two typed, one
+/// spoken -- each resolved to unknown and were told to reword, which is what
+/// the second and third were. Read by word matching, like asksToMove: an
+/// answer word only counts next to a word for what is being answered, so
+/// "accept the terms in that email" is left alone.
+pub fn asksToAnswerInvitation(text: []const u8) bool {
+    const answers = [_][]const u8{
+        "accept",  "accepts",   "decline", "declines", "rsvp",
+        "acepta",  "aceptar",   "acéptala", "aceptala", "rechaza",
+        "rechazar", "recházala", "rechazala",
+    };
+    const things = [_][]const u8{
+        "invitation", "invitations", "invite",     "invites",    "meeting",
+        "meetings",   "event",       "events",     "call",       "calendar",
+        "offsite",    "invitación",  "invitacion", "reunión",    "reunion",
+        "evento",     "llamada",     "calendario",
+    };
+    var answered = false;
+    for (answers) |word| {
+        if (findPhrase(text, word) != null) answered = true;
+    }
+    if (!answered) return false;
+    for (things) |word| {
+        if (findPhrase(text, word) != null) return true;
+    }
+    return false;
+}
+
 pub fn asksToMove(now: Day, text: []const u8) bool {
     const always = [_][]const u8{
         "reschedule", "rescheduling", "rescheduled", "postpone", "postponing",
@@ -1144,6 +1175,22 @@ test "a request to move an entry is noticed, so it is not read as a removal" {
     try std.testing.expect(!asksToMove(NOW, "remove the dentist on thursday"));
     try std.testing.expect(!asksToMove(NOW, "the tech meeting"));
     try std.testing.expect(!asksToMove(NOW, "2"));
+}
+
+test "a request to answer an invitation is noticed, so it is not told to reword" {
+    // The three shapes logged on 2026-10-23, two typed and one spoken, each
+    // resolved to unknown; the name is changed.
+    try std.testing.expect(asksToAnswerInvitation("Accept Dana invitation for the strat meeting"));
+    try std.testing.expect(asksToAnswerInvitation("Accept the strategic planning meeting with Dana"));
+    try std.testing.expect(asksToAnswerInvitation("Accept the meeting that Dana is placing my calendar for today at 3pm."));
+    try std.testing.expect(asksToAnswerInvitation("decline the invite from Sam"));
+    try std.testing.expect(asksToAnswerInvitation("RSVP yes to the offsite"));
+    try std.testing.expect(asksToAnswerInvitation("acepta la invitación de la reunión"));
+    // An answer word alone, or a calendar word alone, is something else.
+    try std.testing.expect(!asksToAnswerInvitation("accept"));
+    try std.testing.expect(!asksToAnswerInvitation("accept the terms in that email"));
+    try std.testing.expect(!asksToAnswerInvitation("add a meeting with Dana tomorrow at 3pm"));
+    try std.testing.expect(!asksToAnswerInvitation("what meetings do I have today"));
 }
 
 test "a title the model made up is rejected, one from the request is kept" {

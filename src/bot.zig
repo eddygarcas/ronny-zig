@@ -3190,6 +3190,9 @@ test "a poll that fails once is logged in words the watchdog does not page on" {
 const CANNOT_MOVE = "I can't move or reschedule a calendar entry -- I can only add, list and remove them, so nothing has changed. " ++
     "To move one, remove it (\"delete the dentist today\") and then add it again at the new time.";
 
+const CANNOT_ANSWER_INVITATION = "I can't accept or decline a meeting invitation -- I can only add, list and remove your own calendar entries, so nothing has changed. " ++
+    "Answer it from your calendar app or the invitation itself.";
+
 /// What a request Ronny did not recognise is answered with. Fixed text,
 /// never `understood.reply`: when Jev resolves to unknown, interpret skips
 /// the argument call (unknown is argless) and the reply is its default,
@@ -3203,8 +3206,14 @@ const CANNOT_MOVE = "I can't move or reschedule a calendar entry -- I can only a
 /// the owner plainly meant and Ronny cannot do, and "reword it" only
 /// invites the rewordings logged that morning. Pointing at remove-then-add
 /// keeps both steps behind their own typed yes.
+///
+/// A request to accept or decline an invitation is the same case: on
+/// 2026-10-23 one was asked three ways in a minute and each got "reword
+/// it". Answering an invitation replies to its organiser, so it stays
+/// outside what Ronny can do (see appointment.asksToAnswerInvitation).
 fn unknownReply(today: dates.Day, text: []const u8) []const u8 {
     if (appointment.asksToMove(today, text)) return CANNOT_MOVE;
+    if (appointment.asksToAnswerInvitation(text)) return CANNOT_ANSWER_INVITATION;
     return "I didn't catch what you'd like me to do, so I haven't done anything. Try rewording it -- /help lists what I can do.";
 }
 
@@ -3221,6 +3230,12 @@ test "a request that was not understood is not answered as if it were" {
     // done, and what can.
     const move = unknownReply(today, "Reschedule the tech meeting alignment till tomorrow at the same time.");
     try std.testing.expect(std.mem.indexOf(u8, move, "can't move") != null);
+
+    // 2026-10-23: three requests to accept a meeting invitation, the second
+    // and third rewordings of the first. Say it can't be done.
+    const accept = unknownReply(today, "Accept the strategic planning meeting with Dana");
+    try std.testing.expect(std.mem.indexOf(u8, accept, "can't accept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accept, "rewording") == null);
 }
 
 test "a turn of the loop that never returns ends the process instead of hanging it" {
