@@ -154,7 +154,8 @@ particular build, so changing the card is changing the link.
 
 whisper.cpp also has a Vulkan backend (`GGML_VULKAN`), which runs on NVIDIA
 and AMD alike. It needs `vulkan-headers` and `shaderc` (for `glslc`) to
-build, and a Vulkan driver to run: `nvidia-utils` on NVIDIA, `vulkan-radeon`
+build, plus `spirv-headers` (the Vulkan backend's cmake stops without it),
+and a Vulkan driver to run: `nvidia-utils` on NVIDIA, `vulkan-radeon`
 on AMD. Same tag and rpath flags as the CUDA build, into its own prefix:
 
 ```
@@ -167,7 +168,12 @@ cmake -B build-vulkan \
 cmake --build build-vulkan -j && cmake --install build-vulkan
 ```
 
-The backend then logs as `Vulkan0` rather than `CUDA0`. HIP/ROCm
+The backend then logs as `Vulkan0` rather than `CUDA0`. On the RTX 3060
+(2026-11, v1.9.3, medium model, `samples/jfk.wav`) it gave the same
+transcript as CUDA in 2.4s against CUDA's 1.2s, model load included. The
+very first run took 57s: the driver compiles the shaders once and caches
+them under `~/.cache`, which the services have because they run as the
+owner. Expect that one slow voice note after the first start on a new card. HIP/ROCm
 (`GGML_HIP`) is the other AMD route; Vulkan was chosen because it can be
 built and tested on the NVIDIA card before the AMD one goes in.
 
