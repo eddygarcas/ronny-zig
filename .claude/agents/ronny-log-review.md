@@ -37,7 +37,8 @@ Look for:
   improvements, because they are what the owner actually tried.
 - **Misroutings**: the action Jev chose next to what the owner plainly meant.
 - **Anything slow**: a step that took far longer than its neighbours.
-- **The deploy check**: `whisper backend` must say CUDA0, not CPU. The
+- **The deploy check**: `whisper backend` must name a GPU (CUDA0, Vulkan0,
+  ROCm0), never CPU; on the CPU Ronny warns "whisper is running on CPU". The
   running binary is `zig-out/bin/ronny` in the main checkout, not this one;
   report a CPU backend, do not try to rebuild it.
 - **Silence**: the watcher logs a heartbeat; a long gap means it hung.
@@ -86,8 +87,8 @@ Rules that come from this project's own mistakes:
 Always both flags. A plain `zig build` links a CPU-only whisper:
 
 ```
-zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
-zig build test -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
+zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper"
+zig build test -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper"
 ```
 
 The test step can print "failed command" even when everything passed; the

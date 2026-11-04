@@ -549,12 +549,18 @@ PATH=/opt/cuda/bin:$PATH cmake -B build \
   -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/whisper-cuda"
 cmake --build build -j && cmake --install build
+ln -sfn whisper-cuda "$HOME/.local/opt/whisper"
 ```
+
+`~/.local/opt/whisper` is a link to the build for the card you have, and
+everything else names the link. An AMD card, or any card, can use a Vulkan
+build instead; that recipe, and what to do when the card changes, are in
+[docs/toolchain.md](docs/toolchain.md).
 
 Then point the build at it, and download a model:
 
 ```
-zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
+zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper"
 mkdir -p models && curl -L -o models/ggml-medium.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin
 ```
@@ -711,7 +717,7 @@ Other things worth knowing:
   regex.
 - **The bot token is a credential.** Anyone holding it can impersonate the
   bot; ownership is enforced only by Telegram chat id.
-- **A CUDA whisper build lives outside your package manager**, so upgrades
+- **A GPU whisper build lives outside your package manager**, so upgrades
   will neither break it nor update it. If the API drifts far enough that
   `src/whisper_shim.c` stops compiling, rebuild from a newer tag.
 

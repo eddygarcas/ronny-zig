@@ -49,7 +49,7 @@ notify() {
 tests_pass() {
     local out
     out="$(cd "$worktree" && zig build test -Doptimize=ReleaseSafe \
-        -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda" 2>&1)"
+        -Dwhisper-prefix="$HOME/.local/opt/whisper" 2>&1)"
     # The wrapper can say "failed command" when everything passed; the run
     # line is what counts.
     grep -Eq 'run test [0-9]+ pass \([0-9]+ total\)' <<< "$out" &&
@@ -125,7 +125,9 @@ deploy() {
             unhealthy="the watcher never opened the inbox"
         [ -z "$unhealthy" ] && ! grep -q 'watchdog started' <<< "$after" &&
             unhealthy="the watchdog never started"
-        if [ -z "$unhealthy" ] && grep 'whisper backend' <<< "$after" | grep -qv CUDA; then
+        # "not the CPU" rather than "CUDA": the GPU backend's name changes
+        # with the card (CUDA0 on NVIDIA, Vulkan0 or ROCm0 on AMD).
+        if [ -z "$unhealthy" ] && grep 'whisper' <<< "$after" | grep -q 'running on CPU'; then
             unhealthy="whisper came up on the CPU"
         fi
     fi

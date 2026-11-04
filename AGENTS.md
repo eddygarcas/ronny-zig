@@ -106,15 +106,15 @@ relinks against the distro's CPU-only whisper in `/usr/lib`, which loads
 fine, transcribes fine, and is ~150x slower:
 
 ```
-zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
+zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper"
 ```
 
 This has regressed twice, the second time from routine rebuilds during an
 unrelated feature. Two ways to tell which one you have:
 
 ```
-readelf -d zig-out/bin/ronny | grep RUNPATH     # must name whisper-cuda/lib
-journalctl -u ronny-bot | grep "whisper backend" # must say CUDA0, not CPU
+readelf -d zig-out/bin/ronny | grep RUNPATH     # must name .local/opt/whisper/lib
+journalctl -u ronny-bot | grep "whisper backend" # must name a GPU, not CPU
 ```
 
 Ronny logs a warning naming this command when it starts on CPU, so the

@@ -55,7 +55,7 @@ pub fn load(model_path: [:0]const u8) Error!void {
     if (written > 0 and std.mem.startsWith(u8, backend, "CPU")) {
         log.warn(
             "whisper is running on {s}, not the GPU -- transcription will be very slow. " ++
-                "Rebuild with: zig build -Doptimize=ReleaseSafe -Dwhisper-prefix=\"$HOME/.local/opt/whisper-cuda\"",
+                "Rebuild with: zig build -Doptimize=ReleaseSafe -Dwhisper-prefix=\"$HOME/.local/opt/whisper\"",
             .{backend},
         );
     } else {

@@ -46,7 +46,11 @@ pub fn build(b: *std.Build) void {
     // Zig or C code changes, because ggml loads its backends by dlopen at
     // runtime and simply picks the best one it finds.
     //
-    //   zig build -Dwhisper-prefix=$HOME/.local/opt/whisper-cuda
+    //   zig build -Dwhisper-prefix=$HOME/.local/opt/whisper
+    //
+    // That path is a link to the build for the card in the machine
+    // (whisper-cuda, whisper-vulkan), so a GPU swap changes the link, not
+    // every command that names it. See docs/toolchain.md.
     //
     // Unset, the system package is used, which still works -- just slowly.
     const whisper_prefix = b.option(

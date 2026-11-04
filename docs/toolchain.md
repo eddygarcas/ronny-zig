@@ -146,6 +146,54 @@ trip to discover:
   against the API it was written for.
 - **`CMAKE_CUDA_ARCHITECTURES`** set to just the card you have.
 
+The build Ronny uses is whatever `~/.local/opt/whisper` links to. Every
+command, `restart.sh`, the log review and the docs name the link, never a
+particular build, so changing the card is changing the link.
+
+### Vulkan, for an AMD card (or any card)
+
+whisper.cpp also has a Vulkan backend (`GGML_VULKAN`), which runs on NVIDIA
+and AMD alike. It needs `vulkan-headers` and `shaderc` (for `glslc`) to
+build, and a Vulkan driver to run: `nvidia-utils` on NVIDIA, `vulkan-radeon`
+on AMD. Same tag and rpath flags as the CUDA build, into its own prefix:
+
+```
+cd whisper.cpp
+cmake -B build-vulkan \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON \
+  -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_TESTS=OFF \
+  -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local/opt/whisper-vulkan"
+cmake --build build-vulkan -j && cmake --install build-vulkan
+```
+
+The backend then logs as `Vulkan0` rather than `CUDA0`. HIP/ROCm
+(`GGML_HIP`) is the other AMD route; Vulkan was chosen because it can be
+built and tested on the NVIDIA card before the AMD one goes in.
+
+### Changing the GPU
+
+The checks look for "not the CPU", not for a vendor: Ronny warns `whisper is
+running on CPU` when no GPU backend loaded, `restart.sh` checks the binary
+links `~/.local/opt/whisper/lib`, and the log review's deploy rolls back on
+that warning. What has to change is outside the repo:
+
+1. **Before**, on the old card: build the backend for the new one (above)
+   and check it with the old card if it can (Vulkan can).
+2. **Drivers.** Swapping NVIDIA for AMD on this machine: `vulkan-radeon`
+   in, and the NVIDIA early-load out of the initramfs
+   (`/etc/mkinitcpio.conf.d/nvidia.conf`, then `mkinitcpio -P`).
+   `nvidia-open-dkms` and friends can go once the AMD card works.
+3. **Ollama.** `ollama-rocm` (or `ollama-vulkan`) in, `ollama-cuda` out,
+   then `systemctl restart ollama`. `ollama ps` after a generation must say
+   `100% GPU`; a CPU figure means the backend did not load.
+4. **whisper.** `ln -sfn whisper-vulkan ~/.local/opt/whisper`, then
+   `./restart.sh --build`. The journal must say `whisper backend: Vulkan0`.
+5. **Measure.** Send a voice note: the journal's `transcribed ... x real
+   time` was about 0.07x on the 3060 with CUDA (10.5s of audio in 784ms,
+   2026-10). `zig build probe` times the summaries. Both give the next
+   decision about models numbers to stand on.
+
 ## Host-specific: piper for voice summaries
 
 Text-to-speech is not linked at all. `src/speech.zig` spawns the `piper`

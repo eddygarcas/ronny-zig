@@ -25,10 +25,10 @@ if $follow; then sudo=(sudo); else sudo=(sudo -n); fi
 
 if $build; then
     # Both flags, always: a plain build links a CPU-only whisper. See AGENTS.md.
-    zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper-cuda"
+    zig build -Doptimize=ReleaseSafe -Dwhisper-prefix="$HOME/.local/opt/whisper"
 fi
-if ! readelf -d zig-out/bin/ronny | grep -q 'whisper-cuda'; then
-    echo "zig-out/bin/ronny is not linked against whisper-cuda; run ./restart.sh --build" >&2
+if ! readelf -d zig-out/bin/ronny | grep -q '/\.local/opt/whisper/lib'; then
+    echo "zig-out/bin/ronny is not linked against ~/.local/opt/whisper; run ./restart.sh --build" >&2
     exit 1
 fi
 
