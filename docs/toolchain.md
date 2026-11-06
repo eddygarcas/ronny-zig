@@ -177,6 +177,31 @@ owner. Expect that one slow voice note after the first start on a new card. HIP/
 (`GGML_HIP`) is the other AMD route; Vulkan was chosen because it can be
 built and tested on the NVIDIA card before the AMD one goes in.
 
+### Adding a second card (planned, 2026-11)
+
+The RX 7700 XT joins the RTX 3060 rather than replacing it: an eGPU dock
+over OCuLink, from a PCIe x1 adapter (3.0 x1, about 1 GB/s). Each card runs
+its own models; nothing is split across them, which that link is too narrow
+for. The 3060 keeps Ronny: whisper stays on the CUDA build, so the
+`~/.local/opt/whisper` link does not change, and `qwen2.5` stays on it. The
+7700 XT takes the coding models.
+
+To check on the day, none of it verified yet:
+
+1. `lspci` shows both cards, and `lspci -vv` the AMD one's link at 8GT/s x1.
+2. `vulkan-radeon` is installed already. Add `ollama-rocm` (or
+   `ollama-vulkan`) beside `ollama-cuda`, keeping the NVIDIA packages and
+   the initramfs early-load as they are.
+3. Which card a model lands on: Ollama puts a model that fits on one GPU on
+   a single GPU (docs.ollama.com/faq), but the docs do not say which, nor
+   whether CUDA and ROCm cards are used together. The deterministic way is
+   two Ollama instances, one per card (`CUDA_VISIBLE_DEVICES`,
+   `ROCR_VISIBLE_DEVICES`), on different ports, with Ronny's `OLLAMA_URL`
+   on the 3060's.
+4. Loading is bounded by the SATA SSD under `/var/lib/ollama` (~0.5 GB/s),
+   which is slower than the x1 link; models already in the page cache
+   reload over the link at about 1 GB/s.
+
 ### Changing the GPU
 
 The checks look for "not the CPU", not for a vendor: Ronny warns `whisper is
