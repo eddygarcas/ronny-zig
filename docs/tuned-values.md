@@ -53,6 +53,12 @@ how many requests a day go to Google for an idle calendar (under 500, against
 a default quota in the millions). Three minutes is short next to a ten-minute
 lead and long next to a poll.
 
+**`REMINDER_RETRY_SECONDS` (30)** is the same refresh after a listing
+*failed*. On 2026-11-12 every boot's first listing failed before the network
+was up and waited the full three minutes, and a reminder went out 8 minutes
+ahead instead of 10. One long poll is soon enough, and still not a request on
+every 10s poll retry during an outage.
+
 **`DEFAULT_REMINDER_MINUTES` (10)** in `src/settings.zig` is what the owner
 asked for. It is a setting, so the number matters less than the fact that
 switching reminders off keeps it: "turn them back on" restores the lead

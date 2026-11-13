@@ -71,6 +71,25 @@ pub const PENDING_REMOVAL_TTL_SECONDS = 600;
 /// bounds how close to its start a new meeting can be and still get its
 /// reminder: closer than this and the reminder may go late or not at all.
 pub const REMINDER_REFRESH_SECONDS = 180;
+
+/// How soon a listing that *failed* is tried again.
+///
+/// What broke: on 2026-11-12 the host booted five times in an hour, and each
+/// time the first listing failed (NetworkUnreachable / NameServerFailure, the
+/// network not up yet) and the next came the full REMINDER_REFRESH_SECONDS
+/// later. After the 16:19 boot that left a 16:30 meeting unlisted until
+/// 16:22, and its reminder went out 8 minutes ahead instead of 10. After a
+/// boot there is no earlier copy to fall back on, so the cadence that suits a
+/// healthy listing is wrong for a failed one. Thirty seconds is one long poll:
+/// the next turn after a failure, without a request on every 10s poll retry
+/// while an outage lasts.
+pub const REMINDER_RETRY_SECONDS = 30;
+
+fn reminderRefreshDue(age_seconds: i96, failing: bool, same_day: bool) bool {
+    if (!same_day) return true;
+    const interval: i96 = if (failing) REMINDER_RETRY_SECONDS else REMINDER_REFRESH_SECONDS;
+    return age_seconds >= interval;
+}
 pub const SEARCH_RESULT_LIMIT = 30;
 const POLL_TIMEOUT_SECONDS = 30;
 const RETRY_DELAY_SECONDS = 10;
@@ -370,7 +389,8 @@ const PendingEvent = struct {
 };
 
 /// Today's meetings as the reminder check last saw them. Refreshed from
-/// Google every REMINDER_REFRESH_SECONDS and at midnight; what has been
+/// Google every REMINDER_REFRESH_SECONDS (REMINDER_RETRY_SECONDS after a
+/// failure) and at midnight; what has been
 /// reminded is carried across a refresh by id.
 const Reminders = struct {
     arena: std.heap.ArenaAllocator,
@@ -532,7 +552,7 @@ pub const Bot = struct {
         const clock_ns = std.Io.Clock.now(.boot, self.cfg.io).nanoseconds;
         if (self.reminders) |state| {
             const age = @divTrunc(clock_ns - state.refreshed_ns, std.time.ns_per_s);
-            if (age < REMINDER_REFRESH_SECONDS and state.day.order(today) == .eq) return;
+            if (!reminderRefreshDue(age, state.failing, state.day.order(today) == .eq)) return;
         }
         if (self.reminders == null) {
             self.reminders = .{
@@ -3283,6 +3303,20 @@ test "a turn of the loop that never returns ends the process instead of hanging 
     // Generous against a slow turn (a model call, a long voice note), and
     // short against the 15h and 58h hangs seen so far.
     try std.testing.expect(STALL_GUARD_SECONDS > 5 * 60 and STALL_GUARD_SECONDS <= 30 * 60);
+}
+
+test "a reminder listing that failed is tried again within a minute, not three" {
+    // 2026-11-12: booted 16:19:11, listing failed 16:19:14 (network not up),
+    // came back 16:22:16 -- and a 16:30 meeting was reminded 8 minutes
+    // ahead instead of 10. A minute after the failure it must be due.
+    try std.testing.expect(reminderRefreshDue(60, true, true));
+    // ...but not on every 10s poll retry during an outage.
+    try std.testing.expect(!reminderRefreshDue(10, true, true));
+    // A healthy listing keeps the three-minute cadence.
+    try std.testing.expect(!reminderRefreshDue(60, false, true));
+    try std.testing.expect(reminderRefreshDue(REMINDER_REFRESH_SECONDS, false, true));
+    // A new day always fetches.
+    try std.testing.expect(reminderRefreshDue(0, false, false));
 }
 
 test "only consecutive poll failures count as an outage" {
